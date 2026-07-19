@@ -1,6 +1,5 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 
 namespace Reactor.Backends.Cli;
 
@@ -22,11 +21,9 @@ public sealed record CopilotCliOptions : CliAgentOptions
 /// <c>--output-format json --allow-all-tools --no-ask-user --session-id &lt;uuid&gt; [--model m] [--reasoning-effort e]</c>,
 /// with the prompt on stdin. The executable can be set with <c>REACTOR_COPILOT_CLI</c>.
 /// </summary>
-public sealed partial class CopilotCliBackend(CopilotCliOptions? options = null)
+public sealed class CopilotCliBackend(CopilotCliOptions? options = null)
     : CliAgentBackend(options ?? new CopilotCliOptions(), "copilot", "REACTOR_COPILOT_CLI")
 {
-    private static readonly HashSet<string> Efforts = new(StringComparer.OrdinalIgnoreCase) { "none", "minimal", "low", "medium", "high", "xhigh", "max" };
-
     private CopilotCliOptions CopilotOptions => (CopilotCliOptions)Options;
 
     public override string Name => "copilot-cli";
@@ -67,19 +64,9 @@ public sealed partial class CopilotCliBackend(CopilotCliOptions? options = null)
     protected internal override ICliOutputParser CreateParser() => new CopilotOutputParser(Options.LogAssistantText);
 
     /// <summary>Copilot names Claude models with a dotted version (<c>claude-sonnet-4.5</c>); dated ids are shortened.</summary>
-    protected internal override string? NormalizeModel(string? model, Action<string, string> log)
-    {
-        if (string.IsNullOrWhiteSpace(model))
-        {
-            return null;
-        }
+    protected internal override string? NormalizeModel(string? model, Action<string, string> log) => CopilotModelNames.Normalize(model);
 
-        var match = ClaudeDashedVersion().Match(model);
-        return match.Success ? $"{match.Groups["family"].Value}-{match.Groups["major"].Value}.{match.Groups["minor"].Value}" : model;
-    }
-
-    protected internal override string? MapReasoningEffort(string? effort) =>
-        effort is not null && Efforts.Contains(effort) ? effort.ToLowerInvariant() : null;
+    protected internal override string? MapReasoningEffort(string? effort) => CopilotModelNames.CliReasoningEffort(effort);
 
     protected override void AddUsageMetadata(CliRunSummary summary, CliThread thread, Dictionary<string, object?> metadata)
     {
@@ -100,9 +87,6 @@ public sealed partial class CopilotCliBackend(CopilotCliOptions? options = null)
         var relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
         return !relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative);
     }
-
-    [GeneratedRegex(@"^(?<family>claude-(?:opus|sonnet|haiku))-(?<major>\d+)-(?<minor>\d{1,2})(?:-\d{8})?$", RegexOptions.IgnoreCase)]
-    private static partial Regex ClaudeDashedVersion();
 }
 
 /// <summary>Parses <c>copilot --output-format json</c> JSON lines.</summary>

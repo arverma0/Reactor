@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Reactor.Copilot\Reactor.Copilot.csproj" />
     <ProjectReference Include="..\..\src\Reactor\Reactor.csproj" />
+    <ProjectReference Include="..\..\src\Reactor.Backends\Reactor.Backends.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />

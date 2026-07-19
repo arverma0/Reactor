@@ -10,6 +10,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Reactor\Reactor.csproj" />
+    <ProjectReference Include="..\Reactor.Backends\Reactor.Backends.csproj" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Copilot.Tests" />
