@@ -75,6 +75,51 @@ public static class JsonHelpers
         return null;
     }
 
+    /// <summary>
+    /// Reads a numeric JSON value regardless of how the node was created (parsed JSON or in-memory CLR primitive).
+    /// </summary>
+    public static bool TryGetNumber(this JsonValue value, out double number)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.GetValueKind() != JsonValueKind.Number)
+        {
+            number = 0;
+            return false;
+        }
+
+        if (value.TryGetValue(out double d))
+        {
+            number = d;
+            return true;
+        }
+
+        if (value.TryGetValue(out long l))
+        {
+            number = l;
+            return true;
+        }
+
+        if (value.TryGetValue(out int i))
+        {
+            number = i;
+            return true;
+        }
+
+        if (value.TryGetValue(out decimal m))
+        {
+            number = (double)m;
+            return true;
+        }
+
+        if (value.TryGetValue(out float f))
+        {
+            number = f;
+            return true;
+        }
+
+        return double.TryParse(value.ToJsonString(), NumberStyles.Float, CultureInfo.InvariantCulture, out number);
+    }
+
     /// <summary>Gets an integer property (numbers or numeric strings), or null.</summary>
     public static int? Int(this JsonNode? node, string property)
     {
@@ -83,19 +128,9 @@ public static class JsonHelpers
             switch (v.GetValueKind())
             {
                 case JsonValueKind.Number:
-                    if (v.TryGetValue<int>(out var i))
+                    if (v.TryGetNumber(out var d))
                     {
-                        return i;
-                    }
-
-                    if (v.TryGetValue<long>(out var l))
-                    {
-                        return (int)Math.Clamp(l, int.MinValue, int.MaxValue);
-                    }
-
-                    if (v.TryGetValue<double>(out var d))
-                    {
-                        return (int)d;
+                        return (int)Math.Clamp(Math.Truncate(d), int.MinValue, int.MaxValue);
                     }
 
                     break;

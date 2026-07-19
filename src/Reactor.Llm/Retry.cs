@@ -89,15 +89,9 @@ public static class Retry
                     throw;
                 }
 
-                var delay = policy.CalculateDelay(attempt);
-                if (error is ProviderError { RetryAfter: double retryAfter })
+                if (!TryGetRetryDelay(policy, error, attempt, out var delay))
                 {
-                    if (retryAfter > policy.MaxDelay)
-                    {
-                        throw;
-                    }
-
-                    delay = TimeSpan.FromSeconds(Math.Max(0, retryAfter));
+                    throw;
                 }
 
                 policy.OnRetry?.Invoke(error, attempt + 1, delay);
@@ -111,6 +105,26 @@ public static class Retry
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Computes the delay before retry number <paramref name="attempt"/> + 1, honoring a provider Retry-After.
+    /// Returns false when the provider asked for a wait longer than <see cref="RetryPolicy.MaxDelay"/>.
+    /// </summary>
+    internal static bool TryGetRetryDelay(RetryPolicy policy, Exception error, int attempt, out TimeSpan delay)
+    {
+        delay = policy.CalculateDelay(attempt);
+        if (error is ProviderError { RetryAfter: double retryAfter })
+        {
+            if (retryAfter > policy.MaxDelay)
+            {
+                return false;
+            }
+
+            delay = TimeSpan.FromSeconds(Math.Max(0, retryAfter));
+        }
+
+        return true;
     }
 
     /// <summary>Runs an operation without a result, retrying per <paramref name="policy"/>.</summary>

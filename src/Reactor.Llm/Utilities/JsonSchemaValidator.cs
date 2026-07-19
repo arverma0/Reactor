@@ -300,7 +300,7 @@ public static class JsonSchemaValidator
         }
         else if (kind is "number" or "integer")
         {
-            var number = value.GetValue<double>();
+            value.TryGetNumber(out var number);
             if (Number(s, "minimum") is { } min && number < min)
             {
                 errors.Add($"{path}: {Format(number)} is less than the minimum {Format(min)}");
@@ -360,7 +360,7 @@ public static class JsonSchemaValidator
                     case JsonValueKind.Null:
                         return "null";
                     case JsonValueKind.Number:
-                        var d = v.GetValue<double>();
+                        v.TryGetNumber(out var d);
                         return Math.Abs(d % 1) < double.Epsilon && !double.IsInfinity(d) ? "integer" : "number";
                 }
 
@@ -371,7 +371,7 @@ public static class JsonSchemaValidator
     }
 
     private static double? Number(JsonObject s, string property) =>
-        s[property] is JsonValue v && v.GetValueKind() == JsonValueKind.Number ? v.GetValue<double>() : null;
+        s[property] is JsonValue v && v.TryGetNumber(out var number) ? number : null;
 
     private static JsonNode? ResolveRef(JsonNode root, string reference)
     {
