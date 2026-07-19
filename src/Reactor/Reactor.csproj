@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <RootNamespace>Reactor</RootNamespace>
+    <!-- 'Reactor.Core' avoids a file-name clash with the 'reactor' CLI on case-insensitive file systems. -->
+    <AssemblyName>Reactor.Core</AssemblyName>
+    <PackageId>Reactor.Core</PackageId>
     <Description>Reactor pipeline engine: DOT-defined multi-stage AI workflows with handlers, checkpoints, human gates, and parallel branches.</Description>
   </PropertyGroup>
   <ItemGroup>
