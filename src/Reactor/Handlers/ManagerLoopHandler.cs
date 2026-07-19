@@ -51,6 +51,12 @@ public sealed class ManagerLoopHandler : INodeHandler
             var workdir = node[AttrKeys.StackChildWorkdir] ?? graph[AttrKeys.StackChildWorkdir] ?? run?.WorkingDirectory ?? Directory.GetCurrentDirectory();
             workdir = Path.GetFullPath(workdir, run?.WorkingDirectory ?? Directory.GetCurrentDirectory());
             var dotPath = Path.GetFullPath(dotFile, workdir);
+            if (!File.Exists(dotPath) && !Path.IsPathRooted(dotFile) && Path.GetDirectoryName(graph.SourcePath) is { Length: > 0 } parentDirectory)
+            {
+                // Fall back to a path relative to the parent pipeline's file.
+                dotPath = Path.GetFullPath(dotFile, parentDirectory);
+            }
+
             if (!File.Exists(dotPath))
             {
                 return Outcome.Fail($"Child pipeline file not found: {dotPath}");

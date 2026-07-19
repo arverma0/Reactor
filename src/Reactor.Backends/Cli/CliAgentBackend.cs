@@ -164,6 +164,14 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
         var summary = parser.Summary;
         if (result.ExitCode != 0 || summary.IsError || !summary.Completed)
         {
+            // The CLI may have created the session before failing (e.g. Claude Code when not logged in); continue it on the
+            // next attempt rather than trying to create a session with the same id again.
+            if (summary.SessionId is { Length: > 0 } failedSession)
+            {
+                thread.SessionId = failedSession;
+                thread.Started = true;
+            }
+
             var detail = summary.ErrorMessage ?? LastLines(result.Stderr) ?? (summary.Completed ? null : "no result was reported");
             var message = $"{Name} failed (exit code {result.ExitCode.ToString(CultureInfo.InvariantCulture)})" + (detail is null ? "" : ": " + detail);
             Log(message, "error");

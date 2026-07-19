@@ -1,0 +1,18 @@
+// A human approval gate: the pipeline pauses at `review` until someone picks an option
+// (console prompt, `--answer A`, or the web console / POST /pipelines/{id}/questions/{qid}/answer).
+// After 30 minutes without an answer it takes the default choice.
+digraph human_review {
+    graph [goal="Add a CONTRIBUTING.md that explains how to build and test this repository"]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    draft [prompt="Write CONTRIBUTING.md for this repository: $goal. Inspect the build files first."]
+    review [shape=hexagon, label="Is CONTRIBUTING.md ready to merge?", human.timeout="30m", human.default_choice="approve"]
+    revise [prompt="Improve CONTRIBUTING.md based on reviewer feedback: make it more concise and accurate."]
+
+    start -> draft -> review
+    review -> exit   [label="[A] Approve"]
+    review -> revise [label="[R] Revise"]
+    revise -> review
+}

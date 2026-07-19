@@ -22,6 +22,18 @@ internal static class SseStreams
         TimeSpan readTimeout,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // A 2xx response that is not an event stream usually means a wrong base URL or an intercepting proxy; say so
+        // instead of reporting a truncated stream.
+        var mediaType = response.Content.Headers.ContentType?.MediaType;
+        if (mediaType is not null && !mediaType.Equals("text/event-stream", StringComparison.OrdinalIgnoreCase))
+        {
+            var snippet = await ReadSnippetAsync(response, cancellationToken).ConfigureAwait(false);
+            yield return new SseRead(null, new StreamError(
+                $"{provider} returned '{mediaType}' instead of an event stream (HTTP {(int)response.StatusCode}); check the base URL and any proxy." +
+                (snippet.Length > 0 ? $" Response: {snippet}" : "")));
+            yield break;
+        }
+
         Stream? stream = null;
         SdkError? failure = null;
         try
@@ -86,6 +98,23 @@ internal static class SseStreams
             {
                 await enumerator.DisposeAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>Reads up to 1 KB of a response body for diagnostics; never throws.</summary>
+    private static async Task<string> ReadSnippetAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            var text = await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false);
+            text = text.ReplaceLineEndings(" ").Trim();
+            return text.Length <= 1024 ? text : text[..1024] + "…";
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException or ObjectDisposedException)
+        {
+            return "";
         }
     }
 }

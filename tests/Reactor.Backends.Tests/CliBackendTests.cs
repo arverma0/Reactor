@@ -247,6 +247,30 @@ public sealed class CliBackendTests
     }
 
     [Fact]
+    public async Task A_session_created_by_a_failed_run_is_resumed_on_the_thread()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), ClaudeNotLoggedIn, exitCode: 1);
+        await using var backend = new ClaudeCodeBackend(new ClaudeCodeOptions { Executable = cli.Executable });
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [default_fidelity="full"]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              first [prompt="One"]
+              second [prompt="Two"]
+              start -> first -> second -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        var invocations = cli.Invocations;
+        Assert.Equal(2, invocations.Count);
+        Assert.Contains("--session-id", invocations[0]);
+        Assert.Contains("--resume S", invocations[1]);
+    }
+
+    [Fact]
     public async Task Cancellation_kills_the_cli_process_tree()
     {
         using var dir = new TempDir();

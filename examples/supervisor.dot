@@ -1,0 +1,24 @@
+// Supervisor pattern: the manager node starts child-worker.dot as a child pipeline, observes its
+// progress every 10s, and steers the active stage (steering.md) if it runs long. It succeeds when the
+// child completes successfully.
+digraph supervisor {
+    graph [
+        goal="Supervise the worker pipeline",
+        stack.child_dotfile="child-worker.dot"
+    ]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    manage [
+        shape=house,
+        label="Supervise worker",
+        manager.poll_interval="10s",
+        manager.max_cycles=360,
+        manager.actions="observe,steer,wait",
+        manager.steer_cooldown="5m",
+        manager.steer_prompt="Wrap up: finish the current change, make sure it builds, and stop."
+    ]
+
+    start -> manage -> exit
+}

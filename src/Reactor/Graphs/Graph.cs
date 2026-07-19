@@ -21,6 +21,9 @@ public sealed class Graph
     /// <summary>The DOT source this graph was parsed from, when available.</summary>
     public string? Source { get; set; }
 
+    /// <summary>The file the graph was loaded from, when available (relative child pipeline paths may resolve against it).</summary>
+    public string? SourcePath { get; set; }
+
     public IReadOnlyDictionary<string, Node> Nodes => _nodes;
 
     public IReadOnlyList<Edge> Edges => _edges;
@@ -148,7 +151,7 @@ public sealed class Graph
     /// <summary>Deep copy (nodes, edges, attributes).</summary>
     public Graph Clone()
     {
-        var clone = new Graph(Name) { Source = Source };
+        var clone = new Graph(Name) { Source = Source, SourcePath = SourcePath };
         foreach (var (key, value) in Attributes)
         {
             clone.Attributes[key] = value;

@@ -1,0 +1,45 @@
+// A small "software factory": spec -> plan -> implement -> build/test loop -> parallel reviews ->
+// human sign-off -> docs. Demonstrates goal gates, retry targets, tool nodes, conditional routing,
+// parallel fan-out/fan-in, a human gate, and thread-shared context (fidelity=full).
+digraph factory {
+    graph [
+        goal="Build a Python library `slugify_plus` with a slugify(text) function (unicode-aware, max_length option) and tests",
+        default_fidelity="compact",
+        default_max_retries=1,
+        retry_target="implement"
+    ]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    spec      [prompt="Write SPEC.md for: $goal. Cover inputs, outputs, edge cases, and examples."]
+    plan      [prompt="Read SPEC.md and write PLAN.md with small, ordered implementation steps.", fidelity="full", thread_id="build"]
+    implement [prompt="Implement PLAN.md. Write the library and tests.", fidelity="full", thread_id="build", goal_gate=true]
+    test      [shape=parallelogram, label="Run tests", tool_command="python -m pytest -q", timeout="10m"]
+    fix       [prompt="Tests failed (see tool.output in context). Fix the code, not the tests, unless a test is wrong.", fidelity="full", thread_id="build"]
+    route     [shape=diamond, label="Tests passing?"]
+
+    reviews   [shape=component, label="Reviews", join_policy="wait_all"]
+    api_review  [prompt="Review the public API of slugify_plus for clarity and consistency with SPEC.md."]
+    edge_review [prompt="Look for unhandled edge cases (empty strings, emoji, RTL text, very long input)."]
+    gather    [shape=tripleoctagon, label="Gather reviews"]
+    apply     [prompt="Apply the worthwhile suggestions from the reviews (parallel.results).", fidelity="full", thread_id="build"]
+
+    signoff   [shape=hexagon, label="Ship slugify_plus?"]
+    docs      [prompt="Write README.md with installation, usage examples, and the API reference."]
+
+    start -> spec -> plan -> implement -> test -> route
+    route -> reviews [condition="outcome=success"]
+    route -> fix     [condition="outcome=fail"]
+    fix -> test
+
+    reviews -> api_review
+    reviews -> edge_review
+    api_review -> gather
+    edge_review -> gather
+    gather -> apply -> signoff
+
+    signoff -> docs      [label="[S] Ship"]
+    signoff -> implement [label="[R] Rework"]
+    docs -> exit
+}

@@ -1,0 +1,13 @@
+// The child pipeline started by supervisor.dot (also runnable on its own).
+digraph child_worker {
+    graph [goal="Add a --version flag to the project's command-line entry point"]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    explore   [prompt="Find the command-line entry point of this project and describe how arguments are parsed."]
+    implement [prompt="$goal. Keep the change minimal.", fidelity="full", thread_id="work"]
+    verify    [prompt="Check that the change builds and the flag works. Fix anything broken.", fidelity="full", thread_id="work"]
+
+    start -> explore -> implement -> verify -> exit
+}

@@ -39,6 +39,9 @@ public sealed record ReactorServerOptions
     /// <summary>Register custom handlers, transforms, or lint rules on the shared runner.</summary>
     public Action<PipelineRunner>? ConfigureRunner { get; init; }
 
+    /// <summary>Stage executions allowed per run before it fails (guards against runaway loops; 0 = unlimited).</summary>
+    public int MaxStepsPerRun { get; init; } = 1000;
+
     /// <summary>Maximum DOT source size accepted (default 1 MiB).</summary>
     public int MaxDotBytes { get; init; } = 1024 * 1024;
 }
@@ -479,6 +482,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
                 Interviewer = run.Interviewer,
                 InitialContext = run.InitialContext,
                 OnEvent = run.Record,
+                MaxSteps = Math.Max(0, _options.MaxStepsPerRun),
             };
             var result = await body(options, token).ConfigureAwait(false);
             run.Finish(StatusOf(result), result, result.Cancelled ? null : FailureOf(result));

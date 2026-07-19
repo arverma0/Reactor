@@ -1,0 +1,22 @@
+// Implement, then verify with a real command (tool node). Failures loop back to a fixer with the
+// command output in context; `implement` is a goal gate, so the pipeline cannot finish without it.
+// Edit tool_command for your stack (e.g. "npm test", "dotnet test", "cargo test").
+digraph test_fix_loop {
+    graph [
+        goal="Create fizzbuzz.py that prints FizzBuzz for 1..100, with a passing test in test_fizzbuzz.py",
+        default_max_retries=1,
+        retry_target="implement"
+    ]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    implement [prompt="$goal. Write both files.", goal_gate=true]
+    test      [shape=parallelogram, label="Run tests", tool_command="python -m pytest -q", timeout="5m"]
+    fix       [prompt="The tests failed. Read the failure output in context (tool.output) and fix the code."]
+
+    start -> implement -> test
+    test -> exit [condition="outcome=success"]
+    test -> fix  [condition="outcome=fail"]
+    fix -> test
+}

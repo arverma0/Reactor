@@ -42,7 +42,7 @@ internal sealed class RunOptionSet
 
     public Option<string[]> Answers { get; } = new("--answer") { Description = "Pre-supplied human gate answers, used in order (repeatable)", Arity = ArgumentArity.ZeroOrMore };
 
-    public Option<int?> MaxSteps { get; } = new("--max-steps") { Description = "Abort after this many stage executions (safety limit)" };
+    public Option<int> MaxSteps { get; } = new("--max-steps") { Description = "Fail the run after this many stage executions, a guard against runaway loops (0 = unlimited)", DefaultValueFactory = _ => 500 };
 
     public Option<bool> Json { get; } = new("--json") { Description = "Emit events and the result as JSON lines" };
 
@@ -170,6 +170,8 @@ internal static class PipelineCommands
                 try
                 {
                     graph = DotParser.Parse(source);
+                    var path = result.GetValue(file)!;
+                    graph.SourcePath = path == "-" ? null : Path.GetFullPath(path);
                 }
                 catch (DotParseException ex)
                 {
@@ -218,7 +220,8 @@ internal static class PipelineCommands
     {
         var file = new Argument<string>("file") { Description = "DOT pipeline file ('-' reads standard input)" };
         var json = new Option<bool>("--json") { Description = "Print diagnostics as JSON" };
-        var command = new Command("validate", "Parse and lint a pipeline without running it") { file, json };
+        var noColor = new Option<bool>("--no-color") { Description = "Disable colored output" };
+        var command = new Command("validate", "Parse and lint a pipeline without running it") { file, json, noColor };
         command.SetAction(async (result, cancellationToken) =>
         {
             string source;
@@ -272,7 +275,7 @@ internal static class PipelineCommands
             }
             else
             {
-                var reporter = new ConsoleReporter(Console.Out, Verbosity.Normal, ConsoleReporter.ColorSupported(false), json: false);
+                var reporter = new ConsoleReporter(Console.Out, Verbosity.Normal, ConsoleReporter.ColorSupported(result.GetValue(noColor)), json: false);
                 PrintDiagnostics(reporter, prepared.Diagnostics);
                 if (!prepared.HasErrors)
                 {
@@ -397,7 +400,7 @@ internal static class PipelineCommands
                 WorkingDirectory = workDir,
                 InitialContext = initialContext,
                 OnEvent = reporter.OnEvent,
-                MaxSteps = result.GetValue(options.MaxSteps) ?? 0,
+                MaxSteps = Math.Max(0, result.GetValue(options.MaxSteps)),
             };
 
             PipelineResult? outcome;

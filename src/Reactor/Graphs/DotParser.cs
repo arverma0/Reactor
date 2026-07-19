@@ -41,8 +41,14 @@ public static class DotParser
         return graph;
     }
 
-    /// <summary>Reads and parses a <c>.dot</c> file.</summary>
-    public static Graph ParseFile(string path) => Parse(File.ReadAllText(path));
+    /// <summary>Reads and parses a <c>.dot</c> file (recording its full path in <see cref="Graph.SourcePath"/>).</summary>
+    public static Graph ParseFile(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        var graph = Parse(File.ReadAllText(path));
+        graph.SourcePath = Path.GetFullPath(path);
+        return graph;
+    }
 
     /// <summary>Derives a stylesheet class from a subgraph label: lowercase, spaces → hyphens, other non-alphanumerics removed.</summary>
     public static string DeriveClassName(string label)

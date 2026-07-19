@@ -307,6 +307,23 @@ public class OpenAICompatibleAdapterTests
         Assert.IsType<ServerError>(errored[^1].Error);
     }
 
+    [Fact]
+    public async Task Non_event_stream_responses_report_the_content_type_and_body()
+    {
+        // e.g. an intercepting proxy answering "200 text/plain OK" to a streaming request.
+        var (adapter, handler) = Create();
+        handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("OK", System.Text.Encoding.UTF8, "text/plain"),
+        }));
+
+        var events = await TestUtil.CollectAsync(adapter.StreamAsync(SimpleRequest()));
+
+        var error = Assert.IsType<StreamError>(events[^1].Error);
+        Assert.Contains("'text/plain' instead of an event stream", error.Message);
+        Assert.Contains("Response: OK", error.Message);
+    }
+
     [Theory]
     [InlineData(HttpStatusCode.Unauthorized, typeof(AuthenticationError))]
     [InlineData(HttpStatusCode.NotFound, typeof(NotFoundError))]

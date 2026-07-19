@@ -711,7 +711,9 @@ public sealed class PipelineRunner
                 try
                 {
                     var source = await File.ReadAllTextAsync(dotFilePath, cts.Token).ConfigureAwait(false);
-                    return await _runner.RunAsync(source, childOptions, cts.Token).ConfigureAwait(false);
+                    var childGraph = DotParser.Parse(source);
+                    childGraph.SourcePath = Path.GetFullPath(dotFilePath);
+                    return await _runner.RunAsync(childGraph, childOptions, cts.Token).ConfigureAwait(false);
                 }
                 finally
                 {

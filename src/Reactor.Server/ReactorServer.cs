@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Human;
@@ -30,6 +31,9 @@ public static class ReactorServer
     {
         ArgumentNullException.ThrowIfNull(options);
         var builder = WebApplication.CreateSlimBuilder(args ?? []);
+
+        // Request logs are noisy and would record ?access_token= query strings; keep startup/lifetime messages only.
+        builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
         builder.Services.AddReactorServer(options);
         configure?.Invoke(builder);
         var app = builder.Build();

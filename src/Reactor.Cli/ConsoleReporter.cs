@@ -135,6 +135,13 @@ internal sealed class ConsoleReporter
             Write(Paint("  " + result.FinalOutcome.FailureReason, Red));
         }
 
+        // Per the spec, failures routed onward (e.g. over unconditional edges) do not fail the run; make them visible.
+        var failedStages = result.NodeOutcomes.Where(kv => kv.Value.Status == StageStatus.Fail).Select(kv => kv.Key).ToList();
+        if (ok && failedStages.Count > 0)
+        {
+            Write(Paint($"  ⚠ {failedStages.Count} stage(s) failed and were routed onward: {string.Join(", ", failedStages)}", Yellow));
+        }
+
         Write(Paint($"  stages: {string.Join(" → ", result.CompletedNodes)}", Dim));
         Write(Paint($"  logs:   {result.LogsRoot}", Dim));
     }
