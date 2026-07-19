@@ -33,6 +33,12 @@ public sealed record CopilotSdkBackendOptions
 
     /// <summary>Copilot tools to disable for pipeline stages (e.g. <c>ask_user</c> is never offered).</summary>
     public IReadOnlyList<string>? ExcludedTools { get; init; }
+
+    /// <summary>
+    /// Check requested models against the account's model list before a stage starts (default true). Without this, the
+    /// runtime may silently substitute a different (possibly more expensive) model for an unavailable one.
+    /// </summary>
+    public bool VerifyModels { get; init; } = true;
 }
 
 /// <summary>A Copilot stage failed. <see cref="Retryable"/> tells the engine whether a retry may help.</summary>
@@ -52,6 +58,9 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
     private readonly CopilotSdkBackendOptions _options;
     private readonly Lazy<ICopilotRuntime> _runtime;
     private readonly ThreadLeasePool<ConversationHolder> _threads;
+    private readonly SemaphoreSlim _modelsLock = new(1, 1);
+    private IReadOnlyList<CopilotModelInfo>? _models;
+    private bool _modelsUnavailable;
 
     public CopilotSdkBackend(CopilotSdkBackendOptions? options = null)
         : this(options ?? new CopilotSdkBackendOptions(), null)
@@ -78,6 +87,25 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
 
         var model = CopilotModelNames.Normalize(stage.Model ?? _options.DefaultModel);
         var effort = CopilotModelNames.SdkReasoningEffort(stage.ExplicitReasoningEffort);
+        if (model is not null && _options.VerifyModels && await GetModelsAsync(Log, cancellationToken).ConfigureAwait(false) is { } models)
+        {
+            var info = models.FirstOrDefault(m => string.Equals(m.Id, model, StringComparison.OrdinalIgnoreCase));
+            if (info is null || !info.Enabled)
+            {
+                var available = string.Join(", ", models.Where(m => m.Enabled).Select(m => m.Id).Order(StringComparer.Ordinal));
+                throw new CopilotStageException(
+                    $"Copilot model '{model}' is {(info is null ? "not available" : "disabled by policy")} for this account. Available models: {available}.",
+                    retryable: false);
+            }
+
+            model = info.Id;
+            if (effort is not null && !info.ReasoningEfforts.Contains(effort, StringComparer.OrdinalIgnoreCase))
+            {
+                Log($"copilot-sdk: {model} does not support reasoning_effort '{effort}'; using the model default", "debug");
+                effort = null;
+            }
+        }
+
         var key = _options.ReuseThreadSessions ? stage.ThreadKey("copilot-sdk") : null;
         await using var lease = await _threads.AcquireAsync(key, () => new ConversationHolder()).ConfigureAwait(false);
         var holder = lease.Value;
@@ -138,10 +166,17 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
             throw new CopilotStageException(message, IsRetryable(error));
         }
 
+        var actualModel = stats.Model ?? model;
+        if (model is not null && stats.Model is { } reported && !string.Equals(reported, model, StringComparison.OrdinalIgnoreCase))
+        {
+            Log($"copilot-sdk: the stage ran on '{reported}' instead of the requested '{model}'", "warn");
+        }
+
         var metadata = new Dictionary<string, object?>
         {
             ["backend"] = "copilot-sdk",
-            ["model"] = stats.Model ?? model,
+            ["model"] = actualModel,
+            ["requested_model"] = model,
             ["session_id"] = conversation.SessionId,
             ["thread_id"] = stage.ThreadId,
             ["resumed"] = resumed,
@@ -169,6 +204,42 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
         if (_runtime.IsValueCreated)
         {
             await _runtime.Value.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The models the signed-in Copilot account can use (starts the runtime if needed).</summary>
+    public Task<IReadOnlyList<CopilotModelInfo>> ListModelsAsync(CancellationToken cancellationToken = default) =>
+        _runtime.Value.ListModelsAsync(cancellationToken);
+
+    /// <summary>The cached model list, or null when the runtime cannot list models (verification is then skipped).</summary>
+    private async Task<IReadOnlyList<CopilotModelInfo>?> GetModelsAsync(Action<string, string> log, CancellationToken cancellationToken)
+    {
+        if (_models is not null || _modelsUnavailable)
+        {
+            return _models;
+        }
+
+        await _modelsLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_models is null && !_modelsUnavailable)
+            {
+                try
+                {
+                    _models = await _runtime.Value.ListModelsAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException and not CopilotStageException)
+                {
+                    _modelsUnavailable = true;
+                    log($"copilot-sdk: could not list models ({ex.Message}); requested models are not verified", "warn");
+                }
+            }
+
+            return _models;
+        }
+        finally
+        {
+            _modelsLock.Release();
         }
     }
 

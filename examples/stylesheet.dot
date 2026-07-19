@@ -1,13 +1,13 @@
 // Model stylesheet: CSS-like rules assign models per node. Specificity: * < .class < #id; explicit
 // node attributes always win. Subgraph labels become classes ("Deep thinking" -> .deep-thinking).
-// `backend` pins a node to a specific backend route (e.g. direct LLM calls without tools).
+// Model ids must exist for your backend: `reactor models --provider copilot` lists the Copilot ones.
 digraph stylesheet_demo {
     graph [
         goal="Design and implement a small CLI todo app in Python",
         model_stylesheet="
             * { llm_model: gpt-5-mini; reasoning_effort: medium; }
-            .deep-thinking { llm_model: claude-sonnet-4.5; reasoning_effort: high; }
-            #final_review { llm_model: gpt-5; }
+            .deep-thinking { llm_model: claude-sonnet-5; reasoning_effort: high; }
+            #final_review { llm_model: gpt-5.5; }
         "
     ]
 

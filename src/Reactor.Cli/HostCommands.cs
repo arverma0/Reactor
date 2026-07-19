@@ -183,11 +183,16 @@ internal static class HostCommands
 
     public static Command Models()
     {
-        var provider = new Option<string?>("--provider") { Description = "Only this provider" };
+        var provider = new Option<string?>("--provider") { Description = "Only this provider; 'copilot' lists the models your Copilot account can use" };
         var json = new Option<bool>("--json") { Description = "Print as JSON" };
-        var command = new Command("models", "List models in the catalog") { provider, json };
-        command.SetAction(result =>
+        var command = new Command("models", "List models in the catalog (or available through GitHub Copilot)") { provider, json };
+        command.SetAction(async (result, cancellationToken) =>
         {
+            if (string.Equals(result.GetValue(provider), "copilot", StringComparison.OrdinalIgnoreCase))
+            {
+                return await ListCopilotModelsAsync(result.GetValue(json), cancellationToken).ConfigureAwait(false);
+            }
+
             var models = ModelCatalog.ListModels(result.GetValue(provider));
             if (result.GetValue(json))
             {
@@ -205,6 +210,36 @@ internal static class HostCommands
             return ExitCodes.Success;
         });
         return command;
+    }
+
+    private static async Task<int> ListCopilotModelsAsync(bool json, CancellationToken cancellationToken)
+    {
+        await using var backend = new Copilot.CopilotSdkBackend();
+        IReadOnlyList<Copilot.CopilotModelInfo> models;
+        try
+        {
+            models = await backend.ListModelsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is Copilot.CopilotStageException or IOException or InvalidOperationException)
+        {
+            await Console.Error.WriteLineAsync("✖ " + ex.Message).ConfigureAwait(false);
+            return ExitCodes.Configuration;
+        }
+
+        if (json)
+        {
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(models, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            return ExitCodes.Success;
+        }
+
+        Console.WriteLine($"{"MODEL",-28} {"COST",6} {"CONTEXT",9}  {"POLICY",-9} REASONING EFFORTS");
+        foreach (var model in models.OrderBy(m => m.Id, StringComparer.Ordinal))
+        {
+            var cost = model.BillingMultiplier is { } multiplier ? multiplier.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "x" : "-";
+            Console.WriteLine($"{model.Id,-28} {cost,6} {model.ContextWindow,9}  {model.PolicyState ?? "-",-9} {string.Join(",", model.ReasoningEfforts)}");
+        }
+
+        return ExitCodes.Success;
     }
 
     public static Command Doctor()

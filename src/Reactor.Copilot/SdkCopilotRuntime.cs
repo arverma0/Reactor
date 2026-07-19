@@ -95,6 +95,20 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
         return new SdkConversation(session);
     }
 
+    public async Task<IReadOnlyList<CopilotModelInfo>> ListModelsAsync(CancellationToken cancellationToken)
+    {
+        var client = await EnsureStartedAsync(cancellationToken).ConfigureAwait(false);
+        var models = await client.ListModelsAsync(cancellationToken).ConfigureAwait(false);
+        return models.Select(m => new CopilotModelInfo(
+                m.Id,
+                string.IsNullOrEmpty(m.Name) ? m.Id : m.Name,
+                m.Policy?.State,
+                m.Billing?.Multiplier,
+                m.Capabilities?.Limits?.MaxContextWindowTokens ?? 0,
+                m.SupportedReasoningEfforts?.ToList() ?? (m.Capabilities?.Supports?.ReasoningEffort == true ? ["low", "medium", "high"] : [])))
+            .ToList();
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_client is not { } client)

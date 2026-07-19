@@ -58,8 +58,24 @@ internal interface ICopilotConversation : IAsyncDisposable
     Task SetModelAsync(string model, string? reasoningEffort, CancellationToken cancellationToken);
 }
 
+/// <summary>A model offered by the Copilot runtime.</summary>
+public sealed record CopilotModelInfo(
+    string Id,
+    string Name,
+    string? PolicyState,
+    double? BillingMultiplier,
+    int ContextWindow,
+    IReadOnlyList<string> ReasoningEfforts)
+{
+    /// <summary>False when the account's policy disables the model.</summary>
+    public bool Enabled => !string.Equals(PolicyState, "disabled", StringComparison.OrdinalIgnoreCase);
+}
+
 /// <summary>Creates Copilot conversations (one runtime process serves all of them).</summary>
 internal interface ICopilotRuntime : IAsyncDisposable
 {
     Task<ICopilotConversation> CreateConversationAsync(CopilotConversationOptions options, CancellationToken cancellationToken);
+
+    /// <summary>The models available to the signed-in account.</summary>
+    Task<IReadOnlyList<CopilotModelInfo>> ListModelsAsync(CancellationToken cancellationToken);
 }

@@ -39,7 +39,20 @@ internal sealed class FakeCopilotRuntime : ICopilotRuntime
 
     public TurnHandler OnTurn { get; set; } = (_, _, _) => Task.FromResult<string?>("done");
 
+    /// <summary>Models reported by <see cref="ListModelsAsync"/>; null makes listing fail (verification is skipped).</summary>
+    public List<CopilotModelInfo>? Models { get; set; }
+
+    public int ListCalls;
+
     public bool Disposed { get; private set; }
+
+    public Task<IReadOnlyList<CopilotModelInfo>> ListModelsAsync(CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref ListCalls);
+        return Models is null
+            ? Task.FromException<IReadOnlyList<CopilotModelInfo>>(new IOException("models.list is not supported"))
+            : Task.FromResult<IReadOnlyList<CopilotModelInfo>>(Models);
+    }
 
     public Task<ICopilotConversation> CreateConversationAsync(CopilotConversationOptions options, CancellationToken cancellationToken)
     {
@@ -407,6 +420,101 @@ public sealed class CopilotSdkBackendTests
     [InlineData(null, null, "socket closed", true)]
     public void Error_retryability_follows_status_type_and_message(int? status, string? type, string message, bool retryable) =>
         Assert.Equal(retryable, CopilotSdkBackend.IsRetryable(new CopilotActivity.Error(message, type, status)));
+
+    private static List<CopilotModelInfo> Catalog() =>
+    [
+        new("gpt-5-mini", "GPT-5 mini", "enabled", 0, 264_000, ["low", "medium", "high"]),
+        new("claude-sonnet-5", "Claude Sonnet 5", "enabled", 1, 1_000_000, ["low", "medium", "high", "xhigh", "max"]),
+        new("claude-haiku-4.5", "Claude Haiku 4.5", "enabled", 0.33, 200_000, []),
+        new("legacy-model", "Legacy", "disabled", 1, 100_000, []),
+    ];
+
+    [Fact]
+    public async Task Unavailable_models_fail_fast_without_starting_a_session()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime { Models = Catalog() };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+
+        var result = await Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="A", llm_model="claude-sonnet-4.5", max_retries=2]
+              b [prompt="B", llm_model="legacy-model"]
+              start -> a -> b -> exit
+            }
+            """, Options(dir), Ct);
+
+        Assert.Empty(runtime.Conversations);
+        Assert.Contains("'claude-sonnet-4.5' is not available", result.NodeOutcomes["a"].FailureReason);
+        Assert.Contains("claude-sonnet-5, gpt-5-mini", result.NodeOutcomes["a"].FailureReason);
+        Assert.DoesNotContain("legacy-model,", result.NodeOutcomes["a"].FailureReason);
+        Assert.Contains("disabled by policy", result.NodeOutcomes["b"].FailureReason);
+        Assert.Equal(1, runtime.ListCalls);
+    }
+
+    [Fact]
+    public async Task Verified_models_use_catalog_ids_and_drop_unsupported_efforts()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime { Models = Catalog() };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+
+        await Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="A", llm_model="Claude-Sonnet-5", reasoning_effort="max"]
+              b [prompt="B", llm_model="claude-haiku-4-5", reasoning_effort="high"]
+              start -> a -> b -> exit
+            }
+            """, Options(dir), Ct);
+
+        Assert.Equal("claude-sonnet-5", runtime.Created[0].Model);
+        Assert.Equal("max", runtime.Created[0].ReasoningEffort);
+        Assert.Equal("claude-haiku-4.5", runtime.Created[1].Model);
+        Assert.Null(runtime.Created[1].ReasoningEffort);
+    }
+
+    [Fact]
+    public async Task Model_substitution_by_the_runtime_is_reported()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            Models = Catalog(),
+            OnTurn = (c, _, _) =>
+            {
+                c.Emit(new CopilotActivity.AssistantMessage("done", "claude-opus-4.8"));
+                return Task.FromResult<string?>("done");
+            },
+        };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+        var events = new List<PipelineEvent>();
+
+        await Runner(backend).RunAsync(OneStage.Replace("claude-sonnet-4-5", "gpt-5-mini", StringComparison.Ordinal), Options(dir, events), Ct);
+
+        Assert.Contains(Logs(events, "implement"), l => l.Contains("ran on 'claude-opus-4.8' instead of the requested 'gpt-5-mini'", StringComparison.Ordinal));
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "implement", "backend.json")))!;
+        Assert.Equal("claude-opus-4.8", metadata["model"]!.GetValue<string>());
+        Assert.Equal("gpt-5-mini", metadata["requested_model"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Model_verification_is_skipped_when_the_runtime_cannot_list_models()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime();
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+        var events = new List<PipelineEvent>();
+
+        var result = await Runner(backend).RunAsync(OneStage, Options(dir, events), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Contains(Logs(events, "implement"), l => l.Contains("requested models are not verified", StringComparison.Ordinal));
+        Assert.Equal("claude-sonnet-4.5", runtime.Created[0].Model);
+    }
 
     private sealed record ToolHookSnapshot(string? Pre, string? Post, string? NodeId);
 }
