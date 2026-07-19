@@ -154,6 +154,9 @@ public interface ICodergenBackend
     /// (writing <c>status.json</c> to report fail/retry outcomes and routing preferences).
     /// </summary>
     bool SupportsStatusFile => false;
+
+    /// <summary>Per-node variant of <see cref="SupportsStatusFile"/> (routing backends answer for the backend a node uses).</summary>
+    bool SupportsStatusFileFor(Node node) => SupportsStatusFile;
 }
 
 /// <summary>A backend result: response text or an explicit outcome, plus optional metadata recorded with the stage.</summary>
@@ -172,9 +175,16 @@ public sealed class CodergenResult
     /// <summary>Backend metadata (model, tokens, session id, cost, ...) written to <c>backend.json</c>.</summary>
     public IReadOnlyDictionary<string, object?> Metadata { get; init; } = new Dictionary<string, object?>();
 
+    /// <summary>A copy of this result carrying <paramref name="metadata"/>.</summary>
+    public CodergenResult WithMetadata(IReadOnlyDictionary<string, object?> metadata) =>
+        new(Text, Outcome) { Metadata = metadata ?? throw new ArgumentNullException(nameof(metadata)) };
+
     public static CodergenResult FromText(string text) => new(text ?? "", null);
 
     public static CodergenResult FromOutcome(Outcome outcome) => new(null, outcome ?? throw new ArgumentNullException(nameof(outcome)));
+
+    /// <summary>An explicit outcome plus the response text (written to <c>response.md</c>).</summary>
+    public static CodergenResult FromOutcome(Outcome outcome, string? text) => new(text, outcome ?? throw new ArgumentNullException(nameof(outcome)));
 
     public static implicit operator CodergenResult(string text) => FromText(text);
 

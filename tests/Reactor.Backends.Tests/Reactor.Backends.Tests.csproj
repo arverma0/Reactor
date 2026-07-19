@@ -18,6 +18,9 @@
     <ProjectReference Include="..\..\src\Reactor.Llm\Reactor.Llm.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\Reactor.Agent.Tests\Session\SessionTestSupport.cs" Link="Support\SessionTestSupport.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
 </Project>

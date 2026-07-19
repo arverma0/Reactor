@@ -128,7 +128,7 @@ public sealed class CodergenHandler : INodeHandler
 
         sb.Append(task);
 
-        if (backend is { SupportsStatusFile: true } && (run?.RunnerOptions.IncludeStatusProtocol ?? true))
+        if (backend is not null && backend.SupportsStatusFileFor(node) && (run?.RunnerOptions.IncludeStatusProtocol ?? true))
         {
             sb.AppendLine().AppendLine().Append(StatusProtocol(node, graph, stageDir));
         }
