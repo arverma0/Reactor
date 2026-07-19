@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Reactor</RootNamespace>
+    <Description>Reactor pipeline engine: DOT-defined multi-stage AI workflows with handlers, checkpoints, human gates, and parallel branches.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Tests" />
+    <InternalsVisibleTo Include="Reactor.Backends.Tests" />
+  </ItemGroup>
+</Project>

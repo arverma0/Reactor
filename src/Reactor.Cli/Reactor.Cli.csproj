@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Reactor.Cli</RootNamespace>
+    <AssemblyName>reactor</AssemblyName>
+    <Description>reactor: command-line runner for Reactor pipelines.</Description>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>reactor</ToolCommandName>
+    <PackageId>Reactor.Cli</PackageId>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" />
+    <!-- Direct reference so the Copilot runtime is bundled with the CLI (the SDK's build assets are not transitive). -->
+    <PackageReference Include="GitHub.Copilot.SDK" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Reactor\Reactor.csproj" />
+    <ProjectReference Include="..\Reactor.Llm\Reactor.Llm.csproj" />
+    <ProjectReference Include="..\Reactor.Agent\Reactor.Agent.csproj" />
+    <ProjectReference Include="..\Reactor.Backends\Reactor.Backends.csproj" />
+    <ProjectReference Include="..\Reactor.Copilot\Reactor.Copilot.csproj" />
+    <ProjectReference Include="..\Reactor.Server\Reactor.Server.csproj" />
+  </ItemGroup>
+</Project>

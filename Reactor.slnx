@@ -1,0 +1,19 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Reactor.Llm/Reactor.Llm.csproj" />
+    <Project Path="src/Reactor.Agent/Reactor.Agent.csproj" />
+    <Project Path="src/Reactor/Reactor.csproj" />
+    <Project Path="src/Reactor.Backends/Reactor.Backends.csproj" />
+    <Project Path="src/Reactor.Copilot/Reactor.Copilot.csproj" />
+    <Project Path="src/Reactor.Server/Reactor.Server.csproj" />
+    <Project Path="src/Reactor.Cli/Reactor.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Reactor.Llm.Tests/Reactor.Llm.Tests.csproj" />
+    <Project Path="tests/Reactor.Agent.Tests/Reactor.Agent.Tests.csproj" />
+    <Project Path="tests/Reactor.Tests/Reactor.Tests.csproj" />
+    <Project Path="tests/Reactor.Backends.Tests/Reactor.Backends.Tests.csproj" />
+    <Project Path="tests/Reactor.Server.Tests/Reactor.Server.Tests.csproj" />
+    <Project Path="tests/Reactor.Copilot.Tests/Reactor.Copilot.Tests.csproj" />
+  </Folder>
+</Solution>

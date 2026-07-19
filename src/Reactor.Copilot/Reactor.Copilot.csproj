@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Reactor.Copilot</RootNamespace>
+    <Description>GitHub Copilot SDK backend for Reactor pipelines.</Description>
+    <!-- Libraries do not need the Copilot runtime; the host application (reactor CLI) bundles it. -->
+    <CopilotSkipCliDownload>true</CopilotSkipCliDownload>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="GitHub.Copilot.SDK" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Reactor\Reactor.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Copilot.Tests" />
+  </ItemGroup>
+</Project>

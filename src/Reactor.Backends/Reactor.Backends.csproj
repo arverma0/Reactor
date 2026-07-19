@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Reactor.Backends</RootNamespace>
+    <Description>Codergen backends for Reactor: the built-in coding agent loop, and CLI agents (GitHub Copilot CLI, Claude Code) run as subprocesses.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Reactor\Reactor.csproj" />
+    <ProjectReference Include="..\Reactor.Agent\Reactor.Agent.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Backends.Tests" />
+  </ItemGroup>
+</Project>

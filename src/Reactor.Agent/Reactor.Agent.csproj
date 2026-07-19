@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Reactor.Agent</RootNamespace>
+    <Description>Coding agent loop: provider-aligned tools, execution environments, steering, events, and subagents on top of Reactor.Llm.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Reactor.Llm\Reactor.Llm.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Agent.Tests" />
+  </ItemGroup>
+</Project>

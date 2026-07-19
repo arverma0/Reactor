@@ -1,0 +1,16 @@
+## .NET build output
+bin/
+obj/
+artifacts/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+TestResults/
+*.trx
+*.coverage
+
+## Reactor run output (default logs root)
+.reactor/
+runs/

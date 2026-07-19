@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Reactor.Llm</RootNamespace>
+    <Description>Unified LLM client: one interface over OpenAI (Responses API), Anthropic (Messages API), Gemini, and OpenAI-compatible endpoints.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Catalog\models.json" LogicalName="Reactor.Llm.models.json" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Llm.Tests" />
+  </ItemGroup>
+</Project>
