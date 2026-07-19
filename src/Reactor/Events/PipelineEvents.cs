@@ -22,13 +22,14 @@ public abstract record PipelineEvent
     [JsonIgnore]
     public abstract string Description { get; }
 
-    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
+    private static readonly JsonSerializerOptions SerializerOptions = new()
     {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) },
     };
 
-    /// <summary>JSON form: all properties plus <c>type</c> and <c>description</c>.</summary>
+    /// <summary>JSON form (snake_case): all properties plus <c>type</c> and <c>description</c>.</summary>
     public JsonObject ToJson()
     {
         var json = JsonSerializer.SerializeToNode(this, GetType(), SerializerOptions) as JsonObject ?? [];

@@ -1,0 +1,522 @@
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
+using Reactor.Events;
+using Reactor.Execution;
+using Reactor.Graphs;
+using Reactor.Handlers;
+using Reactor.Validation;
+
+namespace Reactor.Server;
+
+/// <summary>Configuration for HTTP server mode.</summary>
+public sealed record ReactorServerOptions
+{
+    /// <summary>Backend for codergen stages (null = simulation mode).</summary>
+    public ICodergenBackend? Backend { get; init; }
+
+    /// <summary>Where run directories are created (relative paths resolve against <see cref="WorkingDirectory"/>).</summary>
+    public string LogsBaseDirectory { get; init; } = Path.Combine(".reactor", "runs");
+
+    /// <summary>Default working directory for runs (tools, agents, child pipelines).</summary>
+    public string WorkingDirectory { get; init; } = Directory.GetCurrentDirectory();
+
+    /// <summary>Allow API clients to choose a run's working directory (off by default).</summary>
+    public bool AllowClientWorkingDirectory { get; init; }
+
+    /// <summary>When set, API requests must carry <c>Authorization: Bearer &lt;token&gt;</c> (or <c>?access_token=</c>).</summary>
+    public string? AuthToken { get; init; }
+
+    /// <summary>Runs executing at once; further runs wait in the <c>queued</c> state.</summary>
+    public int MaxConcurrentRuns { get; init; } = 4;
+
+    /// <summary>Events kept in memory per run for SSE replay (the full log is always in <c>events.jsonl</c>).</summary>
+    public int MaxEventsPerRun { get; init; } = 50_000;
+
+    /// <summary>Path to Graphviz <c>dot</c> (default: on PATH).</summary>
+    public string? GraphvizPath { get; init; }
+
+    /// <summary>Register custom handlers, transforms, or lint rules on the shared runner.</summary>
+    public Action<PipelineRunner>? ConfigureRunner { get; init; }
+
+    /// <summary>Maximum DOT source size accepted (default 1 MiB).</summary>
+    public int MaxDotBytes { get; init; } = 1024 * 1024;
+}
+
+/// <summary>Run states reported by the API.</summary>
+public static class RunStatus
+{
+    public const string Queued = "queued";
+    public const string Running = "running";
+    public const string Success = "success";
+    public const string PartialSuccess = "partial_success";
+    public const string Fail = "fail";
+    public const string Cancelled = "cancelled";
+    public const string Error = "error";
+
+    public static bool IsTerminal(string status) => status is Success or PartialSuccess or Fail or Cancelled or Error;
+}
+
+/// <summary>A pipeline event with its per-run sequence number (the SSE event id).</summary>
+public sealed record RunEvent(long Sequence, PipelineEvent Event);
+
+/// <summary>A pipeline run managed by the server: progress, events, pending questions, and the result.</summary>
+public sealed class ManagedRun
+{
+    private readonly object _gate = new();
+    private readonly LinkedList<RunEvent> _events = new();
+    private readonly List<Channel<RunEvent>> _subscribers = [];
+    private readonly Dictionary<string, string> _nodeStatuses = new(StringComparer.Ordinal);
+    private readonly List<string> _completedNodes = [];
+    private readonly int _maxEvents;
+    private long _sequence;
+    private bool _eventsCompleted;
+
+    internal ManagedRun(string id, Graph graph, string source, string logsRoot, string workingDirectory, IReadOnlyDictionary<string, object?>? initialContext, int maxEvents)
+    {
+        Id = id;
+        Graph = graph;
+        Source = source;
+        LogsRoot = logsRoot;
+        CurrentLogsRoot = logsRoot;
+        WorkingDirectory = workingDirectory;
+        InitialContext = initialContext;
+        _maxEvents = maxEvents;
+    }
+
+    public string Id { get; }
+
+    public Graph Graph { get; }
+
+    public string Name => Graph.Name;
+
+    public string Goal => Graph.Goal;
+
+    /// <summary>The submitted DOT source.</summary>
+    public string Source { get; }
+
+    public string LogsRoot { get; }
+
+    /// <summary>The logs root currently in use (changes after a <c>loop_restart</c>).</summary>
+    public string CurrentLogsRoot { get; private set; }
+
+    public string WorkingDirectory { get; }
+
+    public IReadOnlyDictionary<string, object?>? InitialContext { get; }
+
+    public WebInterviewer Interviewer { get; } = new();
+
+    public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+
+    public DateTimeOffset? StartedAt { get; private set; }
+
+    public DateTimeOffset? FinishedAt { get; private set; }
+
+    public string Status { get; private set; } = RunStatus.Queued;
+
+    public string? CurrentNode { get; private set; }
+
+    public PipelineResult? Result { get; private set; }
+
+    public string? Error { get; private set; }
+
+    public long EventCount => Interlocked.Read(ref _sequence);
+
+    internal CancellationTokenSource Cancellation { get; set; } = new();
+
+    internal Task Execution { get; set; } = Task.CompletedTask;
+
+    public IReadOnlyList<string> CompletedNodes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _completedNodes.ToList();
+            }
+        }
+    }
+
+    /// <summary>Latest status per node (wire names).</summary>
+    public IReadOnlyDictionary<string, string> NodeStatuses
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new Dictionary<string, string>(_nodeStatuses, StringComparer.Ordinal);
+            }
+        }
+    }
+
+    /// <summary>Waits for the run (including a resumed run) to finish.</summary>
+    public Task WaitAsync(CancellationToken cancellationToken = default) => Execution.WaitAsync(cancellationToken);
+
+    /// <summary>
+    /// Events after <paramref name="afterSequence"/>: the in-memory backlog first, then live events until the run ends.
+    /// </summary>
+    public async IAsyncEnumerable<RunEvent> ReadEventsAsync(long afterSequence, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        List<RunEvent> backlog;
+        Channel<RunEvent>? channel = null;
+        lock (_gate)
+        {
+            backlog = _events.Where(e => e.Sequence > afterSequence).ToList();
+            if (!_eventsCompleted)
+            {
+                channel = Channel.CreateUnbounded<RunEvent>(new UnboundedChannelOptions { SingleReader = true });
+                _subscribers.Add(channel);
+            }
+        }
+
+        try
+        {
+            var last = afterSequence;
+            foreach (var evt in backlog)
+            {
+                last = evt.Sequence;
+                yield return evt;
+            }
+
+            if (channel is null)
+            {
+                yield break;
+            }
+
+            await foreach (var evt in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (evt.Sequence > last)
+                {
+                    last = evt.Sequence;
+                    yield return evt;
+                }
+            }
+        }
+        finally
+        {
+            if (channel is not null)
+            {
+                lock (_gate)
+                {
+                    _subscribers.Remove(channel);
+                }
+            }
+        }
+    }
+
+    internal void Record(PipelineEvent pipelineEvent)
+    {
+        lock (_gate)
+        {
+            var evt = new RunEvent(++_sequence, pipelineEvent);
+            _events.AddLast(evt);
+            while (_events.Count > _maxEvents)
+            {
+                _events.RemoveFirst();
+            }
+
+            switch (pipelineEvent)
+            {
+                case StageStarted started:
+                    CurrentNode = started.NodeId;
+                    break;
+                case StageCompleted completed:
+                    _nodeStatuses[completed.NodeId] = completed.Status;
+                    _completedNodes.Add(completed.NodeId);
+                    if (CurrentNode == completed.NodeId)
+                    {
+                        CurrentNode = null;
+                    }
+
+                    break;
+                case StageFailed { WillRetry: false } failed:
+                    _nodeStatuses[failed.NodeId] = "fail";
+                    break;
+                case LoopRestarted restarted:
+                    CurrentLogsRoot = restarted.LogsRoot;
+                    _nodeStatuses.Clear();
+                    _completedNodes.Clear();
+                    break;
+            }
+
+            foreach (var subscriber in _subscribers)
+            {
+                subscriber.Writer.TryWrite(evt);
+            }
+        }
+    }
+
+    internal void MarkRunning()
+    {
+        lock (_gate)
+        {
+            Status = RunStatus.Running;
+            StartedAt ??= DateTimeOffset.UtcNow;
+            FinishedAt = null;
+            Error = null;
+        }
+    }
+
+    internal void Finish(string status, PipelineResult? result, string? error)
+    {
+        lock (_gate)
+        {
+            Status = status;
+            Result = result ?? Result;
+            Error = error;
+            FinishedAt = DateTimeOffset.UtcNow;
+            CurrentNode = null;
+            if (result is not null)
+            {
+                foreach (var (node, outcome) in result.NodeOutcomes)
+                {
+                    _nodeStatuses[node] = outcome.Status.ToWire();
+                }
+            }
+        }
+    }
+
+    internal void CompleteEvents()
+    {
+        lock (_gate)
+        {
+            _eventsCompleted = true;
+            foreach (var subscriber in _subscribers)
+            {
+                subscriber.Writer.TryComplete();
+            }
+        }
+    }
+
+    internal void ReopenEvents()
+    {
+        lock (_gate)
+        {
+            _eventsCompleted = false;
+        }
+    }
+}
+
+/// <summary>Outcome of starting (or resuming) a run.</summary>
+public sealed record StartResult(ManagedRun? Run, IReadOnlyList<Diagnostic> Diagnostics, string? Error)
+{
+    public bool Succeeded => Run is not null;
+}
+
+/// <summary>A request to start a pipeline.</summary>
+public sealed record StartRequest
+{
+    public required string Dot { get; init; }
+
+    public IReadOnlyDictionary<string, object?>? Context { get; init; }
+
+    public string? WorkingDirectory { get; init; }
+}
+
+/// <summary>Starts, tracks, cancels, and resumes pipeline runs for the HTTP server.</summary>
+public sealed class PipelineRunManager : IAsyncDisposable
+{
+    private readonly ReactorServerOptions _options;
+    private readonly ConcurrentDictionary<string, ManagedRun> _runs = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _slots;
+
+    public PipelineRunManager(ReactorServerOptions options)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _slots = new SemaphoreSlim(Math.Max(1, options.MaxConcurrentRuns));
+        Runner = new PipelineRunner(new PipelineRunnerOptions
+        {
+            Backend = options.Backend,
+            LogsBaseDirectory = ResolveBase(options),
+        });
+        options.ConfigureRunner?.Invoke(Runner);
+    }
+
+    public PipelineRunner Runner { get; }
+
+    public ReactorServerOptions Options => _options;
+
+    /// <summary>All runs, newest first.</summary>
+    public IReadOnlyList<ManagedRun> Runs => _runs.Values.OrderByDescending(r => r.CreatedAt).ToList();
+
+    public ManagedRun? Get(string id) => _runs.GetValueOrDefault(id);
+
+    /// <summary>Parses and validates the pipeline, then starts it (or queues it when all slots are busy).</summary>
+    public StartResult Start(StartRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        PreparedPipeline prepared;
+        try
+        {
+            prepared = Runner.Prepare(DotParser.Parse(request.Dot));
+        }
+        catch (DotParseException ex)
+        {
+            return new StartResult(null, [], ex.Message);
+        }
+
+        if (prepared.HasErrors)
+        {
+            return new StartResult(null, prepared.Diagnostics, "The pipeline has validation errors.");
+        }
+
+        string workingDirectory;
+        if (!string.IsNullOrWhiteSpace(request.WorkingDirectory))
+        {
+            if (!_options.AllowClientWorkingDirectory)
+            {
+                return new StartResult(null, prepared.Diagnostics, "This server does not allow clients to choose the working directory.");
+            }
+
+            workingDirectory = Path.GetFullPath(request.WorkingDirectory);
+            if (!Directory.Exists(workingDirectory))
+            {
+                return new StartResult(null, prepared.Diagnostics, $"Working directory '{workingDirectory}' does not exist.");
+            }
+        }
+        else
+        {
+            workingDirectory = Path.GetFullPath(_options.WorkingDirectory);
+        }
+
+        var id = Guid.NewGuid().ToString("N")[..12];
+        var logsRoot = Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}-{id}");
+        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun));
+        _runs[id] = run;
+        run.Execution = ExecuteAsync(run, (options, ct) => Runner.RunAsync(prepared.Graph, options, ct));
+        return new StartResult(run, prepared.Diagnostics, null);
+    }
+
+    /// <summary>Requests cancellation; false when the run is unknown or already finished.</summary>
+    public bool Cancel(string id)
+    {
+        if (!_runs.TryGetValue(id, out var run) || RunStatus.IsTerminal(run.Status))
+        {
+            return false;
+        }
+
+        run.Cancellation.Cancel();
+        return true;
+    }
+
+    /// <summary>Resumes a finished, unsuccessful run from its last checkpoint.</summary>
+    public StartResult Resume(string id)
+    {
+        if (!_runs.TryGetValue(id, out var run))
+        {
+            return new StartResult(null, [], $"Unknown run '{id}'.");
+        }
+
+        if (!RunStatus.IsTerminal(run.Status))
+        {
+            return new StartResult(null, [], "The run is still active.");
+        }
+
+        if (run.Status == RunStatus.Success)
+        {
+            return new StartResult(null, [], "The run already succeeded.");
+        }
+
+        if (!File.Exists(Path.Combine(run.CurrentLogsRoot, "checkpoint.json")))
+        {
+            return new StartResult(null, [], "The run has no checkpoint to resume from.");
+        }
+
+        run.Cancellation = new CancellationTokenSource();
+        run.ReopenEvents();
+        var logsRoot = run.CurrentLogsRoot;
+        run.Execution = ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options with { LogsRoot = logsRoot }, ct));
+        return new StartResult(run, [], null);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var run in _runs.Values)
+        {
+            if (!RunStatus.IsTerminal(run.Status))
+            {
+                await run.Cancellation.CancelAsync().ConfigureAwait(false);
+            }
+        }
+
+        try
+        {
+            await Task.WhenAll(_runs.Values.Select(r => r.Execution)).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        if (_options.Backend is IAsyncDisposable disposable)
+        {
+            await disposable.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task ExecuteAsync(ManagedRun run, Func<RunOptions, CancellationToken, Task<PipelineResult>> body)
+    {
+        var token = run.Cancellation.Token;
+        await Task.Yield();
+        try
+        {
+            await _slots.WaitAsync(token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            run.Finish(RunStatus.Cancelled, null, null);
+            run.CompleteEvents();
+            return;
+        }
+
+        try
+        {
+            run.MarkRunning();
+            var options = new RunOptions
+            {
+                RunId = run.Id,
+                LogsRoot = run.LogsRoot,
+                WorkingDirectory = run.WorkingDirectory,
+                Interviewer = run.Interviewer,
+                InitialContext = run.InitialContext,
+                OnEvent = run.Record,
+            };
+            var result = await body(options, token).ConfigureAwait(false);
+            run.Finish(StatusOf(result), result, result.Cancelled ? null : FailureOf(result));
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            run.Finish(RunStatus.Cancelled, null, null);
+        }
+        catch (Exception ex)
+        {
+            run.Finish(RunStatus.Error, null, ex.Message);
+        }
+        finally
+        {
+            _slots.Release();
+            run.CompleteEvents();
+        }
+    }
+
+    private static string StatusOf(PipelineResult result) =>
+        result.Cancelled ? RunStatus.Cancelled : result.Status switch
+        {
+            StageStatus.Success => RunStatus.Success,
+            StageStatus.PartialSuccess => RunStatus.PartialSuccess,
+            _ => RunStatus.Fail,
+        };
+
+    private static string? FailureOf(PipelineResult result) =>
+        result.Status is StageStatus.Success or StageStatus.PartialSuccess || string.IsNullOrWhiteSpace(result.FinalOutcome.FailureReason)
+            ? null
+            : result.FinalOutcome.FailureReason;
+
+    private static string ResolveBase(ReactorServerOptions options) =>
+        Path.GetFullPath(Path.IsPathRooted(options.LogsBaseDirectory) ? options.LogsBaseDirectory : Path.Combine(options.WorkingDirectory, options.LogsBaseDirectory));
+
+    private static string Sanitize(string name)
+    {
+        var clean = new string(name.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '-').ToArray()).Trim('-');
+        return clean.Length == 0 ? "pipeline" : clean.Length > 40 ? clean[..40] : clean;
+    }
+}

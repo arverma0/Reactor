@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reactor</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #161c24; --panel2: #1d2530; --border: #2a3441; --text: #d7dee8; --muted: #8a97a8;
+    --accent: #4f9dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --run: #58a6ff; --queued: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+  header h1 span { color: var(--accent); }
+  header .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 49px); }
+  aside { border-right: 1px solid var(--border); overflow: auto; background: var(--panel); }
+  aside .toolbar { padding: 10px; border-bottom: 1px solid var(--border); }
+  .run-item { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .run-item:hover, .run-item.active { background: var(--panel2); }
+  .run-item .name { font-weight: 600; }
+  .run-item .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  section#content { overflow: auto; padding: 18px 22px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { border-color: var(--bad); color: var(--bad); }
+  textarea, input { width: 100%; background: #0b0f14; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 13px/1.4 ui-monospace, Consolas, monospace; }
+  textarea { min-height: 320px; resize: vertical; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; border: 1px solid currentColor; }
+  .s-success { color: var(--ok); } .s-partial_success { color: var(--warn); } .s-fail, .s-error { color: var(--bad); }
+  .s-running { color: var(--run); } .s-queued { color: var(--queued); } .s-cancelled, .s-skipped { color: var(--muted); } .s-retry { color: var(--warn); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .card h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  .question { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn) inset; }
+  .question .text { font-size: 15px; margin-bottom: 10px; white-space: pre-wrap; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tabs button.active { border-color: var(--accent); color: var(--accent); }
+  #graph img { max-width: 100%; background: #fff; border-radius: 6px; padding: 8px; }
+  .events { font: 12px/1.5 ui-monospace, Consolas, monospace; max-height: 60vh; overflow: auto; }
+  .events div { padding: 1px 0; border-bottom: 1px dashed #1f2733; white-space: pre-wrap; word-break: break-word; }
+  .events .t { color: var(--muted); } .events .k { color: var(--accent); }
+  .events .warn { color: var(--warn); } .events .error { color: var(--bad); } .events .debug { color: #6e7b8c; }
+  pre { background: #0b0f14; border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word; }
+  .muted { color: var(--muted); }
+  .diag { margin: 4px 0; } .diag.error { color: var(--bad); } .diag.warning { color: var(--warn); }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .stages { display: grid; grid-template-columns: 220px 1fr; gap: 12px; }
+  .stage-list div { padding: 4px 8px; cursor: pointer; border-radius: 4px; }
+  .stage-list div:hover, .stage-list div.active { background: var(--panel2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚛ <span>Reactor</span></h1>
+  <span class="muted">pipeline console</span>
+  <div class="spacer"></div>
+  <span id="conn" class="muted"></span>
+  <button id="tokenBtn" title="Set API token">🔑 Token</button>
+</header>
+<main>
+  <aside>
+    <div class="toolbar row"><button class="primary" id="newBtn">+ New pipeline</button></div>
+    <div id="runs"></div>
+  </aside>
+  <section id="content"></section>
+</main>
+<script>
+"use strict";
+const SAMPLE = `digraph Example {
+    graph [goal="Create a hello world Python script"]
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    plan      [shape=box, prompt="Plan how to $goal"]
+    implement [shape=box, prompt="Implement the plan", goal_gate=true]
+    review    [shape=hexagon, label="Review the result?"]
+    start -> plan -> implement -> review
+    review -> exit      [label="[A] Approve"]
+    review -> implement [label="[R] Revise"]
+}`;
+const TERMINAL = ["success", "partial_success", "fail", "cancelled", "error"];
+const EVENT_TYPES = ["PipelineStarted", "PipelineCompleted", "PipelineFailed", "StageStarted", "StageCompleted", "StageFailed", "StageRetrying", "StageLog",
+  "EdgeSelected", "GoalGateUnsatisfied", "LoopRestarted", "ParallelStarted", "ParallelBranchStarted", "ParallelBranchCompleted", "ParallelCompleted",
+  "InterviewStarted", "InterviewCompleted", "InterviewTimeout", "CheckpointSaved"];
+const state = { runs: [], selected: null, detail: null, tab: "graph", source: null, events: [], stage: null, refreshTimer: null };
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) node.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return node;
+};
+const token = () => localStorage.getItem("reactor.token") || "";
+async function api(path, options = {}) {
+  const headers = Object.assign({}, options.headers || {});
+  if (token()) headers["Authorization"] = "Bearer " + token();
+  const res = await fetch(path, Object.assign({}, options, { headers }));
+  if (res.status === 401) { $("#conn").textContent = "unauthorized — set a token"; throw new Error("unauthorized"); }
+  return res;
+}
+async function json(path, options) {
+  const res = await api(path, options);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(body.error || res.statusText), { body });
+  return body;
+}
+const badge = (status) => el("span", { class: "badge s-" + status }, String(status).replace("_", " "));
+const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString() : "";
+
+$("#tokenBtn").onclick = () => {
+  const t = prompt("API token (leave empty to clear):", token());
+  if (t !== null) { localStorage.setItem("reactor.token", t.trim()); refreshRuns(); }
+};
+$("#newBtn").onclick = () => { selectRun(null); renderNew(); };
+
+async function refreshRuns() {
+  try { state.runs = await json("/pipelines"); $("#conn").textContent = "connected"; }
+  catch (e) { if (e.message !== "unauthorized") $("#conn").textContent = "offline"; return; }
+  const list = $("#runs");
+  list.replaceChildren();
+  for (const run of state.runs) {
+    list.append(el("div", { class: "run-item" + (run.id === state.selected ? " active" : ""), onclick: () => selectRun(run.id) },
+      el("div", { class: "row" }, el("span", { class: "name" }, run.name), badge(run.status),
+        run.pending_questions ? el("span", { class: "badge s-partial_success" }, "❓ " + run.pending_questions) : null),
+      el("div", { class: "meta" }, run.id, "·", fmtTime(run.created_at), run.current_node ? "· ▶ " + run.current_node : "")));
+  }
+  if (!state.runs.length) list.append(el("div", { class: "run-item muted" }, "No runs yet."));
+}
+
+function renderNew(text) {
+  const area = el("textarea", { spellcheck: "false" });
+  area.value = text || SAMPLE;
+  const diags = el("div");
+  const show = (body) => {
+    diags.replaceChildren();
+    if (body.valid) diags.append(el("div", { class: "diag", style: "color:var(--ok)" }, `✔ valid — ${body.nodes} nodes, ${body.edges} edges`));
+    if (body.error) diags.append(el("div", { class: "diag error" }, "✖ " + body.error));
+    for (const d of body.diagnostics || [])
+      diags.append(el("div", { class: "diag " + d.severity }, `${d.severity === "error" ? "✖" : "⚠"} [${d.rule}] ${d.message}${d.node_id ? " (" + d.node_id + ")" : ""}`));
+  };
+  const post = (path) => json(path, { method: "POST", headers: { "Content-Type": "text/vnd.graphviz" }, body: area.value });
+  const validate = async () => { try { show(await post("/validate")); } catch (e) { show(e.body || { error: e.message }); } };
+  const run = async () => {
+    try { const body = await post("/pipelines"); await refreshRuns(); selectRun(body.id); }
+    catch (e) { show(e.body || { error: e.message }); }
+  };
+  $("#content").replaceChildren(el("div", { class: "card" }, el("h3", {}, "New pipeline (DOT)"), area,
+    el("div", { class: "row", style: "margin-top:10px" }, el("button", { onclick: validate }, "Validate"), el("button", { class: "primary", onclick: run }, "▶ Run")),
+    diags));
+}
+
+function selectRun(id) {
+  if (state.source) { state.source.close(); state.source = null; }
+  state.selected = id; state.events = []; state.stage = null; state.detail = null;
+  refreshRuns();
+  if (id) { loadDetail(); openEvents(id); }
+}
+
+async function loadDetail() {
+  if (!state.selected) return;
+  try { state.detail = await json("/pipelines/" + state.selected); } catch { return; }
+  renderRun();
+}
+
+function openEvents(id) {
+  const url = "/pipelines/" + id + "/events" + (token() ? "?access_token=" + encodeURIComponent(token()) : "");
+  const source = new EventSource(url);
+  state.source = source;
+  const onEvent = (e) => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { return; }
+    state.events.push(data);
+    appendEvent(data);
+    if (data.type !== "StageLog") scheduleRefresh();
+  };
+  for (const type of EVENT_TYPES) source.addEventListener(type, onEvent);
+  source.addEventListener("end", () => { source.close(); scheduleRefresh(); });
+}
+
+function scheduleRefresh() {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(() => { loadDetail(); refreshRuns(); }, 300);
+}
+
+function eventLine(data) {
+  const level = data.level || (/Failed|Timeout|Unsatisfied/.test(data.type) ? "error" : "");
+  return el("div", { class: level }, el("span", { class: "t" }, fmtTime(data.timestamp) + " "), el("span", { class: "k" }, data.type),
+    data.node_id ? " [" + data.node_id + "] " : " ", data.message || data.description || "");
+}
+
+function appendEvent(data) {
+  const box = document.getElementById("eventbox");
+  if (!box) return;
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  box.append(eventLine(data));
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function questionCard(q) {
+  const card = el("div", { class: "card question" }, el("h3", {}, "❓ Human input needed — " + q.stage), el("div", { class: "text" }, q.text));
+  const send = async (value, text) => {
+    try {
+      await json(`/pipelines/${state.selected}/questions/${q.id}/answer`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value, text }) });
+      scheduleRefresh();
+    } catch (e) { alert(e.message); }
+  };
+  const row = el("div", { class: "row" });
+  if (q.type === "freeform") {
+    const input = el("textarea", { style: "min-height:90px" });
+    card.append(input);
+    row.append(el("button", { class: "primary", onclick: () => send(null, input.value) }, "Submit"));
+  } else if (q.type === "yes_no" || q.type === "confirmation") {
+    row.append(el("button", { class: "primary", onclick: () => send("yes") }, "Yes"), el("button", { onclick: () => send("no") }, "No"));
+  } else {
+    for (const o of q.options) row.append(el("button", { class: "primary", onclick: () => send(o.key) }, o.label));
+  }
+  row.append(el("button", { onclick: () => send("skip") }, "Skip"));
+  card.append(row);
+  if (q.timeout_seconds) card.append(el("div", { class: "muted", style: "margin-top:6px" }, `Times out after ${q.timeout_seconds}s` + (q.default ? ` (default: ${q.default})` : "")));
+  return card;
+}
+
+function renderRun() {
+  const d = state.detail;
+  if (!d) return;
+  const active = !TERMINAL.includes(d.status);
+  const failure = d.error || (d.result && d.result.failure_reason);
+  const header = el("div", { class: "card" },
+    el("div", { class: "row" }, el("h2", { style: "margin:0" }, d.name), badge(d.status), d.current_node ? el("span", { class: "muted" }, "▶ " + d.current_node) : null),
+    d.goal ? el("div", { class: "muted", style: "margin:6px 0" }, "Goal: " + d.goal) : null,
+    el("div", { class: "kv", style: "margin-top:8px" },
+      el("div", {}, "Run id"), el("div", {}, d.id),
+      el("div", {}, "Duration"), el("div", {}, d.duration_seconds != null ? d.duration_seconds.toFixed(1) + "s" : "—"),
+      el("div", {}, "Completed"), el("div", {}, (d.completed_nodes || []).join(" → ") || "—"),
+      el("div", {}, "Logs"), el("div", {}, d.logs_root),
+      failure ? el("div", {}, "Failure") : null,
+      failure ? el("div", { style: "color:var(--bad)" }, failure) : null),
+    el("div", { class: "row", style: "margin-top:10px" },
+      active ? el("button", { class: "danger", onclick: async () => { await api(`/pipelines/${d.id}/cancel`, { method: "POST" }); scheduleRefresh(); } }, "■ Cancel") : null,
+      !active && d.status !== "success" ? el("button", { onclick: async () => {
+        const r = await api(`/pipelines/${d.id}/resume`, { method: "POST" });
+        if (r.ok) selectRun(d.id); else alert((await r.json()).error);
+      } }, "↻ Resume") : null));
+  const questions = (d.pending_questions || []).map(questionCard);
+  const tabs = el("div", { class: "tabs" }, ...["graph", "events", "stages", "context", "checkpoint"].map(t =>
+    el("button", { class: state.tab === t ? "active" : "", onclick: () => { state.tab = t; renderRun(); } }, t)));
+  const body = el("div", { class: "card" });
+  $("#content").replaceChildren(header, ...questions, tabs, body);
+  renderTab(body, d);
+}
+
+async function renderTab(body, d) {
+  if (state.tab === "graph") {
+    const holder = el("div", { id: "graph" }, el("span", { class: "muted" }, "Rendering…"));
+    body.append(holder);
+    try {
+      const res = await api(`/pipelines/${d.id}/graph?format=svg`);
+      if (res.ok) holder.replaceChildren(el("img", { src: URL.createObjectURL(await res.blob()), alt: "pipeline graph" }));
+      else { const err = await res.json(); holder.replaceChildren(el("div", { class: "muted" }, err.error || "Graph unavailable"), el("pre", {}, err.dot || "")); }
+    } catch (e) { holder.replaceChildren(el("div", { class: "muted" }, e.message)); }
+  } else if (state.tab === "events") {
+    const box = el("div", { class: "events", id: "eventbox" });
+    body.append(box);
+    for (const e of state.events) box.append(eventLine(e));
+    box.scrollTop = box.scrollHeight;
+  } else if (state.tab === "stages") {
+    const nodes = Object.keys(d.node_statuses || {});
+    const list = el("div", { class: "stage-list" });
+    const view = el("div", {}, el("span", { class: "muted" }, nodes.length ? "Select a stage." : "No stages have run yet."));
+    for (const n of nodes) list.append(el("div", { class: state.stage === n ? "active" : "", onclick: () => { state.stage = n; renderRun(); } }, badge(d.node_statuses[n]), " ", n));
+    body.append(el("div", { class: "stages" }, list, view));
+    if (state.stage) {
+      try {
+        const info = await json(`/pipelines/${d.id}/stages/${encodeURIComponent(state.stage)}`);
+        const content = el("pre", {}, "");
+        const files = el("div", { class: "row" }, ...info.files.map(f => el("button", { onclick: async () => {
+          const r = await api(`/pipelines/${d.id}/stages/${encodeURIComponent(state.stage)}/files/${encodeURIComponent(f.name)}`);
+          content.textContent = await r.text();
+        } }, f.name)));
+        view.replaceChildren(el("div", { class: "muted" }, "Outcome"), el("pre", {}, JSON.stringify(info.outcome, null, 2)), files, content);
+      } catch (e) { view.replaceChildren(el("span", { class: "muted" }, e.message)); }
+    }
+  } else if (state.tab === "context") {
+    try {
+      const ctx = await json(`/pipelines/${d.id}/context`);
+      body.append(el("div", { class: "muted" }, "Source: " + ctx.source), el("pre", {}, JSON.stringify(ctx.context, null, 2)));
+    } catch (e) { body.append(el("span", { class: "muted" }, e.message)); }
+  } else if (state.tab === "checkpoint") {
+    const res = await api(`/pipelines/${d.id}/checkpoint`);
+    body.append(el("pre", {}, res.ok ? JSON.stringify(await res.json(), null, 2) : "No checkpoint yet."));
+  }
+}
+
+refreshRuns();
+setInterval(refreshRuns, 4000);
+renderNew();
+</script>
+</body>
+</html>
