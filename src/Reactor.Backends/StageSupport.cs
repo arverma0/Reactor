@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -38,6 +39,14 @@ public sealed record StageSettings
 
     public TimeSpan? Timeout { get; init; }
 
+    /// <summary>
+    /// Identifies one engine execution: a fresh run, a resume, and each <c>loop_restart</c> get distinct scopes, while
+    /// parallel branches share their run's scope. Thread-scoped sessions never cross scopes.
+    /// </summary>
+    public string ExecutionScope { get; init; } = "";
+
+    private static readonly ConditionalWeakTable<RunServices, string> Scopes = new();
+
     public static StageSettings From(Node node, PipelineContext context)
     {
         ArgumentNullException.ThrowIfNull(node);
@@ -58,24 +67,29 @@ public sealed record StageSettings
             WorkingDirectory = Path.GetFullPath(run?.WorkingDirectory ?? Directory.GetCurrentDirectory()),
             StageDirectory = run?.StageDirectory(node.Id),
             Timeout = node.Timeout,
+            ExecutionScope = run is null ? "" : Scopes.GetValue(run, _ => Guid.NewGuid().ToString("N")),
         };
     }
 
     /// <summary>Key for thread-scoped session reuse (null when the stage does not share a thread).</summary>
-    public string? ThreadKey(string scope) => ThreadId is null ? null : string.Join('\u001f', RunId, scope, ThreadId);
+    public string? ThreadKey(string scope) => ThreadId is null ? null : string.Join('\u001f', RunId, ExecutionScope, scope, ThreadId);
 }
 
 /// <summary>
 /// Holds thread-scoped resources (agent sessions, CLI session ids) for <c>full</c>-fidelity reuse. A resource is leased to
 /// one stage at a time; when parallel branches contend for the same thread, the contender gets a fresh, unpooled
-/// resource (a fork) instead of waiting. Idle entries are evicted after <see cref="IdleTimeout"/>.
+/// resource (a fork) instead of waiting. Idle entries are evicted after <see cref="IdleTimeout"/>. A lease reports
+/// <see cref="Lease.ContextLost"/> when its thread had a resource before but this lease got a fresh one (invalidated,
+/// evicted, or forked), so the caller can carry the earlier context over another way.
 /// </summary>
 internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
     where T : class
 {
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _created = new(StringComparer.Ordinal);
 
-    public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromHours(2);
+    /// <summary>Evict resources unused for this long (null = never).</summary>
+    public TimeSpan? IdleTimeout { get; init; } = TimeSpan.FromHours(6);
 
     public int Count => _entries.Count;
 
@@ -85,19 +99,46 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
         await EvictIdleAsync().ConfigureAwait(false);
         if (key is null)
         {
-            return new Lease(create(), null, this, pooled: false, isNew: true);
+            return new Lease(create(), null, this, pooled: false, isNew: true, contextLost: false);
         }
 
-        var entry = _entries.GetOrAdd(key, _ => new Entry());
-        if (!entry.Gate.Wait(0))
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            return new Lease(create(), null, this, pooled: false, isNew: true);
+            var entry = _entries.GetOrAdd(key, _ => new Entry());
+            if (!entry.Gate.Wait(0))
+            {
+                // Another stage holds this thread (parallel branches): work on a fork rather than wait.
+                return new Lease(create(), null, this, pooled: false, isNew: true, contextLost: true);
+            }
+
+            try
+            {
+                if (entry.Removed)
+                {
+                    // Evicted between the lookup and the lock; look it up again.
+                    entry.Gate.Release();
+                    continue;
+                }
+
+                var isNew = entry.Value is null;
+                var lost = isNew && _created.ContainsKey(key);
+                if (isNew)
+                {
+                    entry.Value = create();
+                    _created[key] = 0;
+                }
+
+                entry.LastUsed = DateTimeOffset.UtcNow;
+                return new Lease(entry.Value!, entry, this, pooled: true, isNew, lost);
+            }
+            catch
+            {
+                entry.Gate.Release();
+                throw;
+            }
         }
 
-        var isNew = entry.Value is null;
-        entry.Value ??= create();
-        entry.LastUsed = DateTimeOffset.UtcNow;
-        return new Lease(entry.Value, entry, this, pooled: true, isNew);
+        return new Lease(create(), null, this, pooled: false, isNew: true, contextLost: _created.ContainsKey(key));
     }
 
     /// <summary>Drops (and disposes) a pooled resource, e.g. after its session closed.</summary>
@@ -117,8 +158,11 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
     {
         foreach (var (key, entry) in _entries.ToList())
         {
-            _entries.TryRemove(key, out _);
-            if (entry.Value is { } value && dispose is not null)
+            entry.Removed = true;
+            _entries.TryRemove(new KeyValuePair<string, Entry>(key, entry));
+            var value = entry.Value;
+            entry.Value = null;
+            if (value is not null && dispose is not null)
             {
                 await dispose(value).ConfigureAwait(false);
             }
@@ -127,22 +171,35 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
 
     private async Task EvictIdleAsync()
     {
-        var cutoff = DateTimeOffset.UtcNow - IdleTimeout;
+        if (IdleTimeout is not { } idle)
+        {
+            return;
+        }
+
+        var cutoff = DateTimeOffset.UtcNow - idle;
         foreach (var (key, entry) in _entries)
         {
-            if (entry.LastUsed < cutoff && entry.Gate.Wait(0))
+            if (entry.LastUsed >= cutoff || !entry.Gate.Wait(0))
             {
-                try
-                {
-                    if (_entries.TryRemove(key, out _) && entry.Value is { } value && dispose is not null)
-                    {
-                        await dispose(value).ConfigureAwait(false);
-                    }
-                }
-                finally
-                {
-                    entry.Gate.Release();
-                }
+                continue;
+            }
+
+            T? value;
+            try
+            {
+                entry.Removed = true;
+                _entries.TryRemove(new KeyValuePair<string, Entry>(key, entry));
+                value = entry.Value;
+                entry.Value = null;
+            }
+            finally
+            {
+                entry.Gate.Release();
+            }
+
+            if (value is not null && dispose is not null)
+            {
+                await dispose(value).ConfigureAwait(false);
             }
         }
     }
@@ -154,9 +211,12 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
         public T? Value { get; set; }
 
         public DateTimeOffset LastUsed { get; set; } = DateTimeOffset.UtcNow;
+
+        /// <summary>Set (under the gate) when the entry leaves the pool; holders of a stale reference must look up again.</summary>
+        public bool Removed { get; set; }
     }
 
-    internal sealed class Lease(T value, Entry? entry, ThreadLeasePool<T> pool, bool pooled, bool isNew) : IAsyncDisposable
+    internal sealed class Lease(T value, Entry? entry, ThreadLeasePool<T> pool, bool pooled, bool isNew, bool contextLost) : IAsyncDisposable
     {
         private int _released;
 
@@ -167,8 +227,11 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
         /// <summary>False for forks and thread-less stages: the caller owns (and must dispose) the resource.</summary>
         public bool Pooled { get; } = pooled;
 
-        /// <summary>True when the resource was created for this lease (first stage of the thread).</summary>
+        /// <summary>True when the resource was created for this lease.</summary>
         public bool IsNew { get; } = isNew;
+
+        /// <summary>True when the thread had a resource before, but this lease got a fresh one without its history.</summary>
+        public bool ContextLost { get; } = contextLost;
 
         public async ValueTask DisposeAsync()
         {
@@ -190,6 +253,56 @@ internal sealed class ThreadLeasePool<T>(Func<T, ValueTask>? dispose = null)
     }
 
     private ValueTask DisposeUnpooledAsync(T value) => dispose?.Invoke(value) ?? ValueTask.CompletedTask;
+}
+
+/// <summary>Carries pipeline context into a stage whose thread conversation is unavailable.</summary>
+internal static class ThreadContinuity
+{
+    public const string Notice =
+        "Note: the earlier conversation for this stage's thread is not available (the agent session was restarted or " +
+        "forked), so here is a summary of the pipeline so far.";
+
+    /// <summary>
+    /// For a <c>full</c>-fidelity stage that had to start a fresh session although its thread already had a session,
+    /// prepends a <c>summary:high</c> preamble (as the engine does after a resume) so the agent does not start blind. The
+    /// prompt actually sent is saved as <c>prompt.effective.md</c>.
+    /// </summary>
+    public static string Recover(string prompt, StageSettings stage, PipelineContext context, Action<string, string> log)
+    {
+        ArgumentNullException.ThrowIfNull(prompt);
+        ArgumentNullException.ThrowIfNull(stage);
+        ArgumentNullException.ThrowIfNull(context);
+        if (context.Run is not { } run)
+        {
+            return prompt;
+        }
+
+        var preamble = PreambleBuilder.Build(FidelityModes.SummaryHigh, run.Graph, context, run.History, run.RunId);
+        if (preamble.Length == 0)
+        {
+            return prompt;
+        }
+
+        log("thread conversation unavailable (session restarted or forked); continuing with a summary of earlier stages", "warn");
+        var effective = $"{Notice}\n\n{preamble}\n\n---\n\n{prompt}";
+        if (stage.StageDirectory is { } dir)
+        {
+            try
+            {
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, "prompt.effective.md"), effective);
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        return effective;
+    }
+
+    /// <summary>How a stage's thread conversation was obtained (recorded in <c>backend.json</c>).</summary>
+    public static string? Describe(StageSettings stage, bool isNew, bool contextLost) =>
+        stage.ThreadId is null ? null : contextLost ? "recovered" : isNew ? "new" : "continued";
 }
 
 /// <summary>Appends backend activity to <c>{stage}/agent-events.jsonl</c> (one JSON object per line).</summary>

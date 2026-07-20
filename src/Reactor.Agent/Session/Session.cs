@@ -53,7 +53,8 @@ public sealed class Session : IAsyncDisposable
     private string? _projectDocs;
     private bool _started;
     private bool _contextWarningEmitted;
-    private volatile bool _aborting;
+    private int _stopRequested;
+    private string? _stopReason;
     private int _shutdown;
     private Usage _totalUsage = Usage.Empty;
     private volatile SessionState _state = SessionState.Idle;
@@ -167,11 +168,20 @@ public sealed class Session : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(input);
         ThrowIfClosed();
         await _processing.WaitAsync(cancellationToken).ConfigureAwait(false);
+        CancellationTokenSource? cts = null;
         try
         {
             ThrowIfClosed();
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _processingCts = cts;
+            cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            // Publish the token source, then re-check for a stop request (both with full fences) so a concurrent
+            // AbortAsync/CloseAsync either sees the source or is seen here.
+            Interlocked.Exchange(ref _processingCts, cts);
+            if (Volatile.Read(ref _stopRequested) == 1)
+            {
+                await cts.CancelAsync().ConfigureAwait(false);
+            }
+
             await EnsureStartedAsync(cts.Token).ConfigureAwait(false);
 
             string? next = input;
@@ -193,14 +203,15 @@ public sealed class Session : IAsyncDisposable
 
             Emit(EventKind.ProcessingEnd, ("state", _state.ToString()));
         }
-        catch (OperationCanceledException) when (_aborting || _state == SessionState.Closed || cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (Volatile.Read(ref _stopRequested) == 1 || _state == SessionState.Closed || cancellationToken.IsCancellationRequested)
         {
-            await ShutdownAsync("aborted").ConfigureAwait(false);
+            await ShutdownAsync(_stopReason ?? "aborted").ConfigureAwait(false);
             throw new AbortError("The session was aborted.");
         }
         finally
         {
-            _processingCts = null;
+            Interlocked.Exchange(ref _processingCts, null);
+            cts?.Dispose();
             _processing.Release();
         }
     }
@@ -223,28 +234,36 @@ public sealed class Session : IAsyncDisposable
     /// Aborts any in-flight work: cancels the LLM call, kills running processes, closes subagents, emits SESSION_END,
     /// and transitions to CLOSED.
     /// </summary>
-    public async Task AbortAsync()
+    public Task AbortAsync() => StopAsync("aborted");
+
+    /// <summary>Closes the session, cancelling in-flight work if any (same sequence as <see cref="AbortAsync"/>).</summary>
+    public Task CloseAsync() => StopAsync("closed");
+
+    public ValueTask DisposeAsync() => new(CloseAsync());
+
+    private async Task StopAsync(string reason)
     {
-        if (_state == SessionState.Closed)
+        if (Volatile.Read(ref _shutdown) == 1)
         {
             return;
         }
 
-        _aborting = true;
+        Interlocked.CompareExchange(ref _stopReason, reason, null);
+        Interlocked.Exchange(ref _stopRequested, 1);
         try
         {
-            _processingCts?.Cancel();
+            Volatile.Read(ref _processingCts)?.Cancel();
         }
         catch (ObjectDisposedException)
         {
         }
 
-        // Let the loop unwind (cancelling the LLM stream and killing its processes) before the final cleanup; bounded so an
-        // abort issued from inside the loop (e.g. by an event observer) cannot deadlock.
+        // Let the loop unwind (cancelling the LLM stream and killing its processes) before the final cleanup; bounded so a
+        // stop issued from inside the loop (e.g. by an event observer) cannot deadlock.
         var acquired = await _processing.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         try
         {
-            await ShutdownAsync("aborted").ConfigureAwait(false);
+            await ShutdownAsync(_stopReason ?? reason).ConfigureAwait(false);
         }
         finally
         {
@@ -255,11 +274,6 @@ public sealed class Session : IAsyncDisposable
         }
     }
 
-    /// <summary>Closes the session (aborting in-flight work if any).</summary>
-    public Task CloseAsync() => _state == SessionState.Processing ? AbortAsync() : ShutdownAsync("closed");
-
-    public ValueTask DisposeAsync() => new(CloseAsync());
-
     private async Task EnsureStartedAsync(CancellationToken cancellationToken)
     {
         if (_started)
@@ -267,7 +281,6 @@ public sealed class Session : IAsyncDisposable
             return;
         }
 
-        _started = true;
         _snapshot ??= await EnvironmentSnapshot.CaptureAsync(Environment, _options.CaptureGitContext, cancellationToken).ConfigureAwait(false);
         if (_projectDocs is null && _options.DiscoverProjectDocs)
         {
@@ -277,6 +290,7 @@ public sealed class Session : IAsyncDisposable
             _projectDocs = await ProjectDocs.DiscoverAsync(Environment, _snapshot.GitRoot, fileNames, cancellationToken).ConfigureAwait(false);
         }
 
+        _started = true;
         Emit(EventKind.SessionStart, ("model", Profile.Model), ("profile", Profile.Id), ("depth", Depth));
     }
 
@@ -429,13 +443,11 @@ public sealed class Session : IAsyncDisposable
         for (var attempt = 0; ; attempt++)
         {
             var accumulator = new StreamAccumulator();
-            var delivered = false;
             var textStarted = false;
             try
             {
                 await foreach (var evt in Client.StreamAsync(request, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
                 {
-                    delivered = true;
                     accumulator.Process(evt);
                     if (evt.Type == StreamEventType.TextDelta && evt.Delta is { Length: > 0 } delta)
                     {
@@ -460,9 +472,10 @@ public sealed class Session : IAsyncDisposable
 
                 return accumulator.Response;
             }
-            catch (Exception error) when (!delivered && error is not AbortError && !cancellationToken.IsCancellationRequested &&
+            catch (Exception error) when (error is not AbortError && !cancellationToken.IsCancellationRequested &&
                                           attempt < Config.LlmRetryPolicy.MaxRetries && Config.LlmRetryPolicy.IsRetryable(error))
             {
+                // Retrying is safe even mid-stream: nothing has been executed yet, and only text deltas were shown.
                 var delay = Config.LlmRetryPolicy.CalculateDelay(attempt);
                 if (error is ProviderError { RetryAfter: double retryAfter })
                 {
@@ -472,6 +485,11 @@ public sealed class Session : IAsyncDisposable
                     }
 
                     delay = TimeSpan.FromSeconds(retryAfter);
+                }
+
+                if (textStarted)
+                {
+                    Emit(EventKind.Warning, ("message", $"The response stream was interrupted ({error.Message}); retrying the request."), ("error_type", error.GetType().Name));
                 }
 
                 Config.LlmRetryPolicy.OnRetry?.Invoke(error, attempt + 1, delay);

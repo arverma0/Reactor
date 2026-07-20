@@ -355,6 +355,53 @@ public sealed class SessionLoopTests
         Assert.Equal(SessionState.Idle, session.State);
     }
 
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(3, true)]
+    public async Task Stream_failures_are_retried_even_after_output_started(int afterEvents, bool warns)
+    {
+        var (session, llm, _, events) = Create();
+        llm.Responder = _ => Text("complete answer");
+        llm.FailNextStream(afterEvents, new StreamError("connection reset"));
+
+        await session.SubmitAsync("go", Ct);
+
+        Assert.Equal(2, llm.Requests.Count);
+        Assert.Equal("complete answer", session.LastAssistantText);
+        Assert.Equal(SessionState.Idle, session.State);
+        Assert.Equal(warns, Of(events, EventKind.Warning).Any(e => e.GetString("message")!.Contains("interrupted", StringComparison.Ordinal)));
+        Assert.Single(session.History.OfType<AssistantTurn>());
+    }
+
+    [Fact]
+    public async Task Closing_while_the_session_is_starting_cancels_the_loop()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var env = new FakeEnvironment
+        {
+            CommandHandler = _ =>
+            {
+                entered.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+                return new ExecResult { ExitCode = 128 };
+            },
+        };
+        var (session, llm, _, events) = Create(env: env);
+        llm.Responder = _ => Text("should not be called");
+
+        var run = Task.Run(() => session.SubmitAsync("go", Ct), Ct);
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+        var close = session.CloseAsync();
+        release.Set();
+
+        await Assert.ThrowsAsync<AbortError>(() => run);
+        await close;
+        Assert.Empty(llm.Requests);
+        Assert.Equal(SessionState.Closed, session.State);
+        Assert.Equal("closed", Assert.Single(Of(events, EventKind.SessionEnd)).GetString("reason"));
+    }
+
     [Fact]
     public async Task Retries_exhausted_closes_the_session()
     {

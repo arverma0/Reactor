@@ -27,6 +27,13 @@ internal sealed class FakeLlm : IProviderAdapter
     /// <summary>Awaited before each response (lets tests block the model call, e.g. to test abort).</summary>
     public Func<Request, CancellationToken, Task>? BeforeRespond { get; set; }
 
+    private StreamFailure? _pendingStreamFailure;
+
+    private sealed record StreamFailure(int AfterEvents, Exception Error);
+
+    /// <summary>Makes the next stream throw <paramref name="error"/> after yielding <paramref name="afterEvents"/> events.</summary>
+    public void FailNextStream(int afterEvents, Exception error) => _pendingStreamFailure = new StreamFailure(afterEvents, error);
+
     public IReadOnlyList<Request> Requests
     {
         get
@@ -79,9 +86,17 @@ internal sealed class FakeLlm : IProviderAdapter
     public async IAsyncEnumerable<StreamEvent> StreamAsync(Request request, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var response = await CompleteAsync(request, cancellationToken);
+        var failure = Interlocked.Exchange(ref _pendingStreamFailure, null);
+        var emitted = 0;
         foreach (var evt in Synthesize(response))
         {
+            if (failure is not null && emitted == failure.AfterEvents)
+            {
+                throw failure.Error;
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
+            emitted++;
             yield return evt;
         }
     }

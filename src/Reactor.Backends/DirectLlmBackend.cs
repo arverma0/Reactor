@@ -44,6 +44,11 @@ public sealed class DirectLlmBackend(DirectLlmBackendOptions options) : ICoderge
 
         await using var lease = await _threads.AcquireAsync(stage.ThreadKey("direct:" + provider), () => []).ConfigureAwait(false);
         var history = lease.Value;
+        if (lease.ContextLost)
+        {
+            prompt = ThreadContinuity.Recover(prompt, stage, context, (message, level) => context.Run?.Log(node.Id, message, level));
+        }
+
         var messages = new List<Message>();
         if (!string.IsNullOrWhiteSpace(_options.SystemPrompt))
         {
@@ -57,7 +62,7 @@ public sealed class DirectLlmBackend(DirectLlmBackendOptions options) : ICoderge
             Model = model,
             Provider = provider,
             Messages = messages,
-            ReasoningEffort = ModelCatalog.GetModelInfo(model)?.SupportsReasoning == false ? null : stage.ReasoningEffort,
+            ReasoningEffort = ModelResolution.ReasoningEffort(stage, model),
             MaxTokens = _options.MaxTokens,
         };
 

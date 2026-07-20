@@ -37,4 +37,21 @@ public static class ModelResolution
             ? throw new ConfigurationError($"Node '{stage.NodeId}': no llm_model is set and no default model is known for provider '{provider}'.")
             : (provider, model);
     }
+
+    /// <summary>
+    /// The reasoning effort to request: none for models the catalog marks as non-reasoning; otherwise the node's explicit
+    /// value (attribute or stylesheet); otherwise the spec default (<c>high</c>) for models known to reason, and nothing for
+    /// unknown models, since OpenAI-compatible servers commonly reject the parameter.
+    /// </summary>
+    public static string? ReasoningEffort(StageSettings stage, string model)
+    {
+        ArgumentNullException.ThrowIfNull(stage);
+        var info = ModelCatalog.GetModelInfo(model);
+        if (info is { SupportsReasoning: false })
+        {
+            return null;
+        }
+
+        return stage.ExplicitReasoningEffort ?? (info is { SupportsReasoning: true } ? stage.ReasoningEffort : null);
+    }
 }

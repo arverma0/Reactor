@@ -187,7 +187,7 @@ internal static class PipelineCommands
 
                 var logsRoot = result.GetValue(logs) is { } explicitLogs
                     ? Path.GetFullPath(explicitLogs)
-                    : Path.Combine(RunsDirectory(workDir), $"{DateTime.Now:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}");
+                    : UniqueRunDirectory(RunsDirectory(workDir), $"{DateTime.Now:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}");
                 return await runner.RunAsync(graph, runOptions with { LogsRoot = logsRoot, StartAt = result.GetValue(startAt) }, ct).ConfigureAwait(false);
             }).ConfigureAwait(false);
         });
@@ -472,6 +472,18 @@ internal static class PipelineCommands
     }
 
     internal static string RunsDirectory(string workDir) => Path.Combine(workDir, ".reactor", "runs");
+
+    /// <summary><paramref name="name"/> under <paramref name="parent"/>, suffixed (-2, -3, …) if that run directory exists.</summary>
+    internal static string UniqueRunDirectory(string parent, string name)
+    {
+        var path = Path.Combine(parent, name);
+        for (var suffix = 2; Directory.Exists(path); suffix++)
+        {
+            path = Path.Combine(parent, $"{name}-{suffix.ToString(CultureInfo.InvariantCulture)}");
+        }
+
+        return path;
+    }
 
     /// <summary>Creates <c>.reactor/</c> with a <c>.gitignore</c> so run logs never end up in commits.</summary>
     internal static void EnsureRunsDirectory(string workDir)

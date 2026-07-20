@@ -86,8 +86,12 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
             session.Profile.Model = model;
         }
 
-        ConfigureForStage(session.Config, node, stage);
+        ConfigureForStage(session.Config, node, stage, model);
         holder.Hooks = ToolHookSettings.Resolve(node, run?.Graph, stage, Log);
+        if (lease.ContextLost)
+        {
+            prompt = ThreadContinuity.Recover(prompt, stage, context, Log);
+        }
 
         using var eventLog = new StageEventLog(stage.StageDirectory);
         var stageStats = new StageStats();
@@ -128,6 +132,7 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
             ["model"] = model,
             ["session_id"] = session.Id,
             ["thread_id"] = stage.ThreadId,
+            ["thread_context"] = ThreadContinuity.Describe(stage, lease.IsNew, lease.ContextLost),
             ["reasoning_effort"] = session.Config.ReasoningEffort,
             ["assistant_turns"] = stageTurns.Count(t => t is AssistantTurn),
             ["tool_calls"] = stageStats.ToolCalls,
@@ -179,21 +184,16 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
         return holder;
     }
 
-    private void ConfigureForStage(SessionConfig config, Node node, StageSettings stage)
+    private void ConfigureForStage(SessionConfig config, Node node, StageSettings stage, string model)
     {
         var defaults = _options.SessionConfig ?? new SessionConfig();
-        config.ReasoningEffort = stage.ReasoningEffort;
+        config.ReasoningEffort = ModelResolution.ReasoningEffort(stage, model);
         config.MaxToolRoundsPerInput = ParseInt(node["agent.max_tool_rounds"]) ?? defaults.MaxToolRoundsPerInput;
         config.MaxTurns = ParseInt(node["agent.max_turns"]) ?? defaults.MaxTurns;
         config.UserInstructions = Combine(defaults.UserInstructions, node["agent.instructions"]);
-        if (AttributeValues.ParseDuration(node["agent.shell_timeout"]) is { } shellTimeout)
-        {
-            config.DefaultCommandTimeoutMs = (int)Math.Clamp(shellTimeout.TotalMilliseconds, 1, int.MaxValue);
-        }
-        else
-        {
-            config.DefaultCommandTimeoutMs = defaults.DefaultCommandTimeoutMs;
-        }
+        config.CommandTimeoutOverrideMs = AttributeValues.ParseDuration(node["agent.shell_timeout"]) is { } shellTimeout
+            ? (int)Math.Clamp(shellTimeout.TotalMilliseconds, 1, int.MaxValue)
+            : defaults.CommandTimeoutOverrideMs;
     }
 
     private void OnSessionEvent(SessionEvent evt, StageEventLog eventLog, StageStats stats, Action<string, string> log)

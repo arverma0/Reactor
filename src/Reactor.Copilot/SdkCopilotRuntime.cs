@@ -42,8 +42,10 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
                     }
 
                     var decision = await hookRunner.BeforeAsync(ToCall(conversation, input.ToolName, input.ToolArgs, input.WorkingDirectory), CancellationToken.None).ConfigureAwait(false);
+
+                    // Allowed: express no opinion so the normal permission flow still applies.
                     return decision.Allowed
-                        ? new PreToolUseHookOutput { PermissionDecision = "allow" }
+                        ? null!
                         : new PreToolUseHookOutput { PermissionDecision = "deny", PermissionDecisionReason = $"Tool call blocked: {decision.Reason}" };
                 },
                 OnPostToolUse = async (input, _) =>

@@ -125,6 +125,10 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
 
         var conversation = holder.Conversation;
         Log($"copilot-sdk: {(resumed ? "continuing" : "started")} session {conversation.SessionId}" + (model is null ? "" : $" ({model})"), "info");
+        if (lease.ContextLost)
+        {
+            prompt = ThreadContinuity.Recover(prompt, stage, context, Log);
+        }
 
         var stats = new StageStats();
         string? reply;
@@ -180,6 +184,7 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
             ["session_id"] = conversation.SessionId,
             ["thread_id"] = stage.ThreadId,
             ["resumed"] = resumed,
+            ["thread_context"] = ThreadContinuity.Describe(stage, !resumed, lease.ContextLost),
             ["reasoning_effort"] = effort,
             ["tool_calls"] = stats.ToolCalls,
             ["tool_errors"] = stats.ToolErrors,

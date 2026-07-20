@@ -218,7 +218,90 @@ public sealed class AgentLoopBackendTests
             """, Pipelines.Options(dir), Ct);
 
         Assert.Equal(["base-model", "big-model"], llm.Requests.Select(r => r.Model));
-        Assert.Equal(["high", "low"], llm.Requests.Select(r => r.ReasoningEffort));
+
+        // base-model is unknown to the catalog, so the implicit default effort is not sent; the stylesheet's explicit one is.
+        Assert.Equal([null, "low"], llm.Requests.Select(r => r.ReasoningEffort));
+    }
+
+    [Theory]
+    [InlineData("gpt-5.2", null, "high")]
+    [InlineData("gpt-5.2", "low", "low")]
+    [InlineData("gpt-4.1", "high", null)]
+    [InlineData("my-local-model", null, null)]
+    [InlineData("my-local-model", "medium", "medium")]
+    public void Reasoning_effort_policy_respects_the_catalog_and_explicit_settings(string model, string? explicitEffort, string? expected)
+    {
+        var stage = new StageSettings
+        {
+            NodeId = "n",
+            WorkingDirectory = ".",
+            ExplicitReasoningEffort = explicitEffort,
+            ReasoningEffort = explicitEffort ?? "high",
+        };
+
+        Assert.Equal(expected, ModelResolution.ReasoningEffort(stage, model));
+    }
+
+    [Fact]
+    public async Task Agent_shell_timeout_overrides_the_profile_default()
+    {
+        using var dir = new TempDir();
+        var llm = new FakeLlm("anthropic");
+        var client = new Client(new Dictionary<string, IProviderAdapter> { ["anthropic"] = llm }, "anthropic");
+        await using var backend = new AgentLoopBackend(new AgentLoopBackendOptions { Client = client });
+        var slow = OperatingSystem.IsWindows() ? "ping -n 6 127.0.0.1 > nul" : "sleep 5";
+        llm.Responder = r => ToolResultCount(r) == 0 ? FakeLlm.ToolCalls(("c1", "shell", Args(new { command = slow }))) : FakeLlm.Text("done");
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              build [prompt="Build", llm_model="claude-sonnet-4-5", agent.shell_timeout="1s"]
+              start -> build -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        var result = llm.Requests[1].Messages.Where(m => m.Role == Role.Tool).SelectMany(m => m.Content).Single().ToolResult!;
+        Assert.Contains("timed out after 1000ms", result.ContentText);
+    }
+
+    [Fact]
+    public async Task A_full_fidelity_retry_after_a_timeout_recovers_thread_context()
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create();
+        var blocked = 0;
+        llm.BeforeRespond = async (request, ct) =>
+        {
+            if (request.Messages.Last(m => m.Role == Role.User).Text.Contains("Second task", StringComparison.Ordinal) &&
+                Interlocked.Increment(ref blocked) == 1)
+            {
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+        };
+        llm.Responder = _ => FakeLlm.Text("ok");
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [default_fidelity="full"]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="First task: plan"]
+              b [prompt="Second task: build", timeout="500ms", max_retries=1]
+              start -> a -> b -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var retry = llm.Requests[^1];
+        var user = Assert.Single(retry.Messages, m => m.Role == Role.User).Text;
+        Assert.StartsWith(ThreadContinuity.Notice, user);
+        Assert.Contains("## Pipeline context", user);
+        Assert.Contains("Second task: build", user);
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "b", "backend.json")))!;
+        Assert.Equal("recovered", metadata["thread_context"]!.GetValue<string>());
+        Assert.True(File.Exists(dir.Combine("run", "b", "prompt.effective.md")));
+        Assert.Equal("new", JsonNode.Parse(File.ReadAllText(dir.Combine("run", "a", "backend.json")))!["thread_context"]!.GetValue<string>());
     }
 
     [Fact]

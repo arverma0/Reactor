@@ -28,11 +28,14 @@ internal static class ShellTool
             "command")),
         ExecuteAsync);
 
-    /// <summary>The timeout used for a call: explicit, else the profile default, else the session default; clamped to [1, max].</summary>
+    /// <summary>
+    /// The timeout used for a call: explicit, else the session's override, else the profile default, else the session
+    /// default; clamped to [1, max].
+    /// </summary>
     public static int EffectiveTimeout(int? requested, ToolContext context)
     {
         var maximum = Math.Max(1, context.Config.MaxCommandTimeoutMs);
-        var timeout = requested ?? context.ProfileShellTimeoutMs ?? context.Config.DefaultCommandTimeoutMs;
+        var timeout = requested ?? context.Config.CommandTimeoutOverrideMs ?? context.ProfileShellTimeoutMs ?? context.Config.DefaultCommandTimeoutMs;
         return Math.Clamp(timeout, 1, maximum);
     }
 

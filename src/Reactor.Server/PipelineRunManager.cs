@@ -12,7 +12,7 @@ namespace Reactor.Server;
 /// <summary>Configuration for HTTP server mode.</summary>
 public sealed record ReactorServerOptions
 {
-    /// <summary>Backend for codergen stages (null = simulation mode).</summary>
+    /// <summary>Backend for codergen stages (null = simulation mode). Owned by the caller: the server never disposes it.</summary>
     public ICodergenBackend? Backend { get; init; }
 
     /// <summary>Where run directories are created (relative paths resolve against <see cref="WorkingDirectory"/>).</summary>
@@ -291,11 +291,33 @@ public sealed class ManagedRun
         }
     }
 
-    internal void ReopenEvents()
+    /// <summary>
+    /// Atomically moves a finished, unsuccessful run back to <c>queued</c> for a resume, so concurrent resume requests cannot
+    /// start two executions on the same run directory.
+    /// </summary>
+    internal bool TryBeginResume(CancellationTokenSource cancellation, out string? error)
     {
         lock (_gate)
         {
+            if (!RunStatus.IsTerminal(Status))
+            {
+                error = "The run is still active.";
+                return false;
+            }
+
+            if (Status == RunStatus.Success)
+            {
+                error = "The run already succeeded.";
+                return false;
+            }
+
+            Cancellation = cancellation;
+            Status = RunStatus.Queued;
+            FinishedAt = null;
+            Error = null;
             _eventsCompleted = false;
+            error = null;
+            return true;
         }
     }
 }
@@ -322,6 +344,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
     private readonly ReactorServerOptions _options;
     private readonly ConcurrentDictionary<string, ManagedRun> _runs = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _slots;
+    private int _disposed;
 
     public PipelineRunManager(ReactorServerOptions options)
     {
@@ -410,30 +433,29 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, [], $"Unknown run '{id}'.");
         }
 
-        if (!RunStatus.IsTerminal(run.Status))
-        {
-            return new StartResult(null, [], "The run is still active.");
-        }
-
-        if (run.Status == RunStatus.Success)
-        {
-            return new StartResult(null, [], "The run already succeeded.");
-        }
-
         if (!File.Exists(Path.Combine(run.CurrentLogsRoot, "checkpoint.json")))
         {
-            return new StartResult(null, [], "The run has no checkpoint to resume from.");
+            return new StartResult(null, [], RunStatus.IsTerminal(run.Status) ? "The run has no checkpoint to resume from." : "The run is still active.");
         }
 
-        run.Cancellation = new CancellationTokenSource();
-        run.ReopenEvents();
+        if (!run.TryBeginResume(new CancellationTokenSource(), out var error))
+        {
+            return new StartResult(null, [], error);
+        }
+
         var logsRoot = run.CurrentLogsRoot;
         run.Execution = ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options with { LogsRoot = logsRoot }, ct));
         return new StartResult(run, [], null);
     }
 
+    /// <summary>Cancels active runs and waits (up to 30 s) for them to stop. The backend is owned by the caller.</summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         foreach (var run in _runs.Values)
         {
             if (!RunStatus.IsTerminal(run.Status))
@@ -448,11 +470,6 @@ public sealed class PipelineRunManager : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-        }
-
-        if (_options.Backend is IAsyncDisposable disposable)
-        {
-            await disposable.DisposeAsync().ConfigureAwait(false);
         }
     }
 

@@ -40,6 +40,13 @@ public class ShellToolTests
         Assert.Equal(600_000, ShellTool.EffectiveTimeout(9_999_999, Context(null)));
         Assert.Equal(1, ShellTool.EffectiveTimeout(0, Context(null)));
         Assert.Equal(1, ShellTool.EffectiveTimeout(-5, Context(null)));
+
+        // A session override beats the profile default but not an explicit timeout_ms.
+        config.CommandTimeoutOverrideMs = 30_000;
+        Assert.Equal(30_000, ShellTool.EffectiveTimeout(null, Context(120_000)));
+        Assert.Equal(30_000, ShellTool.EffectiveTimeout(null, Context(null)));
+        Assert.Equal(5_000, ShellTool.EffectiveTimeout(5_000, Context(120_000)));
+        Assert.Equal(30_000, config.Clone().CommandTimeoutOverrideMs);
     }
 
     [Fact]

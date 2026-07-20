@@ -417,6 +417,37 @@ public sealed class ServerApiTests
     }
 
     [Fact]
+    public async Task Concurrent_resume_requests_start_exactly_one_execution()
+    {
+        var backend = new ControllableBackend
+        {
+            Respond = node => node.Id == "implement" ? CodergenResult.FromOutcome(Outcome.Fail("compile error")) : CodergenResult.FromText("ok"),
+        };
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend });
+        var id = (await server.StartRunAsync("""
+            digraph Resumable {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan"]
+              implement [prompt="Implement"]
+              start -> plan -> implement
+              implement -> exit [condition="outcome=success"]
+            }
+            """))["id"]!.GetValue<string>();
+        await server.WaitForStatusAsync(id, "fail", "error");
+
+        // Hold the resumed execution at `implement` so every request sees the same state.
+        backend.Block.Add("implement");
+        backend.Respond = _ => CodergenResult.FromText("ok");
+        var responses = await Task.WhenAll(Enumerable.Range(0, 5).Select(_ => server.Client.PostAsync($"/pipelines/{id}/resume", null)));
+
+        Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Accepted);
+        Assert.Equal(4, responses.Count(r => r.StatusCode == HttpStatusCode.Conflict));
+        backend.Release.SetResult();
+        await server.WaitForStatusAsync(id, "success");
+    }
+
+    [Fact]
     public async Task Graph_is_rendered_with_stage_status_colors()
     {
         await using var server = await ServerHarness.StartAsync();

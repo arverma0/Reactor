@@ -271,6 +271,31 @@ public sealed class CliBackendTests
     }
 
     [Fact]
+    public async Task A_run_killed_before_reporting_its_session_retries_with_a_fresh_session_id()
+    {
+        // Claude Code rejects --session-id for an id that already exists, and a killed run may have created it.
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), ClaudeOutput, sleepSeconds: 10);
+        await using var backend = new ClaudeCodeBackend(new ClaudeCodeOptions { Executable = cli.Executable });
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [default_fidelity="full"]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan", timeout="1s", max_retries=1]
+              start -> plan -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Fail, result.NodeOutcomes["plan"].Status);
+        var invocations = cli.Invocations;
+        Assert.Equal(2, invocations.Count);
+        Assert.All(invocations, i => Assert.Contains("--session-id", i));
+        Assert.NotEqual(SessionIdArg(invocations[0], "--session-id"), SessionIdArg(invocations[1], "--session-id"));
+    }
+
+    [Fact]
     public async Task Cancellation_kills_the_cli_process_tree()
     {
         using var dir = new TempDir();

@@ -82,7 +82,7 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
     private readonly CliAgentOptions _options;
     private readonly string _defaultExecutable;
     private readonly string _executableVariable;
-    private readonly ThreadLeasePool<CliThread> _threads = new();
+    private readonly ThreadLeasePool<CliThread> _threads = new() { IdleTimeout = null };
     private ResolvedCommand? _command;
 
     protected CliAgentBackend(CliAgentOptions options, string defaultExecutable, string executableVariable)
@@ -132,12 +132,17 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
         var thread = lease.Value;
         var invocation = new CliInvocation(stage, model, effort, thread.SessionId, thread.Started);
         var arguments = BuildArguments(invocation).Concat(_options.ExtraArguments).ToList();
+        if (lease.ContextLost)
+        {
+            prompt = ThreadContinuity.Recover(prompt, stage, context, Log);
+        }
 
         Log($"{Name}: {(invocation.Resume ? "resuming" : "starting")} session {thread.SessionId}" + (model is null ? "" : $" ({model})"), "info");
         var parser = CreateParser();
         CliProcessResult result;
-        using (var eventLog = new StageEventLog(stage.StageDirectory, "cli-events.jsonl"))
+        try
         {
+            using var eventLog = new StageEventLog(stage.StageDirectory, "cli-events.jsonl");
             result = await CliProcess.RunAsync(
                 command,
                 arguments,
@@ -155,6 +160,11 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
                 },
                 cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException)
+        {
+            SettleSession(thread, parser.Summary, succeeded: false);
+            throw;
+        }
 
         if (stage.StageDirectory is { } dir && !string.IsNullOrWhiteSpace(result.Stderr))
         {
@@ -164,26 +174,14 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
         var summary = parser.Summary;
         if (result.ExitCode != 0 || summary.IsError || !summary.Completed)
         {
-            // The CLI may have created the session before failing (e.g. Claude Code when not logged in); continue it on the
-            // next attempt rather than trying to create a session with the same id again.
-            if (summary.SessionId is { Length: > 0 } failedSession)
-            {
-                thread.SessionId = failedSession;
-                thread.Started = true;
-            }
-
+            SettleSession(thread, summary, succeeded: false);
             var detail = summary.ErrorMessage ?? LastLines(result.Stderr) ?? (summary.Completed ? null : "no result was reported");
             var message = $"{Name} failed (exit code {result.ExitCode.ToString(CultureInfo.InvariantCulture)})" + (detail is null ? "" : ": " + detail);
             Log(message, "error");
             throw new CliAgentException(message, CliAgentException.IsRetryableMessage(detail));
         }
 
-        if (summary.SessionId is { Length: > 0 } reported)
-        {
-            thread.SessionId = reported;
-        }
-
-        thread.Started = true;
+        SettleSession(thread, summary, succeeded: true);
         var metadata = new Dictionary<string, object?>(summary.Metadata, StringComparer.Ordinal)
         {
             ["backend"] = Name,
@@ -191,6 +189,7 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
             ["model"] = summary.Model ?? model,
             ["session_id"] = thread.SessionId,
             ["thread_id"] = stage.ThreadId,
+            ["thread_context"] = ThreadContinuity.Describe(stage, lease.IsNew, lease.ContextLost),
             ["resumed"] = invocation.Resume,
             ["reasoning_effort"] = effort,
             ["tool_calls"] = summary.ToolCalls,
@@ -204,6 +203,28 @@ public abstract class CliAgentBackend : ICodergenBackend, IAsyncDisposable
     }
 
     public ValueTask DisposeAsync() => _threads.DisposeAllAsync();
+
+    /// <summary>
+    /// Records which CLI session the thread continues with. A session id the CLI reported is adopted even when the run failed
+    /// (the CLI may have created the session, and creating it again would collide). A run that failed before reporting one
+    /// leaves the session's existence unknown, so a thread that has not started yet switches to a fresh id.
+    /// </summary>
+    private static void SettleSession(CliThread thread, CliRunSummary summary, bool succeeded)
+    {
+        if (summary.SessionId is { Length: > 0 } reported)
+        {
+            thread.SessionId = reported;
+            thread.Started = true;
+        }
+        else if (succeeded)
+        {
+            thread.Started = true;
+        }
+        else if (!thread.Started)
+        {
+            thread.SessionId = Guid.NewGuid().ToString();
+        }
+    }
 
     /// <summary>Builds the CLI arguments (excluding <see cref="CliAgentOptions.ExtraArguments"/>).</summary>
     protected internal abstract IReadOnlyList<string> BuildArguments(CliInvocation invocation);

@@ -15,6 +15,12 @@ public sealed class SessionConfig
     /// <summary>Default shell command timeout (10s).</summary>
     public int DefaultCommandTimeoutMs { get; set; } = 10_000;
 
+    /// <summary>
+    /// When set, the default shell command timeout, taking precedence over both the profile's default (e.g. Anthropic's
+    /// 120 s) and <see cref="DefaultCommandTimeoutMs"/>. Used by hosts that set a timeout per task.
+    /// </summary>
+    public int? CommandTimeoutOverrideMs { get; set; }
+
     /// <summary>Upper bound for any command timeout (10 minutes).</summary>
     public int MaxCommandTimeoutMs { get; set; } = 600_000;
 
@@ -53,6 +59,7 @@ public sealed class SessionConfig
         MaxTurns = MaxTurns,
         MaxToolRoundsPerInput = MaxToolRoundsPerInput,
         DefaultCommandTimeoutMs = DefaultCommandTimeoutMs,
+        CommandTimeoutOverrideMs = CommandTimeoutOverrideMs,
         MaxCommandTimeoutMs = MaxCommandTimeoutMs,
         ReasoningEffort = ReasoningEffort,
         ToolOutputLimits = new Dictionary<string, int>(ToolOutputLimits, StringComparer.Ordinal),

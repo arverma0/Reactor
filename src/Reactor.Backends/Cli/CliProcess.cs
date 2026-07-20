@@ -212,31 +212,44 @@ public static class CliProcess
         using var registration = cancellationToken.Register(() => Kill(process));
         var stdoutTask = Task.Run(async () =>
         {
-            while (await process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
+            try
             {
-                try
+                while (await process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
                 {
-                    onStdoutLine(line);
+                    try
+                    {
+                        onStdoutLine(line);
+                    }
+                    catch (Exception ex) when (ex is not OutOfMemoryException)
+                    {
+                        // A faulty consumer must not break output draining.
+                    }
                 }
-                catch (Exception ex) when (ex is not OutOfMemoryException)
-                {
-                    // A faulty consumer must not break output draining.
-                }
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                // The process was disposed while a grandchild still held the pipe open.
             }
         }, CancellationToken.None);
         var stderrTask = Task.Run(async () =>
         {
-            var buffer = new char[4096];
-            int read;
-            while ((read = await process.StandardError.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+            try
             {
-                lock (stderr)
+                var buffer = new char[4096];
+                int read;
+                while ((read = await process.StandardError.ReadAsync(buffer).ConfigureAwait(false)) > 0)
                 {
-                    if (stderr.Length < MaxStderrChars)
+                    lock (stderr)
                     {
-                        stderr.Append(buffer, 0, Math.Min(read, MaxStderrChars - stderr.Length));
+                        if (stderr.Length < MaxStderrChars)
+                        {
+                            stderr.Append(buffer, 0, Math.Min(read, MaxStderrChars - stderr.Length));
+                        }
                     }
                 }
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+            {
             }
         }, CancellationToken.None);
 
