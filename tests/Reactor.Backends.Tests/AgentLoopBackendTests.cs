@@ -15,7 +15,12 @@ public sealed class AgentLoopBackendTests
 
     private static readonly RetryPolicy FastRetry = new() { MaxRetries = 1, BaseDelay = 0.001, MaxDelay = 1, Jitter = false };
 
-    private static (AgentLoopBackend Backend, FakeLlm Llm) Create(Func<string, string, IProviderProfile>? profiles = null, TimeSpan? steeringPoll = null)
+    private static (AgentLoopBackend Backend, FakeLlm Llm) Create(
+        Func<string, string, IProviderProfile>? profiles = null,
+        TimeSpan? steeringPoll = null,
+        int sessionMaxToolRounds = 0,
+        int defaultMaxToolRounds = 200,
+        int? sessionMaxTokens = null)
     {
         var llm = new FakeLlm("test");
         var client = new Client(new Dictionary<string, IProviderAdapter> { ["test"] = llm }, "test");
@@ -25,8 +30,9 @@ public sealed class AgentLoopBackendTests
             DefaultProvider = "test",
             DefaultModel = "test-model",
             ProfileFactory = profiles,
-            SessionConfig = new SessionConfig { LlmRetryPolicy = FastRetry },
+            SessionConfig = new SessionConfig { LlmRetryPolicy = FastRetry, MaxToolRoundsPerInput = sessionMaxToolRounds, MaxTokens = sessionMaxTokens },
             SteeringPollInterval = steeringPoll ?? TimeSpan.FromMilliseconds(50),
+            DefaultMaxToolRounds = defaultMaxToolRounds,
         });
         return (backend, llm);
     }
@@ -287,12 +293,15 @@ public sealed class AgentLoopBackendTests
               start [shape=Mdiamond]
               exit [shape=Msquare]
               a [prompt="First task: plan"]
-              b [prompt="Second task: build", timeout="500ms", max_retries=1]
+              b [prompt="Second task: build", timeout="3s", max_retries=1]
               start -> a -> b -> exit
             }
             """, Pipelines.Options(dir), Ct);
 
-        Assert.Equal(StageStatus.Success, result.Status);
+        // The timeout must leave the first attempt ample time to reach the model (it then blocks until cancelled), or
+        // the retry would be the call that blocks. b's own outcome matters: b -> exit routes a failure onward too.
+        Assert.Equal(StageStatus.Success, result.NodeOutcomes["b"].Status);
+        Assert.Equal(3, llm.Requests.Count);
         var retry = llm.Requests[^1];
         var user = Assert.Single(retry.Messages, m => m.Role == Role.User).Text;
         Assert.StartsWith(ThreadContinuity.Notice, user);
@@ -408,6 +417,79 @@ public sealed class AgentLoopBackendTests
         Assert.Contains("turn limit", outcome.FailureReason);
         var backendJson = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "implement", "backend.json")))!;
         Assert.Equal("max_tool_rounds_per_input", backendJson["stopped_reason"]!.GetValue<string>());
+    }
+
+    [Theory]
+    [InlineData(null, 0, 3, 3)]
+    [InlineData(null, 4, 3, 4)]
+    [InlineData(2, 4, 3, 2)]
+    public async Task Tool_round_limit_comes_from_the_node_then_the_session_config_then_the_backend_default(
+        int? nodeLimit, int sessionLimit, int backendDefault, int expectedRequests)
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create(sessionMaxToolRounds: sessionLimit, defaultMaxToolRounds: backendDefault);
+        var n = 0;
+        llm.Responder = _ => FakeLlm.ToolCalls(($"c{Interlocked.Increment(ref n)}", "glob", Args(new { pattern = $"*.{n}" })));
+        var limit = nodeLimit is { } value ? $", agent.max_tool_rounds={value}" : "";
+
+        var result = await Pipelines.Runner(backend).RunAsync($$"""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              implement [prompt="Do it"{{limit}}]
+              start -> implement -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(expectedRequests, llm.Requests.Count);
+        Assert.Equal(StageStatus.Fail, result.NodeOutcomes["implement"].Status);
+    }
+
+    [Fact]
+    public async Task A_zero_backend_default_leaves_tool_rounds_unlimited()
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create(defaultMaxToolRounds: 0);
+        var n = 0;
+        llm.Responder = _ => Interlocked.Increment(ref n) <= 250
+            ? FakeLlm.ToolCalls(($"c{n}", "glob", Args(new { pattern = $"*.{n}" })))
+            : FakeLlm.Text("Done.");
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              implement [prompt="Do it"]
+              start -> implement -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(251, llm.Requests.Count);
+        Assert.Equal(StageStatus.Success, result.NodeOutcomes["implement"].Status);
+    }
+
+    [Theory]
+    [InlineData(null, null, null)]
+    [InlineData(null, 1000, 1000)]
+    [InlineData(300, 1000, 300)]
+    [InlineData(0, 1000, 1000)]
+    public async Task Output_token_limit_comes_from_the_node_then_the_session_config(int? nodeLimit, int? sessionLimit, int? expected)
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create(sessionMaxTokens: sessionLimit);
+        llm.Responder = _ => FakeLlm.Text("Done.");
+        var limit = nodeLimit is { } value ? $", agent.max_tokens={value}" : "";
+
+        await Pipelines.Runner(backend).RunAsync($$"""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              implement [prompt="Do it"{{limit}}]
+              start -> implement -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(expected, Assert.Single(llm.Requests).MaxTokens);
     }
 
     [Fact]

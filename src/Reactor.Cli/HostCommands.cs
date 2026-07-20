@@ -105,7 +105,9 @@ internal static class HostCommands
         var workdir = new Option<string?>("--workdir", "-C") { Description = "Working directory (default: current directory)" };
         var effort = new Option<string?>("--reasoning-effort") { Description = "low, medium, or high" };
         var maxRounds = new Option<int>("--max-tool-rounds") { Description = "Tool rounds per input (0 = unlimited)", DefaultValueFactory = _ => 0 };
-        var command = new Command("agent", "Run the coding agent loop directly (interactive or one-shot)") { prompt, provider, model, workdir, effort, maxRounds };
+        var maxTokens = new Option<int?>("--max-tokens") { Description = "Output token limit per LLM response (default: the provider's)" };
+        maxTokens.Validators.Add(RunOptionSet.PositiveIfSet);
+        var command = new Command("agent", "Run the coding agent loop directly (interactive or one-shot)") { prompt, provider, model, workdir, effort, maxRounds, maxTokens };
         command.SetAction(async (result, cancellationToken) =>
         {
             await using var client = Client.FromEnv(timeout: BackendFactory.AgentTimeouts);
@@ -132,7 +134,12 @@ internal static class HostCommands
             }
 
             var profile = ProviderProfiles.Create(resolved.Provider, resolved.Model);
-            var config = new SessionConfig { ReasoningEffort = result.GetValue(effort), MaxToolRoundsPerInput = result.GetValue(maxRounds) };
+            var config = new SessionConfig
+            {
+                ReasoningEffort = result.GetValue(effort),
+                MaxToolRoundsPerInput = result.GetValue(maxRounds),
+                MaxTokens = result.GetValue(maxTokens),
+            };
             await using var session = new Session(profile, new LocalExecutionEnvironment(new LocalEnvironmentOptions { WorkingDirectory = dir }), client, config);
             var color = ConsoleReporter.ColorSupported(false);
             session.Events.Subscribe(evt => RenderAgentEvent(evt, color));

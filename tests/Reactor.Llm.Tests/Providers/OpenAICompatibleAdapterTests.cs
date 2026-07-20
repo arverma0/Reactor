@@ -144,6 +144,32 @@ public class OpenAICompatibleAdapterTests
     }
 
     [Theory]
+    [InlineData("{\"patch\": \"*** Begin Patch\\n*** Add Fi", "{}")]
+    [InlineData("[1, 2]", "{}")]
+    [InlineData("{ \"city\" : \"Paris\" }", "{ \"city\" : \"Paris\" }")]
+    [InlineData("", "{}")]
+    public async Task Replayed_tool_call_arguments_are_valid_json_objects(string raw, string expected)
+    {
+        // A call cut off at max_tokens leaves invalid JSON; llama.cpp and other template-rendering servers reject the
+        // whole request when it is replayed. Valid arguments are sent verbatim (prefix caching depends on the exact text).
+        var (adapter, handler) = Create();
+        handler.EnqueueJson(TextResponse);
+
+        await adapter.CompleteAsync(SimpleRequest() with
+        {
+            Messages =
+            [
+                Message.User("Patch it"),
+                Message.Assistant(ContentPart.ToolCallPart("call_1", "apply_patch", JsonValue.Create(raw))),
+                Message.ToolResult("call_1", "Tool call arguments are not valid JSON", isError: true),
+            ],
+        });
+
+        var call = handler.LastRequest.Json["messages"]![1]!["tool_calls"]![0]!["function"]!;
+        Assert.Equal(expected, call["arguments"]!.GetValue<string>());
+    }
+
+    [Theory]
     [InlineData("auto", null, "\"auto\"")]
     [InlineData("none", null, "\"none\"")]
     [InlineData("required", null, "\"required\"")]

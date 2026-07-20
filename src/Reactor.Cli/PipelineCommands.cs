@@ -34,6 +34,8 @@ internal sealed class RunOptionSet
 
     public Option<string?> Provider { get; } = new("--provider") { Description = "Default LLM provider for the agent/direct backends" };
 
+    public Option<int?> MaxTokens { get; } = new("--max-tokens") { Description = "Output token limit per LLM response for the agent/direct backends (default: the provider's)" };
+
     public Option<string?> WorkingDirectory { get; } = new("--workdir", "-C") { Description = "Working directory for tools and agents (default: current directory)" };
 
     public Option<string[]> Set { get; } = new("--set", "-s") { Description = "Initial context value key=value (repeatable)", Arity = ArgumentArity.ZeroOrMore };
@@ -60,12 +62,22 @@ internal sealed class RunOptionSet
 
     public void AddTo(Command command)
     {
-        foreach (var option in new Option[] { Backend, Model, Provider, WorkingDirectory, Set, AutoApprove, Answers, MaxSteps, Json, Verbose, Quiet, NoColor, CopilotRuntime, CopilotCli, ClaudeCli })
+        foreach (var option in new Option[] { Backend, Model, Provider, MaxTokens, WorkingDirectory, Set, AutoApprove, Answers, MaxSteps, Json, Verbose, Quiet, NoColor, CopilotRuntime, CopilotCli, ClaudeCli })
         {
             command.Options.Add(option);
         }
 
         Backend.AcceptOnlyFromAmong(BackendFactory.Kinds);
+        MaxTokens.Validators.Add(PositiveIfSet);
+    }
+
+    /// <summary>Rejects zero or negative values of an optional count.</summary>
+    internal static void PositiveIfSet(System.CommandLine.Parsing.OptionResult result)
+    {
+        if (result.GetValueOrDefault<int?>() is <= 0)
+        {
+            result.AddError($"{result.Option.Name} must be a positive number.");
+        }
     }
 
     public BackendSettings Backends(ParseResult result) => new()
@@ -73,6 +85,7 @@ internal sealed class RunOptionSet
         Kind = result.GetValue(Backend) ?? "auto",
         Model = result.GetValue(Model),
         Provider = result.GetValue(Provider),
+        MaxTokens = result.GetValue(MaxTokens),
         CopilotRuntime = result.GetValue(CopilotRuntime),
         CopilotCli = result.GetValue(CopilotCli),
         ClaudeCli = result.GetValue(ClaudeCli),

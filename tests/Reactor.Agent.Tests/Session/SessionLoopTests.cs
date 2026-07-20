@@ -430,6 +430,47 @@ public sealed class SessionLoopTests
         Assert.Equal("fine now", session.LastAssistantText);
     }
 
+    [Theory]
+    [InlineData(null, "The model's response was cut off at its output token limit.")]
+    [InlineData(256, "The model's response was cut off at its output token limit (max_tokens=256).")]
+    public async Task A_response_cut_off_at_the_output_limit_warns(int? maxTokens, string expected)
+    {
+        var (session, llm, _, events) = Create(c => c.MaxTokens = maxTokens);
+        llm.Responder = _ => Text("Here is the long explanation that never") with { FinishReason = FinishReason.Length };
+
+        await session.SubmitAsync("explain everything", Ct);
+
+        Assert.Equal(maxTokens, llm.Requests[0].MaxTokens);
+        Assert.Equal(expected, Assert.Single(Of(events, EventKind.Warning)).GetString("message"));
+        Assert.Equal(SessionState.Idle, session.State);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Unparseable_tool_arguments_explain_a_cut_off_response(bool cutOff)
+    {
+        var (session, llm, _, _) = Create();
+        var calls = 0;
+        llm.Responder = _ => Interlocked.Increment(ref calls) == 1
+            ? new Response
+            {
+                Id = "resp_cut",
+                Model = "test-model",
+                Message = new Message { Role = Role.Assistant, Content = [ContentPart.ToolCallPart("c1", "echo", JsonValue.Create("""{"text": "a very long"""))] },
+                FinishReason = cutOff ? FinishReason.Length : FinishReason.ToolCalls,
+                Usage = new Usage { InputTokens = 20, OutputTokens = 8, TotalTokens = 28 },
+            }
+            : Text("ok");
+
+        await session.SubmitAsync("echo something long", Ct);
+
+        var result = Assert.Single(Assert.Single(session.History.OfType<ToolResultsTurn>()).Results);
+        Assert.True(result.IsError);
+        Assert.Contains("not valid JSON", result.ContentText);
+        Assert.Equal(cutOff, result.ContentText.Contains("cut off at the output token limit", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task Context_usage_warning_fires_once_above_80_percent()
     {

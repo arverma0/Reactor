@@ -84,6 +84,12 @@ Each `codergen` stage (a `box` node) is handed to a **backend**. Pick one with `
 Individual nodes can override the default with `backend="copilot-cli"` or route by `llm_provider` — see
 [docs/backends.md](docs/backends.md).
 
+To use a local model, point `OPENAI_COMPATIBLE_BASE_URL` at an OpenAI-compatible server (llama.cpp's
+`llama-server`, Ollama, vLLM, …) and run with `--backend agent --provider openai-compatible --model <name>`. Add
+`--max-tokens` (e.g. 2048) and stage `timeout`s: local servers often let a response run until the context window is
+full, which takes a long time when a small model starts repeating itself. Small local models handle simple stages but
+are far less reliable than frontier models at multi-step coding work.
+
 ## Writing pipelines
 
 A pipeline is a `digraph`. Node **shape** selects the handler:
@@ -189,7 +195,7 @@ docs/                architecture, pipeline reference, backends, HTTP API, spec 
 
 ```powershell
 dotnet build                     # warnings are errors
-dotnet test                      # ~860 tests across six projects
+dotnet test                      # ~900 tests across six projects
 ```
 
 Test projects are executables (xUnit v3), so a single suite can also run directly, e.g.

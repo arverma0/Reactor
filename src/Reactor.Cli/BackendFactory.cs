@@ -17,6 +17,9 @@ internal sealed record BackendSettings
 
     public string? Provider { get; init; }
 
+    /// <summary>Output token limit per LLM response for the native backends (null: the provider's default).</summary>
+    public int? MaxTokens { get; init; }
+
     public string? CopilotRuntime { get; init; }
 
     public string? CopilotCli { get; init; }
@@ -83,10 +86,18 @@ internal static class BackendFactory
                 Client = client,
                 DefaultProvider = settings.Provider,
                 DefaultModel = settings.Model,
-                SessionConfig = new SessionConfig(),
+                SessionConfig = new SessionConfig { MaxTokens = settings.MaxTokens },
             })
             : null;
-        var direct = hasNative ? new DirectLlmBackend(new DirectLlmBackendOptions { Client = client, DefaultProvider = settings.Provider, DefaultModel = settings.Model }) : null;
+        var direct = hasNative
+            ? new DirectLlmBackend(new DirectLlmBackendOptions
+            {
+                Client = client,
+                DefaultProvider = settings.Provider,
+                DefaultModel = settings.Model,
+                MaxTokens = settings.MaxTokens,
+            })
+            : null;
         var copilotRuntime = settings.CopilotRuntime ?? FindCopilotRuntime();
         var copilot = new CopilotSdkBackend(new CopilotSdkBackendOptions { DefaultModel = settings.Model, RuntimePath = settings.CopilotRuntime });
         var copilotCli = new CopilotCliBackend(new CopilotCliOptions { Executable = settings.CopilotCli, DefaultModel = settings.Model });

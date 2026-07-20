@@ -352,6 +352,12 @@ public sealed class Session : IAsyncDisposable
             }
 
             Emit(EventKind.AssistantTextEnd, ("text", response.Text), ("reasoning", response.Reasoning), ("usage", response.Usage), ("finish_reason", response.FinishReason.Reason));
+            if (response.FinishReason.Reason == FinishReason.LengthReason)
+            {
+                var limit = Config.MaxTokens is { } maxTokens ? $" (max_tokens={maxTokens})" : "";
+                Emit(EventKind.Warning, ("message", $"The model's response was cut off at its output token limit{limit}."), ("finish_reason", FinishReason.LengthReason));
+            }
+
             CheckContextUsage();
 
             var calls = response.ToolCalls;
@@ -366,7 +372,7 @@ public sealed class Session : IAsyncDisposable
             }
 
             round++;
-            var results = await ExecuteToolCallsAsync(calls, cancellationToken).ConfigureAwait(false);
+            var results = await ExecuteToolCallsAsync(calls, response.FinishReason.Reason == FinishReason.LengthReason, cancellationToken).ConfigureAwait(false);
             AddTurn(new ToolResultsTurn(results));
             DrainSteering();
 
@@ -498,23 +504,23 @@ public sealed class Session : IAsyncDisposable
         }
     }
 
-    private async Task<IReadOnlyList<ToolResult>> ExecuteToolCallsAsync(IReadOnlyList<ToolCall> calls, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ToolResult>> ExecuteToolCallsAsync(IReadOnlyList<ToolCall> calls, bool responseCutOff, CancellationToken cancellationToken)
     {
         if (Profile.SupportsParallelToolCalls && calls.Count > 1)
         {
-            return await Task.WhenAll(calls.Select(c => Task.Run(() => ExecuteSingleToolAsync(c, cancellationToken), cancellationToken))).ConfigureAwait(false);
+            return await Task.WhenAll(calls.Select(c => Task.Run(() => ExecuteSingleToolAsync(c, responseCutOff, cancellationToken), cancellationToken))).ConfigureAwait(false);
         }
 
         var results = new List<ToolResult>(calls.Count);
         foreach (var call in calls)
         {
-            results.Add(await ExecuteSingleToolAsync(call, cancellationToken).ConfigureAwait(false));
+            results.Add(await ExecuteSingleToolAsync(call, responseCutOff, cancellationToken).ConfigureAwait(false));
         }
 
         return results;
     }
 
-    private async Task<ToolResult> ExecuteSingleToolAsync(ToolCall call, CancellationToken cancellationToken)
+    private async Task<ToolResult> ExecuteSingleToolAsync(ToolCall call, bool responseCutOff, CancellationToken cancellationToken)
     {
         Emit(EventKind.ToolCallStart, ("tool_name", call.Name), ("call_id", call.Id), ("arguments", call.RawArguments ?? call.Arguments.ToJsonString()));
 
@@ -526,7 +532,11 @@ public sealed class Session : IAsyncDisposable
 
         if (call.ArgumentsError is not null)
         {
-            return Fail(call, $"Invalid arguments for tool: {call.Name}: {call.ArgumentsError}");
+            var hint = responseCutOff
+                ? " Your response was cut off at the output token limit before the arguments were complete. Make smaller " +
+                  "tool calls: for example, create a file with part of its content, then add the rest with further edits."
+                : "";
+            return Fail(call, $"Invalid arguments for tool: {call.Name}: {call.ArgumentsError}{hint}");
         }
 
         var errors = JsonSchemaValidator.Validate(call.Arguments, registered.Definition.Parameters);

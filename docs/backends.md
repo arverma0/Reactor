@@ -18,6 +18,13 @@ counts) to the stage directory, forwards agent activity (`→ tool args`, `✗ t
 event stream as `StageLog` events, and maps failures to exceptions carrying a `Retryable` flag so the engine retries
 only what can succeed on retry (rate limits, 5xx, network) and not authentication, policy, or configuration errors.
 
+**Threads.** Stages with `full` fidelity on one thread share a backend session (the conversation, and for agents the
+tool state) for the duration of one engine execution; a resumed run or a `loop_restart` starts fresh sessions. If a
+thread's session is lost — a timeout or abort killed it, it was evicted after idling, or parallel branches forked the
+thread — the next stage on that thread starts a new session with a `summary:high` preamble of the run so far instead
+of starting blind. The prompt actually sent is then saved as `prompt.effective.md`, and `backend.json` records
+`thread_context` (`new`, `continued`, or `recovered`).
+
 ## Choosing a backend
 
 `reactor run --backend <name>` picks the default; a `BackendRouter` then routes each node:
@@ -40,16 +47,24 @@ installed. `--model` sets the default model for stages without `llm_model`.
   `list_dir`, `web_fetch`, …). Unknown providers (OpenAI-compatible endpoints) use the OpenAI set.
 - **Model resolution**: node `llm_provider` → provider inferred from `llm_model` → `--provider` → the client's
   default; model: node `llm_model` → `--model` → the catalog's newest tool-capable model for the provider.
+- **Reasoning effort**: an explicit `reasoning_effort` (attribute or stylesheet) is sent unless the catalog marks the
+  model as non-reasoning. Without one, models the catalog knows to reason get the spec default `high`; unknown models
+  (typical for OpenAI-compatible servers, which often reject the parameter) get none.
 - **Threads**: `full`-fidelity stages on one thread share a session (conversation and tool state). Parallel branches
   that contend for the same thread get their own session instead of waiting.
+- **Budget**: 200 tool rounds per stage unless `agent.max_tool_rounds` (or `SessionConfig.MaxToolRoundsPerInput`)
+  sets another limit (`AgentLoopBackendOptions.DefaultMaxToolRounds`; 0 = unlimited). Output tokens per response
+  come from `agent.max_tokens`, else `--max-tokens`, else the provider's default; a response cut off at the limit is
+  logged as a warning.
 - **Status file**: the prompt tells the agent where `status.json` lives; if the agent stops at a turn limit without
-  writing it, the stage fails ("stopped at its turn limit") instead of silently succeeding.
+  writing it, the stage fails ("stopped at its turn limit") instead of silently succeeding, so a stuck agent cannot
+  run unattended forever.
 - **Steering**: a supervisor (`house` node) writes `steering.md` into the stage directory; the backend polls for it
   and injects it into the running session.
 - **Hooks**: `tool_hooks.pre/post` run around every tool call (see [pipelines.md](pipelines.md#tool-hooks)).
 - **Artifacts**: `transcript.md` (the conversation) and `agent-events.jsonl` (every session event).
-- Node attributes: `agent.max_tool_rounds`, `agent.max_turns`, `agent.instructions` (appended to the system prompt),
-  `agent.shell_timeout`.
+- Node attributes: `agent.max_tool_rounds`, `agent.max_turns`, `agent.max_tokens`, `agent.instructions` (appended
+  to the system prompt), `agent.shell_timeout`.
 
 Credentials come from the environment (`Client.FromEnv`): `OPENAI_API_KEY` (+`OPENAI_BASE_URL`, `OPENAI_ORG_ID`,
 `OPENAI_PROJECT_ID`), `ANTHROPIC_API_KEY` (+`ANTHROPIC_BASE_URL`), `GEMINI_API_KEY`/`GOOGLE_API_KEY`
@@ -60,7 +75,7 @@ timeouts for agent work (stream gaps up to 5 minutes during long reasoning).
 
 `DirectLlmBackend` sends the prompt as a single request without tools — useful for planning, critique, and
 summaries. It cannot write files, so the status-file protocol is not offered. `full`-fidelity threads share a
-message history. Route individual nodes to it with `backend="direct"`.
+message history. Route individual nodes to it with `backend="direct"`; `--max-tokens` limits each response.
 
 ## `copilot` — GitHub Copilot SDK
 

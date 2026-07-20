@@ -43,7 +43,7 @@ Errors report line and column: `reactor validate file.dot`.
 | `goal_gate` | `false` | The pipeline may only exit once this node has succeeded. |
 | `retry_target`, `fallback_retry_target` | | Per-node override of the graph's targets. |
 | `timeout` | | Stage time limit (e.g. `10m`); the stage fails when exceeded. |
-| `llm_model`, `llm_provider`, `reasoning_effort` | `reasoning_effort=high` | Model selection for the stage (usually via the stylesheet). |
+| `llm_model`, `llm_provider`, `reasoning_effort` | `reasoning_effort=high` for reasoning models | Model selection for the stage (usually via the stylesheet); see [backends](backends.md) for how each backend applies the effort. |
 | `fidelity`, `thread_id` | | Context carry-over mode and conversation thread. |
 | `class` | | Comma-separated stylesheet classes. |
 | `auto_status` | `false` | Record SUCCESS automatically when the handler writes no status. |
@@ -59,7 +59,7 @@ Errors report line and column: `reactor validate file.dot`.
 | fan-in (`tripleoctagon`) | optional `prompt`: an LLM picks the best branch (reply `BEST: <id>`); otherwise ranked by status and score |
 | tool (`parallelogram`) | `tool_command` (run with `cmd.exe /c` on Windows, `bash -c` elsewhere); `timeout` (default 10m) |
 | manager (`house`) | `manager.poll_interval` (45s), `manager.max_cycles` (1000), `manager.stop_condition`, `manager.actions` (`observe,wait`; add `steer`), `manager.steer_cooldown` (5m), `manager.steer_prompt`, `stack.child_autostart`, `stack.child_logs_root` |
-| codergen with the `agent` backend | `agent.max_tool_rounds`, `agent.max_turns`, `agent.instructions`, `agent.shell_timeout` |
+| codergen with the `agent` backend | `agent.max_tool_rounds` (default 200), `agent.max_turns`, `agent.max_tokens` (output tokens per response), `agent.instructions`, `agent.shell_timeout` |
 
 ## Edge attributes
 

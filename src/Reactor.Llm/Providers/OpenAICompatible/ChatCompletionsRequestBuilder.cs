@@ -239,11 +239,14 @@ internal static class ChatCompletionsRequestBuilder
             }
             else if (part.Kind == ContentKind.ToolCall && part.ToolCall is { } call)
             {
+                // Servers that render chat templates (llama.cpp, vLLM, ...) parse replayed arguments and reject the whole
+                // request when a call was malformed or cut off at max_tokens; its tool result already carries the error.
+                var arguments = call.TryParseArguments(out _, out _) ? call.ArgumentsJson : "{}";
                 toolCalls.Add(new JsonObject
                 {
                     ["id"] = call.Id,
                     ["type"] = "function",
-                    ["function"] = new JsonObject { ["name"] = call.Name, ["arguments"] = call.ArgumentsJson },
+                    ["function"] = new JsonObject { ["name"] = call.Name, ["arguments"] = arguments },
                 });
             }
             else if (part.Kind == ContentKind.Thinking || part.Kind == ContentKind.RedactedThinking)

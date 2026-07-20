@@ -31,6 +31,12 @@ public sealed record AgentLoopBackendOptions
     /// <summary>Base session configuration, cloned per session.</summary>
     public SessionConfig? SessionConfig { get; init; }
 
+    /// <summary>
+    /// Tool rounds allowed per stage when neither the node (<c>agent.max_tool_rounds</c>) nor <see cref="SessionConfig"/>
+    /// sets a limit (default 200; 0 = unlimited). A stage that hits it fails, so a stuck agent cannot run unattended forever.
+    /// </summary>
+    public int DefaultMaxToolRounds { get; init; } = 200;
+
     /// <summary>Additional interceptors (approval gates, auditing) applied to every session.</summary>
     public IReadOnlyList<IToolInterceptor> Interceptors { get; init; } = [];
 
@@ -49,7 +55,7 @@ public sealed record AgentLoopBackendOptions
 /// the prompt to a session whose profile matches the node's <c>llm_provider</c>/<c>llm_model</c>; <c>full</c>-fidelity
 /// stages on the same thread share one session (conversation continuity). The agent can report outcomes through
 /// <c>status.json</c>. Node extension attributes: <c>agent.max_tool_rounds</c>, <c>agent.max_turns</c>,
-/// <c>agent.instructions</c>, <c>agent.shell_timeout</c>.
+/// <c>agent.max_tokens</c>, <c>agent.instructions</c>, <c>agent.shell_timeout</c>.
 /// </summary>
 public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
 {
@@ -188,8 +194,10 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
     {
         var defaults = _options.SessionConfig ?? new SessionConfig();
         config.ReasoningEffort = ModelResolution.ReasoningEffort(stage, model);
-        config.MaxToolRoundsPerInput = ParseInt(node["agent.max_tool_rounds"]) ?? defaults.MaxToolRoundsPerInput;
+        config.MaxToolRoundsPerInput = ParseInt(node["agent.max_tool_rounds"])
+            ?? (defaults.MaxToolRoundsPerInput > 0 ? defaults.MaxToolRoundsPerInput : Math.Max(0, _options.DefaultMaxToolRounds));
         config.MaxTurns = ParseInt(node["agent.max_turns"]) ?? defaults.MaxTurns;
+        config.MaxTokens = ParseInt(node["agent.max_tokens"]) is int maxTokens and > 0 ? maxTokens : defaults.MaxTokens;
         config.UserInstructions = Combine(defaults.UserInstructions, node["agent.instructions"]);
         config.CommandTimeoutOverrideMs = AttributeValues.ParseDuration(node["agent.shell_timeout"]) is { } shellTimeout
             ? (int)Math.Clamp(shellTimeout.TotalMilliseconds, 1, int.MaxValue)

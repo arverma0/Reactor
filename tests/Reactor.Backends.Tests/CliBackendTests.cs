@@ -283,7 +283,7 @@ public sealed class CliBackendTests
               graph [default_fidelity="full"]
               start [shape=Mdiamond]
               exit [shape=Msquare]
-              plan [prompt="Plan", timeout="1s", max_retries=1]
+              plan [prompt="Plan", timeout="2s", max_retries=1]
               start -> plan -> exit
             }
             """, Pipelines.Options(dir), Ct);

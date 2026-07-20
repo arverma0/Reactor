@@ -143,9 +143,10 @@ public sealed class CodergenHandler : INodeHandler
         ArgumentNullException.ThrowIfNull(graph);
         var sb = new StringBuilder();
         sb.AppendLine("---");
-        sb.AppendLine("## Reporting the stage outcome");
-        sb.AppendLine("This task is one stage of an automated pipeline. If the stage did not succeed, or you want to choose");
-        sb.AppendLine("the next step, write a JSON file before you finish:");
+        sb.AppendLine("## Reporting the stage outcome (optional)");
+        sb.AppendLine("Do the task above first, using your tools to make the actual changes. This task is one stage of an automated");
+        sb.AppendLine("pipeline, and success is recorded automatically when you finish. Only if the task could not be completed, or");
+        sb.AppendLine("you need to choose the next step, write a small JSON status file as your final action:");
         sb.Append("  ").AppendLine(Path.Combine(Path.GetFullPath(stageDir), "status.json"));
         sb.AppendLine("Format: {\"outcome\": \"success\" | \"fail\" | \"retry\" | \"partial_success\", \"notes\": \"short summary\",");
         sb.AppendLine("         \"failure_reason\": \"why it failed\", \"preferred_label\": \"next step label\", \"context_updates\": {\"key\": \"value\"}}");
@@ -155,7 +156,7 @@ public sealed class CodergenHandler : INodeHandler
             sb.Append("Next-step labels you may use as preferred_label: ").AppendLine(string.Join(", ", labels.Select(l => $"\"{l}\"")));
         }
 
-        sb.Append("If you do not write the file, the stage is recorded as a success.");
+        sb.Append("Writing this file does not complete the task, and the task's own output never goes in it or its directory.");
         return sb.ToString().ReplaceLineEndings("\n");
     }
 
