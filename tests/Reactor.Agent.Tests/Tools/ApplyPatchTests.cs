@@ -110,13 +110,94 @@ public class PatchParserTests
     [InlineData("*** Begin Patch\n*** Rename File: a\n*** End Patch\n", "Invalid patch (line 2): Unexpected line '*** Rename File: a'")]
     [InlineData("*** Begin Patch\n*** Delete File:\n*** End Patch\n", "Invalid patch (line 2): '*** Delete File:' requires a file path.")]
     [InlineData("*** Begin Patch\n*** Update File: a\n*** End of File\n*** End Patch\n", "Invalid patch (line 3): '*** End of File' must follow the lines of a hunk.")]
-    [InlineData("*** Begin Patch\n*** Update File: a\n@@ x\n@@ y\n context\n*** End Patch\n", "Invalid patch (line 3): Empty hunk")]
+    [InlineData("*** Begin Patch\n*** Update File: a\n@@ x\n*** End of File\n*** End Patch\n", "Invalid patch (line 3): Empty hunk in '*** Update File: a': after '@@'")]
+    [InlineData("*** Begin Patch\n*** Update File: a\n@@ x\n context\n*** Rename: b\n*** End Patch\n", "Invalid patch (line 5): Unexpected line '*** Rename: b' in '*** Update File: a'. Hunk lines start with")]
     [InlineData("*** Begin Patch\n*** Delete File: a\n+junk\n*** End Patch\n", "Invalid patch (line 3): Unexpected content after '*** Delete File: a'.")]
     public void Malformed_patches_report_the_line(string patch, string expectedStart)
     {
         var error = Assert.Throws<PatchFormatException>(() => PatchParser.Parse(patch));
 
         Assert.StartsWith(expectedStart, error.Message);
+    }
+
+    [Fact]
+    public void Stacked_hunk_headers_form_a_hint_chain()
+    {
+        var hunk = Assert.Single(Assert.Single(PatchParser.Parse(P(
+            "*** Begin Patch",
+            "*** Update File: a.py",
+            "@@ class Widget",
+            "",
+            "@@     def render(self):",
+            "-        return 1",
+            "+        return 2",
+            "*** End Patch"))).Hunks);
+
+        Assert.Equal(["class Widget", "def render(self):"], hunk.ContextHints);
+        Assert.Equal("def render(self):", hunk.ContextHint);
+        Assert.Equal(3, hunk.LineNumber);
+        Assert.Equal(2, hunk.Lines.Count);
+    }
+
+    [Fact]
+    public void Concatenated_patches_are_parsed_as_one()
+    {
+        var operations = PatchParser.Parse(P(
+            "*** Begin Patch",
+            "*** Add File: a.txt",
+            "+a",
+            "*** End Patch",
+            "*** Begin Patch",
+            "*** Update File: b.txt",
+            "@@",
+            "-b",
+            "+B",
+            "*** End Patch",
+            "*** Delete File: c.txt",
+            "*** End Patch"));
+
+        Assert.Equal([PatchOperationKind.Add, PatchOperationKind.Update, PatchOperationKind.Delete], operations.Select(o => o.Kind));
+        Assert.Equal(["a"], operations[0].AddedLines);
+    }
+
+    [Fact]
+    public void Indented_end_markers_between_operations_are_accepted()
+    {
+        // Seen from Qwen2.5-7B: " *** End Patch" (space-prefixed) after each file section.
+        var operations = PatchParser.Parse(P(
+            "*** Begin Patch",
+            "*** Add File: a.txt",
+            "+a",
+            " *** End Patch",
+            "*** Update File: b.txt",
+            "@@",
+            " keep",
+            "-b",
+            "+B",
+            " *** End Patch",
+            "",
+            "*** Delete File: c.txt",
+            " *** End Patch"));
+
+        Assert.Equal([PatchOperationKind.Add, PatchOperationKind.Update, PatchOperationKind.Delete], operations.Select(o => o.Kind));
+        Assert.Equal(["a"], operations[0].AddedLines);
+        Assert.Equal([PatchLineKind.Context, PatchLineKind.Delete, PatchLineKind.Add], Assert.Single(operations[1].Hunks).Lines.Select(l => l.Kind));
+    }
+
+    [Fact]
+    public void An_end_marker_line_inside_a_hunk_is_still_context()
+    {
+        var hunk = Assert.Single(Assert.Single(PatchParser.Parse(P(
+            "*** Begin Patch",
+            "*** Update File: docs/patches.md",
+            "@@",
+            " *** End Patch",
+            "-old",
+            "+new",
+            "*** End Patch"))).Hunks);
+
+        Assert.Equal(new PatchLine(PatchLineKind.Context, "*** End Patch"), hunk.Lines[0]);
+        Assert.Equal(3, hunk.Lines.Count);
     }
 }
 
@@ -412,7 +493,81 @@ public class ApplyPatchToolTests
         await Assert.ThrowsAsync<InvalidDataException>(
             () => Apply(ws, P("*** Begin Patch", "*** Update File: b.bin", "@@", "-a", "+b", "*** End Patch")));
 
-        Assert.Equal("Cannot update 'missing.txt' (patch line 2): file not found.", missing.Message);
+        Assert.Equal(
+            "Cannot update 'missing.txt' (patch line 2): file not found. To create a new file, use '*** Add File: missing.txt' " +
+            "and prefix every line of its content with '+'.",
+            missing.Message);
+    }
+
+    [Fact]
+    public async Task Hint_chains_locate_a_repeated_snippet()
+    {
+        await using var ws = new TestWorkspace();
+        ws.Write("a.py", "class First:\n    def render(self):\n        return 1\n\nclass Second:\n    def render(self):\n        return 1\n");
+
+        await Apply(ws, P(
+            "*** Begin Patch",
+            "*** Update File: a.py",
+            "@@ class Second:",
+            "@@     def render(self):",
+            "-        return 1",
+            "+        return 2",
+            "*** End Patch"));
+
+        Assert.Equal("class First:\n    def render(self):\n        return 1\n\nclass Second:\n    def render(self):\n        return 2\n", ws.ReadText("a.py"));
+    }
+
+    [Fact]
+    public async Task Added_lines_without_context_go_after_the_innermost_hint()
+    {
+        await using var ws = new TestWorkspace();
+        ws.Write("test_a.py", "import a\n\ndef test_a():\n    assert a.f() == 1\n");
+
+        await Apply(ws, P("*** Begin Patch", "*** Update File: test_a.py", "@@ import a", "@@ def test_a():", "+    assert a.g() == 2", "*** End Patch"));
+
+        Assert.Equal("import a\n\ndef test_a():\n    assert a.g() == 2\n    assert a.f() == 1\n", ws.ReadText("test_a.py"));
+    }
+
+    [Fact]
+    public async Task Added_lines_under_a_missing_hint_fail_instead_of_guessing_a_position()
+    {
+        await using var ws = new TestWorkspace();
+        ws.Write("a.py", "x = 1\n");
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Apply(ws, P("*** Begin Patch", "*** Update File: a.py", "@@ def missing():", "+    pass", "*** End Patch")));
+
+        Assert.StartsWith(
+            "Failed to apply hunk 1 of 1 to 'a.py' (patch line 3): the context hint '@@ def missing():' was not found, so there is nowhere",
+            error.Message);
+        Assert.Equal("x = 1\n", ws.ReadText("a.py"));
+    }
+
+    [Fact]
+    public async Task Patch_shapes_seen_from_small_local_models_apply()
+    {
+        // Modeled on Qwen2.5-7B output: '*** End Patch' between file sections, stacked @@ lines, and an addition-only hunk.
+        await using var ws = new TestWorkspace();
+        ws.Write("src/fizzbuzz.py", "def fizzbuzz():\n    return [str(n) for n in range(1, 100)]\n");
+        ws.Write("src/test_fizzbuzz.py", "import fizzbuzz\n\ndef test_fizzbuzz():\n    pass\n");
+
+        var output = await Apply(ws, P(
+            "*** Begin Patch",
+            "*** Update File: src/fizzbuzz.py",
+            "@@ def fizzbuzz():",
+            "-    return [str(n) for n in range(1, 100)]",
+            "+    return [str(n) for n in range(1, 101)]",
+            "*** End Patch",
+            "*** Update File: src/test_fizzbuzz.py",
+            "@@ import fizzbuzz",
+            "@@ def test_fizzbuzz():",
+            "+    assert len(fizzbuzz.fizzbuzz()) == 100",
+            "*** End Patch"));
+
+        Assert.Contains("src/fizzbuzz.py", output.Text);
+        Assert.Contains("src/test_fizzbuzz.py", output.Text);
+        Assert.Equal("def fizzbuzz():\n    return [str(n) for n in range(1, 101)]\n", ws.ReadText("src/fizzbuzz.py"));
+        Assert.Equal("import fizzbuzz\n\ndef test_fizzbuzz():\n    assert len(fizzbuzz.fizzbuzz()) == 100\n    pass\n", ws.ReadText("src/test_fizzbuzz.py"));
     }
 
     [Fact]

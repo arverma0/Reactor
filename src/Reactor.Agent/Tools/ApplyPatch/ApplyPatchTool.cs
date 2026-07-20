@@ -9,24 +9,31 @@ internal static class ApplyPatchTool
     public const string Name = "apply_patch";
 
     private const string Description =
-        "Apply a patch to create, delete, update, or rename files. The patch must use this format:\n\n" +
+        "Apply a patch to create, delete, update, or rename files. Example:\n\n" +
         "*** Begin Patch\n" +
-        "*** Add File: path/to/new_file.py\n" +
-        "+first line of the new file\n" +
-        "+second line\n" +
-        "*** Update File: path/to/existing.py\n" +
-        "*** Move to: path/to/renamed.py   (optional: rename the file)\n" +
-        "@@ def some_function():   (optional: a line near the change, to locate it)\n" +
-        " unchanged context line (prefix: one space)\n" +
-        "-line to remove (prefix: -)\n" +
-        "+line to add (prefix: +)\n" +
-        " unchanged context line\n" +
-        "*** Delete File: path/to/obsolete.py\n" +
+        "*** Add File: src/greet.py\n" +
+        "+def greet(name):\n" +
+        "+    return f\"Hello, {name}!\"\n" +
+        "*** Update File: src/app.py\n" +
+        "@@ def main():\n" +
+        "     config = load_config()\n" +
+        "-    run(config, retries=1)\n" +
+        "+    run(config, retries=3)\n" +
+        "     print(\"done\")\n" +
+        "*** Delete File: src/old_app.py\n" +
         "*** End Patch\n\n" +
-        "Show about 3 unchanged lines of context before and after each change so it can be located unambiguously, and " +
-        "start a new @@ hunk for each separate change in the same file. Add a line \"*** End of File\" after a hunk that " +
-        "must match at the end of the file. Paths are relative to the working directory. The patch is applied atomically: " +
-        "if any hunk cannot be matched, no file is changed.";
+        "Rules: the patch starts with '*** Begin Patch' and ends with '*** End Patch', with no other text around them. " +
+        "Each file operation starts with '*** Add File: <path>', '*** Update File: <path>', or '*** Delete File: <path>'. " +
+        "Every line of an added file starts with '+'. In an update, each change is a hunk that starts with an '@@' line " +
+        "(optionally followed by a nearby line copied from the file, such as a function signature) and every hunk line " +
+        "starts with ' ' (one space: an unchanged line copied exactly from the file), '-' (a line to remove, copied exactly), " +
+        "or '+' (a line to add). Show about 3 unchanged lines before and after each change so it can be located " +
+        "unambiguously, and start a new @@ hunk for each separate change in the same file. To narrow down a repeated " +
+        "snippet, stack @@ lines (e.g. '@@ class Foo' then '@@     def bar():'). To rename a file, put " +
+        "'*** Move to: <new path>' right after its '*** Update File' line. Add a line \"*** End of File\" after a hunk " +
+        "that must match at the end of the file. Use *** Add File (not Update) for files that do not exist yet. Paths " +
+        "are relative to the working directory. The patch is applied atomically: if any hunk cannot be matched, no file " +
+        "is changed.";
 
     public static RegisteredTool Create() => new(
         new ToolDefinition(Name, Description, ToolSchema.Object(

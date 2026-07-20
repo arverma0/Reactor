@@ -60,7 +60,8 @@ internal static class PatchApplier
 
                 case PatchOperationKind.Update:
                     var current = await state.LoadAsync(fullPath).ConfigureAwait(false) ?? throw new FileNotFoundException(
-                        $"Cannot update '{operation.Path}' (patch line {operation.LineNumber}): file not found.", fullPath);
+                        $"Cannot update '{operation.Path}' (patch line {operation.LineNumber}): file not found. To create a new " +
+                        $"file, use '*** Add File: {operation.Path}' and prefix every line of its content with '+'.", fullPath);
                     var updated = ApplyHunks(current, operation);
                     if (operation.MoveTo is { } moveTo && !PathDisplay.Comparer.Equals(environment.ResolvePath(moveTo), fullPath))
                     {
@@ -103,10 +104,15 @@ internal static class PatchApplier
         {
             var hunk = operation.Hunks[h];
             var oldLines = hunk.OldLines();
-            var hintIndex = hunk.ContextHint is { } hint ? FindHint(lines, hint, cursor) : -1;
+            var hintIndex = FindHints(lines, hunk.ContextHints, cursor);
             int start;
             if (oldLines.Count == 0)
             {
+                if (hintIndex < 0 && hunk.ContextHints.Count > 0 && !hunk.IsEndOfFile)
+                {
+                    throw new InvalidOperationException(NotFoundMessage(operation, h, hunk, oldLines, hintIndex));
+                }
+
                 start = hunk.IsEndOfFile || hintIndex < 0 ? lines.Count : hintIndex + 1;
             }
             else
@@ -221,6 +227,24 @@ internal static class PatchApplier
         return true;
     }
 
+    /// <summary>The line of the innermost hint, finding each hint after the previous one; -1 when there are none or one is missing.</summary>
+    private static int FindHints(List<string> lines, IReadOnlyList<string> hints, int from)
+    {
+        var index = -1;
+        foreach (var hint in hints)
+        {
+            index = FindHint(lines, hint, from);
+            if (index < 0)
+            {
+                return -1;
+            }
+
+            from = index + 1;
+        }
+
+        return index;
+    }
+
     private static int FindHint(List<string> lines, string hint, int from)
     {
         for (var i = Math.Max(0, from); i < lines.Count; i++)
@@ -275,11 +299,21 @@ internal static class PatchApplier
             .Append(" of ").Append(operation.Hunks.Count.ToString(CultureInfo.InvariantCulture))
             .Append(" to '").Append(operation.Path).Append("' (patch line ")
             .Append(hunk.LineNumber.ToString(CultureInfo.InvariantCulture)).Append(')');
-        if (hunk.ContextHint is { } hint)
+        if (oldLines.Count == 0)
         {
+            var hints = string.Join(" > ", hunk.ContextHints.Select(h => $"'@@ {h}'"));
+            return sb.Append(": the context hint ").Append(hints)
+                .Append(" was not found, so there is nowhere to insert the added lines.\nNo files were changed. ")
+                .Append("Re-read the file and use an @@ line copied from it (or a few unchanged context lines) to anchor the addition.")
+                .ToString();
+        }
+
+        if (hunk.ContextHints.Count > 0)
+        {
+            var hints = string.Join(" > ", hunk.ContextHints.Select(h => $"'@@ {h}'"));
             sb.Append(hintIndex < 0
-                ? $"; the context hint '@@ {hint}' was not found either"
-                : $" after the context hint '@@ {hint}'");
+                ? $"; the context hint {hints} was not found either"
+                : $" after the context hint {hints}");
         }
 
         sb.Append(". Could not find these lines in the file:\n").AppendJoin('\n', oldLines)

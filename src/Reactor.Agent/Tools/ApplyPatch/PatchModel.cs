@@ -20,12 +20,18 @@ internal enum PatchLineKind
 internal readonly record struct PatchLine(PatchLineKind Kind, string Text);
 
 /// <summary>A hunk of an Update File operation.</summary>
-/// <param name="ContextHint">Text after <c>@@</c> used to locate the change, if any.</param>
+/// <param name="ContextHints">
+/// Text after each <c>@@</c> used to locate the change, outermost first: consecutive <c>@@</c> lines narrow the location
+/// (e.g. a class, then a method in it), each searched after the previous one.
+/// </param>
 /// <param name="Lines">Context, deleted, and added lines in patch order.</param>
 /// <param name="IsEndOfFile">True when the hunk was followed by <c>*** End of File</c> (anchored at the end of the file).</param>
 /// <param name="LineNumber">1-based line of the hunk in the patch text.</param>
-internal sealed record PatchHunk(string? ContextHint, IReadOnlyList<PatchLine> Lines, bool IsEndOfFile, int LineNumber)
+internal sealed record PatchHunk(IReadOnlyList<string> ContextHints, IReadOnlyList<PatchLine> Lines, bool IsEndOfFile, int LineNumber)
 {
+    /// <summary>The innermost context hint, if any.</summary>
+    public string? ContextHint => ContextHints.Count == 0 ? null : ContextHints[^1];
+
     /// <summary>The lines the hunk expects to find in the file (context and deletions).</summary>
     public List<string> OldLines() => Lines.Where(l => l.Kind != PatchLineKind.Add).Select(l => l.Text).ToList();
 }

@@ -80,7 +80,7 @@ internal static partial class PatchParser
         {
             var line = lines[i];
             var trimmed = line.TrimStart();
-            if (IsBlank(line))
+            if (IsBlank(line) || IsPatchMarker(line))
             {
                 i++;
             }
@@ -93,7 +93,7 @@ internal static partial class PatchParser
                 var path = HeaderPath(trimmed, DeleteFile, i);
                 operations.Add(new PatchOperation(PatchOperationKind.Delete, path, i + 1));
                 i++;
-                while (i < last && !IsOperationHeader(lines[i]))
+                while (i < last && !IsOperationHeader(lines[i].TrimStart()))
                 {
                     if (!IsBlank(lines[i]))
                     {
@@ -124,7 +124,8 @@ internal static partial class PatchParser
         i++;
         var content = new List<string>();
         var pendingBlanks = 0;
-        while (i < last && !IsOperationHeader(lines[i]))
+        // Added lines all start with '+', so an indented header or marker can only end the section.
+        while (i < last && !IsOperationHeader(lines[i].TrimStart()))
         {
             var line = lines[i];
             if (line.StartsWith('+'))
@@ -175,7 +176,7 @@ internal static partial class PatchParser
 
         var hunks = new List<PatchHunk>();
         List<PatchLine>? current = null;
-        string? hint = null;
+        var hints = new List<string>();
         var hunkLine = 0;
         var trailingBareBlanks = 0;
 
@@ -195,24 +196,41 @@ internal static partial class PatchParser
             current.RemoveRange(current.Count - trailingBareBlanks, trailingBareBlanks);
             if (current.Count == 0)
             {
-                throw new PatchFormatException(hunkLine, $"Empty hunk in '{UpdateFile} {path}'.");
+                throw new PatchFormatException(hunkLine,
+                    $"Empty hunk in '{UpdateFile} {path}': after '@@', add the lines to change, prefixed with ' ' (unchanged), " +
+                    "'-' (removed), or '+' (added).");
             }
 
-            hunks.Add(new PatchHunk(hint, current, endOfFile, hunkLine));
+            hunks.Add(new PatchHunk(hints, current, endOfFile, hunkLine));
             current = null;
-            hint = null;
+            hints = [];
             trailingBareBlanks = 0;
         }
 
-        while (i < last && !IsOperationHeader(lines[i]))
+        while (i < last && !IsOperationHeader(lines[i]) && !IsIndentedMarkerEndingOperation(lines, i, last))
         {
             var line = lines[i];
             if (line.StartsWith("@@", StringComparison.Ordinal))
             {
-                Flush(false, i + 1);
-                current = [];
-                hint = ParseHint(line);
-                hunkLine = i + 1;
+                var hint = ParseHint(line);
+                if (current is not null && current.Count == trailingBareBlanks)
+                {
+                    // Consecutive "@@" lines narrow the location (e.g. a class, then a method in it).
+                    current.Clear();
+                    trailingBareBlanks = 0;
+                }
+                else
+                {
+                    Flush(false, i + 1);
+                    current = [];
+                    hunkLine = i + 1;
+                }
+
+                if (hint is not null)
+                {
+                    hints.Add(hint);
+                }
+
                 i++;
                 continue;
             }
@@ -239,7 +257,9 @@ internal static partial class PatchParser
             }
             else if (line.StartsWith("***", StringComparison.Ordinal))
             {
-                throw new PatchFormatException(i + 1, $"Unexpected line '{Shorten(line)}' in '{UpdateFile} {path}'.");
+                throw new PatchFormatException(i + 1,
+                    $"Unexpected line '{Shorten(line)}' in '{UpdateFile} {path}'. Hunk lines start with ' ', '-', or '+'; " +
+                    $"file operations start with '{AddFile}', '{UpdateFile}', or '{DeleteFile}'.");
             }
             else
             {
@@ -263,7 +283,7 @@ internal static partial class PatchParser
 
                 // A first hunk without an "@@" line.
                 current = [];
-                hint = null;
+                hints = [];
                 hunkLine = i + 1;
             }
 
@@ -309,10 +329,40 @@ internal static partial class PatchParser
         return path;
     }
 
+    /// <summary>
+    /// True for lines that end the current operation: another operation's header, or a stray <c>*** End Patch</c> /
+    /// <c>*** Begin Patch</c> between operations (models sometimes concatenate patches; those markers are skipped).
+    /// </summary>
     private static bool IsOperationHeader(string line) =>
         line.StartsWith(AddFile, StringComparison.Ordinal) ||
         line.StartsWith(DeleteFile, StringComparison.Ordinal) ||
-        line.StartsWith(UpdateFile, StringComparison.Ordinal);
+        line.StartsWith(UpdateFile, StringComparison.Ordinal) ||
+        line.TrimEnd() is EndPatch or BeginPatch;
+
+    private static bool IsPatchMarker(string line) => line.Trim() is EndPatch or BeginPatch;
+
+    /// <summary>
+    /// True for a space-prefixed <c>*** End Patch</c> (a common model slip) followed only by blank lines before the next
+    /// operation or the end of the patch. It would otherwise be read as a context line; at worst, treating it as a marker
+    /// drops one trailing context line from the hunk.
+    /// </summary>
+    private static bool IsIndentedMarkerEndingOperation(string[] lines, int i, int last)
+    {
+        if (!IsPatchMarker(lines[i]))
+        {
+            return false;
+        }
+
+        for (var j = i + 1; j < last; j++)
+        {
+            if (!IsBlank(lines[j]))
+            {
+                return IsOperationHeader(lines[j].TrimStart());
+            }
+        }
+
+        return true;
+    }
 
     private static bool IsBlank(string line) => line.Trim().Length == 0;
 
