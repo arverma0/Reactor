@@ -126,6 +126,10 @@ validated against real agents.
 - A disk-backed run history (server and CLI runs, loop restarts folded in), event replay, telemetry aggregated per
   stage across runs, and user steering of a running agent stage (`agent` and `copilot` backends) — the Studio
   "flights" API in [http-api.md](http-api.md).
+- A simulation engine for the Studio's wind tunnel (`Reactor.Simulation`): Monte Carlo runs of the real engine with
+  scenario-driven stage outcomes (no LLM calls, tool commands, or child pipelines), replayable per-sample traces,
+  stochastic or interactive simulated server runs, and the in-memory run mode it uses
+  (`PipelineRunnerOptions.PersistRunState = false`). See [http-api.md](http-api.md#simulation-studio-wind-tunnel).
 
 ## Live validation
 

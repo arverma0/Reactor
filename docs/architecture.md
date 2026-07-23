@@ -81,6 +81,10 @@ Supporting pieces:
 - **Resume** — `ResumeAsync(logsRoot)` reloads `checkpoint.json` (context, completed nodes, retry counts, node
   outcomes, last fidelity/thread, history) and continues after the checkpointed node; a `full`-fidelity stage right
   after resume degrades to `summary:high` because agent sessions are not persisted.
+- **Simulation** — `Reactor.Simulation` (the Studio's wind tunnel) runs the real engine on a dedicated runner whose
+  codergen, tool, manager, and custom handlers return scenario-drawn outcomes; human gates and parallel nodes keep their
+  real handlers. Draws are a pure function of (seed, sample, node, execution), so Monte Carlo samples replay exactly as
+  traces; samples run in memory (`PipelineRunnerOptions.PersistRunState = false`), without any engine file I/O.
 
 ## Agent loop (Reactor.Agent)
 

@@ -18,6 +18,22 @@ namespace Reactor.Handlers;
 /// </summary>
 public sealed class ParallelHandler : INodeHandler
 {
+    private readonly bool _sequential;
+
+    public ParallelHandler()
+    {
+    }
+
+    /// <summary>
+    /// With <paramref name="sequential"/>, branches run one at a time in edge order instead of concurrently, which makes the
+    /// result independent of thread scheduling (used by simulations): with <c>first_success</c>, the first branch in edge
+    /// order that succeeds wins and later branches are not started.
+    /// </summary>
+    internal ParallelHandler(bool sequential)
+    {
+        _sequential = sequential;
+    }
+
     public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(node);
@@ -46,7 +62,7 @@ public sealed class ParallelHandler : INodeHandler
         using var firstSuccessCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var results = new BranchResult[branches.Count];
 
-        var tasks = branches.Select((edge, index) => Task.Run(async () =>
+        async Task RunBranchAsync(Edge edge, int index)
         {
             await gate.WaitAsync(firstSuccessCts.Token).ConfigureAwait(false);
             try
@@ -77,15 +93,28 @@ public sealed class ParallelHandler : INodeHandler
             {
                 gate.Release();
             }
-        }, CancellationToken.None)).ToList();
-
-        try
-        {
-            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (firstSuccessCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+
+        if (_sequential)
         {
-            // Branches still waiting for a slot were cancelled by first_success.
+            for (var i = 0; i < branches.Count && !firstSuccessCts.IsCancellationRequested; i++)
+            {
+                await RunBranchAsync(branches[i], i).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        else
+        {
+            var tasks = branches.Select((edge, index) => Task.Run(() => RunBranchAsync(edge, index), CancellationToken.None)).ToList();
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (firstSuccessCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // Branches still waiting for a slot were cancelled by first_success.
+            }
         }
 
         for (var i = 0; i < results.Length; i++)

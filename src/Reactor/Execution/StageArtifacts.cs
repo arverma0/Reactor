@@ -237,7 +237,7 @@ public static class StageArtifacts
             }
         }
 
-        return await RecordAsync(node, outcome, context, text, pins, cancellationToken).ConfigureAwait(false);
+        return await RecordAsync(node, outcome, context, text, pins, simulated, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -259,7 +259,7 @@ public static class StageArtifacts
         var pins = ArtifactPins.Parse(node).Outputs
             .Where(p => p.Kind == ArtifactKind.Text || MissingFile(p, workingDirectory) is null)
             .ToList();
-        return pins.Count == 0 ? outcome : await RecordAsync(node, outcome, context, text, pins, cancellationToken).ConfigureAwait(false);
+        return pins.Count == 0 ? outcome : await RecordAsync(node, outcome, context, text, pins, simulated: false, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<Outcome> RecordAsync(
@@ -268,6 +268,7 @@ public static class StageArtifacts
         PipelineContext context,
         string? text,
         IReadOnlyList<ArtifactPin> pins,
+        bool simulated,
         CancellationToken cancellationToken)
     {
         var workingDirectory = WorkingDirectory(context);
@@ -277,8 +278,12 @@ public static class StageArtifacts
         foreach (var pin in pins)
         {
             var version = (Read(context, pin.Name)?.Version ?? 0) + 1;
+
+            // Simulated stages never touch the working directory: their file outputs are recorded unread.
             var record = pin.Kind == ArtifactKind.File
-                ? await FileRecordAsync(pin, workingDirectory, cancellationToken).ConfigureAwait(false)
+                ? simulated
+                    ? new ArtifactRecord { Name = pin.Name, Kind = pin.KindName, Path = pin.Path }
+                    : await FileRecordAsync(pin, workingDirectory, cancellationToken).ConfigureAwait(false)
                 : TextRecord(pin, text ?? "");
             record = record with { Producer = node.Id, Version = version, ProducedAt = producedAt };
             updates[ArtifactPins.ContextKey(pin.Name)] = record.ToContextValue();

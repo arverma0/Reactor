@@ -324,7 +324,13 @@ public sealed partial class RunHistory
         var map = new Dictionary<string, ManagedRun>(PathComparer);
         foreach (var run in _manager.Runs)
         {
-            map.TryAdd(Path.TrimEndingDirectorySeparator(Path.GetFullPath(run.LogsRoot)), run);
+            var path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(run.LogsRoot));
+
+            // Simulated runs keep their directories apart (.reactor/simulations); the history covers the runs directory.
+            if (PathComparer.Equals(Path.GetDirectoryName(path), BaseDirectory))
+            {
+                map.TryAdd(path, run);
+            }
         }
 
         return map;

@@ -182,6 +182,8 @@ public sealed class PipelineRunner
 
         private ICodergenBackend? Backend => _options.Backend ?? _runner.Options.Backend;
 
+        private bool Persist => _runner.Options.PersistRunState;
+
         public async Task<PipelineResult> RunAsync(CancellationToken cancellationToken)
         {
             InitializeRunDirectory(fresh: true);
@@ -463,7 +465,10 @@ public sealed class PipelineRunner
             {
                 SetRetryCount(node.Id, attempt - 1, context);
                 Emit(new StageStarted(node.Id, node.Label, index, handlerType, attempt));
-                DeleteFile(Path.Combine(stageDir, "status.json"));
+                if (Persist)
+                {
+                    DeleteFile(Path.Combine(stageDir, "status.json"));
+                }
 
                 var stopwatch = Stopwatch.StartNew();
                 Outcome? outcome = null;
@@ -579,6 +584,14 @@ public sealed class PipelineRunner
                 catch (Exception ex) when (ex is JsonException or FormatException or IOException)
                 {
                     return Outcome.Fail($"Invalid status.json written for stage '{node.Id}': {ex.Message}");
+                }
+                finally
+                {
+                    // In-memory runs skip the per-attempt cleanup, so consume the file: a later attempt must not read it again.
+                    if (!Persist)
+                    {
+                        TryDeleteFile(path);
+                    }
                 }
             }
 
@@ -801,16 +814,19 @@ public sealed class PipelineRunner
 
         private void InitializeRunDirectory(bool fresh)
         {
-            Directory.CreateDirectory(_logsRoot);
-            var graphPath = Path.Combine(_logsRoot, GraphFileName);
-            if (fresh || !File.Exists(graphPath))
+            if (Persist)
             {
-                File.WriteAllText(graphPath, _graph.Source ?? DotWriter.Write(_graph));
-            }
+                Directory.CreateDirectory(_logsRoot);
+                var graphPath = Path.Combine(_logsRoot, GraphFileName);
+                if (fresh || !File.Exists(graphPath))
+                {
+                    File.WriteAllText(graphPath, _graph.Source ?? DotWriter.Write(_graph));
+                }
 
-            if (fresh)
-            {
-                WriteManifest();
+                if (fresh)
+                {
+                    WriteManifest();
+                }
             }
 
             OpenEventLog();
@@ -908,9 +924,13 @@ public sealed class PipelineRunner
             _lastFidelity = null;
             _lastThreadId = null;
             _previousNodeId = null;
-            Directory.CreateDirectory(_logsRoot);
-            File.WriteAllText(Path.Combine(_logsRoot, GraphFileName), _graph.Source ?? DotWriter.Write(_graph));
-            WriteManifest();
+            if (Persist)
+            {
+                Directory.CreateDirectory(_logsRoot);
+                File.WriteAllText(Path.Combine(_logsRoot, GraphFileName), _graph.Source ?? DotWriter.Write(_graph));
+                WriteManifest();
+            }
+
             OpenEventLog();
             InitializeContext();
             _context.Set("internal.loop_restart_count", _loopRestarts);
@@ -924,6 +944,11 @@ public sealed class PipelineRunner
             {
                 visit = _visits.GetValueOrDefault(nodeId) + 1;
                 _visits[nodeId] = visit;
+            }
+
+            if (!Persist)
+            {
+                return;
             }
 
             Directory.CreateDirectory(stageDir);
@@ -957,8 +982,13 @@ public sealed class PipelineRunner
             context.Set($"internal.retry_count.{nodeId}", count);
         }
 
-        private static void EnsureStatusFile(string stageDir, Outcome outcome, bool overwrite = false)
+        private void EnsureStatusFile(string stageDir, Outcome outcome, bool overwrite = false)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             var path = Path.Combine(stageDir, "status.json");
             if (overwrite || !File.Exists(path))
             {
@@ -973,6 +1003,11 @@ public sealed class PipelineRunner
         /// </summary>
         private void SaveCheckpoint(string nodeId, string? finalStatus, bool emitEvent = true, int? snapshotIndex = null)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             Checkpoint checkpoint;
             lock (_stateLock)
             {
@@ -1064,6 +1099,11 @@ public sealed class PipelineRunner
 
         private void WriteResultFile(PipelineResult result)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             try
             {
                 var json = new JsonObject
@@ -1121,6 +1161,18 @@ public sealed class PipelineRunner
             if (File.Exists(path))
             {
                 File.Delete(path);
+            }
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: the handler may still hold the file open.
             }
         }
 

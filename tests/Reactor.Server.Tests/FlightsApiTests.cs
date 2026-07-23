@@ -467,14 +467,16 @@ public sealed class FlightsApiTests
         Assert.Equal("pipelines/simple.dot", summary["source_path"]!.GetValue<string>());
         Assert.Equal(10, (await server.GetJsonAsync($"/studio/api/runs/{DirName(created)}"))["studio"]!["layout"]!["nodes"]!["plan"]!["x"]!.GetValue<int>());
 
-        // Runs without metadata have no studio.json; simulated runs are marked so telemetry can skip them.
+        // Runs without metadata have no studio.json. Simulated runs keep their directories apart (.reactor/simulations),
+        // so the history and telemetry never see them; their studio.json still marks them.
         var plain = await StartJsonAsync(server, new { dot = Simple });
         await server.WaitForStatusAsync(plain["id"]!.GetValue<string>(), "success");
         Assert.False(File.Exists(Path.Combine(plain["logs_root"]!.GetValue<string>(), "studio.json")));
         Assert.Null((await server.GetJsonAsync($"/pipelines/{plain["id"]!.GetValue<string>()}"))["studio"]);
         var simulated = await StartJsonAsync(server, new { dot = Simple, simulation = new { } });
         await server.WaitForStatusAsync(simulated["id"]!.GetValue<string>(), "success");
-        Assert.True((await RunsAsync(server)).Single(r => r!["live_id"]?.GetValue<string>() == simulated["id"]!.GetValue<string>())!["simulated"]!.GetValue<bool>());
+        Assert.DoesNotContain(await RunsAsync(server), r => r!["live_id"]?.GetValue<string>() == simulated["id"]!.GetValue<string>());
+        Assert.True(JsonNode.Parse(File.ReadAllText(Path.Combine(simulated["logs_root"]!.GetValue<string>(), "studio.json")))!["simulated"]!.GetValue<bool>());
         Assert.Equal(2, (await server.GetJsonAsync("/studio/api/telemetry?name=Simple"))["runs"]!.GetValue<int>());
 
         var huge = await server.Client.PostAsJsonAsync("/pipelines", new { dot = Simple, studio = new { layout = new string('x', 5 * 1024 * 1024) } });
