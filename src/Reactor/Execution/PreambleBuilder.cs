@@ -147,10 +147,14 @@ public static class PreambleBuilder
         return text.Length <= budget.MaxChars ? text : text[..(budget.MaxChars - marker.Length)] + marker;
     }
 
-    /// <summary>Engine bookkeeping and bulky values that should not be carried into prompts.</summary>
+    /// <summary>
+    /// Engine bookkeeping and bulky values that should not be carried into prompts. Artifact records (<c>artifacts.*</c>)
+    /// are excluded too: a stage sees the artifacts it declares as <c>inputs</c> in its prompt's Inputs section.
+    /// </summary>
     public static bool IsInternalKey(string key) =>
         key.StartsWith("internal.", StringComparison.Ordinal) ||
         key.StartsWith("graph.", StringComparison.Ordinal) ||
+        key.StartsWith(ArtifactPins.ContextPrefix, StringComparison.Ordinal) ||
         key is "parallel.results" or "outcome" or "preferred_label" or "current_node";
 
     private static string OneLine(string text) => text.ReplaceLineEndings(" ").Trim();

@@ -12,6 +12,8 @@ namespace Reactor.Handlers;
 /// prepending a context-carryover preamble for non-<c>full</c> fidelity), writes <c>prompt.md</c>, calls the
 /// <see cref="ICodergenBackend"/> (or simulates a response), writes <c>response.md</c> and <c>status.json</c>,
 /// and honors the status-file contract: if the backend's agent wrote <c>status.json</c> during the stage, that outcome wins.
+/// Declared artifact <c>outputs</c> are then checked and recorded (see <see cref="StageArtifacts.CompleteAsync"/>); in
+/// simulation mode file outputs are recorded without being written.
 /// </summary>
 public sealed class CodergenHandler : INodeHandler
 {
@@ -50,8 +52,9 @@ public sealed class CodergenHandler : INodeHandler
                     await File.WriteAllTextAsync(Path.Combine(stageDir, "response.md"), outcomeText, cancellationToken).ConfigureAwait(false);
                 }
 
-                await WriteStatusAsync(stageDir, explicitOutcome, cancellationToken).ConfigureAwait(false);
-                return explicitOutcome;
+                var completed = await StageArtifacts.CompleteAsync(node, explicitOutcome, context, result.Text, cancellationToken: cancellationToken).ConfigureAwait(false);
+                await WriteStatusAsync(stageDir, completed, cancellationToken).ConfigureAwait(false);
+                return completed;
             }
 
             responseText = result.Text ?? "";
@@ -96,6 +99,7 @@ public sealed class CodergenHandler : INodeHandler
                 ContextUpdates = merged,
                 Notes = written.Notes.Length > 0 ? written.Notes : $"Stage completed: {node.Id} (status reported by agent)",
             };
+            written = await StageArtifacts.CompleteAsync(node, written, context, responseText, simulated: backend is null, cancellationToken).ConfigureAwait(false);
             await WriteStatusAsync(stageDir, written, cancellationToken).ConfigureAwait(false);
             return written;
         }
@@ -103,6 +107,7 @@ public sealed class CodergenHandler : INodeHandler
         var outcome = Outcome.Success(
             node.AutoStatus ? "auto-status: handler completed without writing status" : "Stage completed: " + node.Id,
             defaults);
+        outcome = await StageArtifacts.CompleteAsync(node, outcome, context, responseText, simulated: backend is null, cancellationToken).ConfigureAwait(false);
         await WriteStatusAsync(stageDir, outcome, cancellationToken).ConfigureAwait(false);
         return outcome;
     }
@@ -124,6 +129,8 @@ public sealed class CodergenHandler : INodeHandler
 
     /// <summary>
     /// Builds the full prompt sent to the backend from explicit run state (used by editors to preview what a stage will see).
+    /// The prompt is the preamble, the task, the stage's artifact <c>## Inputs</c>/<c>## Outputs</c> sections (inputs resolve
+    /// from <c>artifacts.*</c> records in <paramref name="context"/>), and the status-file protocol.
     /// </summary>
     public static string BuildPrompt(
         Node node,
@@ -153,6 +160,13 @@ public sealed class CodergenHandler : INodeHandler
         }
 
         sb.Append(task);
+
+        // Reactor extension: declared artifact inputs and outputs (nothing is added for nodes without them).
+        var artifacts = StageArtifacts.PromptSections(node, context);
+        if (artifacts.Length > 0)
+        {
+            sb.AppendLine().AppendLine().Append(artifacts);
+        }
 
         if (backend is not null && backend.SupportsStatusFileFor(node) && includeStatusProtocol)
         {

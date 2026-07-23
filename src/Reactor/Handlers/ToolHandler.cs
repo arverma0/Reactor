@@ -9,6 +9,8 @@ namespace Reactor.Handlers;
 /// a non-zero exit code or timeout is FAIL. Output is written to <c>stdout.txt</c>/<c>stderr.txt</c> in the stage
 /// directory and exposed as <c>tool.output</c> (plus <c>tool.exit_code</c> and <c>tool.stderr</c>). The command receives
 /// <c>REACTOR_RUN_ID</c>, <c>REACTOR_LOGS_ROOT</c>, <c>REACTOR_STAGE_DIR</c>, <c>REACTOR_NODE_ID</c>, and <c>REACTOR_GOAL</c>.
+/// Artifact pins (Reactor extension): each produced input is passed as <c>REACTOR_INPUT_&lt;NAME&gt;</c> (a file path), a
+/// text output records stdout, and file outputs must exist after a successful run (see <see cref="StageArtifacts"/>).
 /// </summary>
 public sealed class ToolHandler : INodeHandler
 {
@@ -42,6 +44,10 @@ public sealed class ToolHandler : INodeHandler
             ["REACTOR_NODE_ID"] = node.Id,
             ["REACTOR_GOAL"] = graph.Goal,
         };
+        foreach (var (key, value) in await StageArtifacts.ToolInputEnvironmentAsync(node, context, stageDir, cancellationToken).ConfigureAwait(false))
+        {
+            environment[key] = value;
+        }
 
         var result = await ShellRunner.RunAsync(command, workingDirectory, environment, timeout, cancellationToken: cancellationToken).ConfigureAwait(false);
         await File.WriteAllTextAsync(Path.Combine(stageDir, "stdout.txt"), result.Stdout, cancellationToken).ConfigureAwait(false);
@@ -69,7 +75,8 @@ public sealed class ToolHandler : INodeHandler
                 updates);
         }
 
-        return Outcome.Success("Tool completed: " + command, updates);
+        var success = Outcome.Success("Tool completed: " + command, updates);
+        return await StageArtifacts.CompleteAsync(node, success, context, output, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     private static string Tail(string text, int max) => text.Length <= max ? text : "…" + text[^max..];

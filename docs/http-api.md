@@ -74,7 +74,18 @@ with an `end` event when the run finishes; comments (`: keep-alive`) are sent ev
 Event types: `PipelineStarted`, `PipelineCompleted`, `PipelineFailed`, `StageStarted`, `StageCompleted`,
 `StageFailed`, `StageRetrying`, `StageLog` (agent activity: `node_id`, `message`, `level`), `EdgeSelected`,
 `GoalGateUnsatisfied`, `LoopRestarted`, `ParallelStarted`, `ParallelBranchStarted`, `ParallelBranchCompleted`,
-`ParallelCompleted`, `InterviewStarted`, `InterviewCompleted`, `InterviewTimeout`, `CheckpointSaved`.
+`ParallelCompleted`, `InterviewStarted`, `InterviewCompleted`, `InterviewTimeout`, `CheckpointSaved`, and
+`ArtifactProduced` (Reactor extension: a stage produced one of its declared `outputs`; `node_id`, `name`, `kind`
+(`file` or `text`), `path`, `bytes`, `version`, `sha256` — `path` and `sha256` are omitted when null; see
+[artifacts](pipelines.md#artifacts-reactor-extension)):
+
+```text
+id: 9
+event: ArtifactProduced
+data: {"node_id":"architect","name":"design","kind":"file","path":"docs/DESIGN.md","bytes":1834,"version":1,"sha256":"9f2c4e…","timestamp":"…","run_id":"245dde38bd50","type":"ArtifactProduced","description":"Artifact design v1 produced by architect: docs/DESIGN.md (1834 bytes)","seq":9}
+```
+
+The latest record of each artifact is in the run's context (`GET /pipelines/{id}/context`) as `artifacts.<name>`.
 
 ## Example session
 

@@ -1,0 +1,33 @@
+// Artifact pins (Reactor extension): each stage declares what it reads (`inputs`) and what it produces
+// (`outputs`). `name:path` is a file the stage must write, relative to the working directory; a bare `name`
+// records the stage's final response (or a tool's stdout). Every prompt lists the stage's inputs and the
+// outputs it owes, and a stage that finishes without writing a declared file fails and is retried.
+// Produced artifacts are recorded in the context as artifacts.<name> and reported as ArtifactProduced events.
+// The test stage echoes a placeholder so the example runs anywhere: set its tool_command to your test runner
+// (e.g. "python -m pytest -q", "dotnet test", "npm test").
+digraph artifacts {
+    graph [
+        goal="Add a slugify(text) function with unit tests to this repository",
+        default_max_retries=1
+    ]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    spec      [label="Specify", outputs="spec:docs/SPEC.md",
+               prompt="Write a short specification for: $goal. Cover inputs, outputs, edge cases, and examples."]
+    architect [label="Design", inputs="spec", outputs="design:docs/DESIGN.md",
+               prompt="Design an implementation of the specification: files, functions, and a test plan."]
+    implement [label="Implement", inputs="spec, design, verdict", outputs="changes",
+               prompt="Implement the design, with unit tests. If a review verdict is listed, address it first; if the tests failed, their output is in the context (tool.output). End with a short summary of what you changed."]
+    test      [shape=parallelogram, label="Run tests", outputs="test_report", max_retries=0, timeout="10m",
+               tool_command="echo No tests were run: set tool_command to your test runner"]
+    review    [label="Review", inputs="design, changes, test_report", outputs="verdict",
+               prompt="Review the change against the design and the test report. Reply with your verdict: what must change, or why it is ready. Choose Revise if anything must change, otherwise Approve."]
+
+    start -> spec -> architect -> implement -> test
+    test   -> review    [condition="outcome=success"]
+    test   -> implement [condition="outcome=fail", label="Fix"]
+    review -> exit      [label="[A] Approve", weight=1]
+    review -> implement [label="[R] Revise"]
+}

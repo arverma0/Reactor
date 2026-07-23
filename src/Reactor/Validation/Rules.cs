@@ -1,6 +1,7 @@
 using Reactor.Conditions;
 using Reactor.Execution;
 using Reactor.Graphs;
+using Reactor.Handlers;
 using Reactor.Stylesheets;
 
 namespace Reactor.Validation;
@@ -520,6 +521,294 @@ public sealed class ManagerLoopChildRule : ILintRule
                     NodeId = node.Id,
                 };
             }
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_syntax</c> (ERROR, Reactor extension): <c>inputs</c>/<c>outputs</c> entries must be well formed — identifier
+/// names, no duplicates, and output paths that are non-empty, relative, and inside the working directory.
+/// </summary>
+public sealed class ArtifactSyntaxRule : ILintRule
+{
+    public string Name => "artifact_syntax";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        foreach (var node in graph.Nodes.Values)
+        {
+            foreach (var error in ArtifactPins.Parse(node).Errors)
+            {
+                yield return new Diagnostic(Name, Severity.Error, error.Message) { NodeId = node.Id, Fix = error.Fix };
+            }
+        }
+    }
+}
+
+/// <summary><c>artifact_inputs</c> (WARNING, Reactor extension): every declared input should be an output of some stage.</summary>
+public sealed class ArtifactInputsRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_inputs";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        var producers = ArtifactFlow.Producers(graph, _types);
+        foreach (var (node, input) in ArtifactFlow.Consumed(graph, _types))
+        {
+            if (!producers.ContainsKey(input))
+            {
+                yield return new Diagnostic(Name, Severity.Warning, $"Input '{input}' is not produced by any stage, so it is never available.")
+                {
+                    NodeId = node.Id,
+                    Fix = $"Add outputs=\"{input}:…\" to the stage that produces it (or outputs=\"{input}\" for a text artifact).",
+                };
+            }
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_order</c> (WARNING, Reactor extension): some producer of each input must be able to run before the
+/// consuming stage. Records made inside a parallel branch stay in that branch (branch context is not merged at the
+/// fan-in), so a producer that only runs in a branch reaches only later stages of the same branch.
+/// </summary>
+public sealed class ArtifactOrderRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_order";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        var consumed = ArtifactFlow.Consumed(graph, _types).ToList();
+        if (consumed.Count == 0)
+        {
+            yield break;
+        }
+
+        var producers = ArtifactFlow.Producers(graph, _types);
+        var flow = new ArtifactFlow(graph, _types);
+        foreach (var (node, input) in consumed)
+        {
+            if (!producers.TryGetValue(input, out var ids) || ids.Any(p => flow.RecordReaches(p, node.Id)))
+            {
+                continue;
+            }
+
+            var list = string.Join(", ", ids.Select(id => $"'{id}'"));
+            var confined = ids.Where(p => flow.GraphReaches(p, node.Id)).ToList();
+            yield return confined.Count > 0
+                ? new Diagnostic(Name, Severity.Warning,
+                    $"Input '{input}' is produced only inside parallel branches ({string.Join(", ", confined.Select(id => $"'{id}'"))}); branch context is not merged at the fan-in, so it is never available here.")
+                {
+                    NodeId = node.Id,
+                    Fix = "Consume it later in the same branch, or produce it in a stage after the fan-in.",
+                }
+                : new Diagnostic(Name, Severity.Warning, $"Input '{input}' is produced only by {list}, which cannot run before this stage, so it is never available.")
+                {
+                    NodeId = node.Id,
+                    Fix = "Produce it in an earlier stage, or reorder the stages.",
+                };
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_handlers</c> (WARNING, Reactor extension): only codergen and tool stages consume and produce artifacts;
+/// <c>inputs</c>/<c>outputs</c> on other node types are ignored.
+/// </summary>
+public sealed class ArtifactHandlersRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_handlers";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        foreach (var node in graph.Nodes.Values)
+        {
+            var type = _types.Of(node);
+            if (!ArtifactPins.Declares(node) || ArtifactPins.IsSupportedHandlerType(type))
+            {
+                continue;
+            }
+
+            var attributes = new[] { AttrKeys.Inputs, AttrKeys.Outputs }.Where(k => !string.IsNullOrWhiteSpace(node[k])).ToList();
+            yield return new Diagnostic(Name, Severity.Warning,
+                $"{string.Join(" and ", attributes)} {(attributes.Count > 1 ? "are" : "is")} ignored on {type} nodes; only codergen and tool stages consume and produce artifacts.")
+            {
+                NodeId = node.Id,
+                Fix = "Declare artifacts on a codergen (box) or tool (parallelogram) stage.",
+            };
+        }
+    }
+}
+
+/// <summary>How artifact records flow through a graph (shared by the artifact lint rules).</summary>
+internal sealed class ArtifactFlow
+{
+    private readonly Graph _graph;
+    private readonly Types _types;
+    private readonly HashSet<string> _mainFlow;
+    private readonly Dictionary<string, HashSet<string>> _graphReach = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>> _branchReach = new(StringComparer.Ordinal);
+
+    public ArtifactFlow(Graph graph, Types types)
+    {
+        _graph = graph;
+        _types = types;
+        _mainFlow = MainFlow();
+    }
+
+    /// <summary>Artifact name → ids of the stages that produce it (stages whose handler supports artifacts).</summary>
+    public static Dictionary<string, List<string>> Producers(Graph graph, Types types)
+    {
+        var producers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes.Values.Where(n => ArtifactPins.IsSupportedHandlerType(types.Of(n))))
+        {
+            foreach (var pin in ArtifactPins.Parse(node).Outputs)
+            {
+                if (!producers.TryGetValue(pin.Name, out var ids))
+                {
+                    producers[pin.Name] = ids = [];
+                }
+
+                ids.Add(node.Id);
+            }
+        }
+
+        return producers;
+    }
+
+    /// <summary>Every (stage, input) pair for stages whose handler supports artifacts.</summary>
+    public static IEnumerable<(Node Node, string Input)> Consumed(Graph graph, Types types) =>
+        graph.Nodes.Values
+            .Where(n => ArtifactPins.IsSupportedHandlerType(types.Of(n)))
+            .SelectMany(n => ArtifactPins.Parse(n).Inputs.Select(input => (n, input)));
+
+    /// <summary>True when <paramref name="to"/> can run after <paramref name="from"/> (a path of at least one edge).</summary>
+    public bool GraphReaches(string from, string to)
+    {
+        if (!_graphReach.TryGetValue(from, out var reach))
+        {
+            reach = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var edge in _graph.OutgoingEdges(from))
+            {
+                reach.UnionWith(ReachabilityRule.Reachable(_graph, edge.To));
+            }
+
+            _graphReach[from] = reach;
+        }
+
+        return reach.Contains(to);
+    }
+
+    /// <summary>
+    /// True when a record made by <paramref name="from"/> can be in the context when <paramref name="to"/> runs: like
+    /// <see cref="GraphReaches"/>, except that a stage that runs only inside parallel branches reaches only the rest of its
+    /// branch (up to the fan-in or exit where the branch stops).
+    /// </summary>
+    public bool RecordReaches(string from, string to) => _mainFlow.Contains(from) ? GraphReaches(from, to) : BranchReach(from).Contains(to);
+
+    private HashSet<string> BranchReach(string from)
+    {
+        if (_branchReach.TryGetValue(from, out var cached))
+        {
+            return cached;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>(_graph.OutgoingEdges(from).Select(e => e.To));
+        while (queue.Count > 0)
+        {
+            var id = queue.Dequeue();
+            if (IsBranchStop(id) || !seen.Add(id))
+            {
+                continue;
+            }
+
+            foreach (var edge in _graph.OutgoingEdges(id))
+            {
+                queue.Enqueue(edge.To);
+            }
+        }
+
+        return _branchReach[from] = seen;
+    }
+
+    /// <summary>
+    /// Stages the top-level traversal can run: from the start node along edges, except that a parallel node continues at
+    /// the fan-in/exit nodes where its branches stop (its own edges lead into the branches, which run on cloned contexts).
+    /// </summary>
+    private HashSet<string> MainFlow()
+    {
+        if (_graph.FindStartNode() is not { } start)
+        {
+            return _graph.Nodes.Keys.ToHashSet(StringComparer.Ordinal);
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal) { start.Id };
+        var queue = new Queue<string>([start.Id]);
+        while (queue.Count > 0)
+        {
+            var id = queue.Dequeue();
+            var next = _graph.GetNode(id) is { } node && _types.Of(node) == HandlerTypes.Parallel
+                ? BranchStops(id)
+                : _graph.OutgoingEdges(id).Select(e => e.To);
+            foreach (var target in next)
+            {
+                if (seen.Add(target))
+                {
+                    queue.Enqueue(target);
+                }
+            }
+        }
+
+        return seen;
+    }
+
+    private IEnumerable<string> BranchStops(string parallelId)
+    {
+        var stops = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>(_graph.OutgoingEdges(parallelId).Select(e => e.To));
+        while (queue.Count > 0)
+        {
+            var id = queue.Dequeue();
+            if (IsBranchStop(id))
+            {
+                stops.Add(id);
+            }
+            else if (seen.Add(id))
+            {
+                foreach (var edge in _graph.OutgoingEdges(id))
+                {
+                    queue.Enqueue(edge.To);
+                }
+            }
+        }
+
+        return stops;
+    }
+
+    private bool IsBranchStop(string id) => _graph.GetNode(id) is not { } node || _types.Of(node) == HandlerTypes.FanIn || Graph.IsExitNode(node);
+
+    /// <summary>Resolves the handler type a node runs with, as <see cref="HandlerRegistry.TryResolve"/> does.</summary>
+    internal sealed class Types(IEnumerable<string>? knownTypes)
+    {
+        private readonly HashSet<string> _known = new(knownTypes ?? HandlerTypes.BuiltIn, StringComparer.Ordinal);
+
+        public string Of(Node node)
+        {
+            if (node.Type.Length > 0 && _known.Contains(node.Type))
+            {
+                return node.Type;
+            }
+
+            var shapeType = HandlerRegistry.ShapeType(node);
+            return _known.Contains(shapeType) ? shapeType : HandlerTypes.Codergen;
         }
     }
 }

@@ -37,7 +37,7 @@ exceptions) plug in without a dependency. `Reactor.Agent` and `Reactor.Llm` are 
 
 ```text
 DOT ──DotParser──▶ Graph ──transforms──▶ Graph ──PipelineValidator──▶ diagnostics ──PipelineRunner──▶ PipelineResult
-                         ($goal expansion,                (19 rules; errors
+                         ($goal expansion,                (23 rules; errors
                           model stylesheet,               stop the run)
                           custom IGraphTransform)
 ```
@@ -70,6 +70,11 @@ Supporting pieces:
   auto-approve, recording, and the server's web interviewer are interchangeable. Timeouts cancel the ask.
 - **Events** — typed records (`StageStarted`, `StageLog`, …) flow through `PipelineEventBus` to the run's
   `events.jsonl`, `RunOptions.OnEvent`, and any `IPipelineEventSink`.
+- **Artifact pins** (Reactor extension) — `ArtifactPins` parses the `inputs`/`outputs` node attributes;
+  `StageArtifacts` renders a codergen prompt's Inputs/Outputs sections, enforces the output contract on successful
+  stages (a missing declared file turns the outcome into FAIL, so retries and routing apply), and adds versioned
+  `artifacts.<name>` records to the outcome's context updates with an `ArtifactProduced` event. The codergen and tool
+  handlers call it; custom handlers can too. Not to be confused with `ArtifactStore`, the spec's store for large values.
 - **Resume** — `ResumeAsync(logsRoot)` reloads `checkpoint.json` (context, completed nodes, retry counts, node
   outcomes, last fidelity/thread, history) and continues after the checkpointed node; a `full`-fidelity stage right
   after resume degrades to `summary:high` because agent sessions are not persisted.
@@ -122,7 +127,7 @@ from command-line options and the environment.
 
 | Project | Focus |
 |---|---|
-| `Reactor.Tests` | parser, conditions, stylesheet, validation rules, engine routing/retries/goal gates/parallel/resume/manager, handlers, examples (incl. the spec smoke test) |
+| `Reactor.Tests` | parser, conditions, stylesheet, validation rules, engine routing/retries/goal gates/parallel/resume/manager, handlers, artifact pins, examples (incl. the spec smoke test) |
 | `Reactor.Llm.Tests` | request/response/stream translation per provider against recorded payloads, errors, retries, high-level API, object generation |
 | `Reactor.Agent.Tests` | tools (read/write/edit/apply_patch/shell/grep/glob/web_fetch), environments, truncation, the session loop, subagents, profiles |
 | `Reactor.Backends.Tests` | agent backend in real pipelines with real tools and a scripted model, CLI backends against fake CLIs replaying recorded output, hooks, routing |

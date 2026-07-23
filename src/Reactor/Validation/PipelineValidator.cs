@@ -119,7 +119,7 @@ public static class PipelineValidator
         return diagnostics;
     }
 
-    /// <summary>The built-in rule set.</summary>
+    /// <summary>The built-in rule set (the spec's rules plus Reactor's artifact rules).</summary>
     public static IReadOnlyList<ILintRule> BuiltInRules(IEnumerable<string>? knownHandlerTypes = null) =>
     [
         new StartNodeRule(),
@@ -141,5 +141,9 @@ public static class PipelineValidator
         new ToolCommandRule(),
         new ParallelStructureRule(),
         new ManagerLoopChildRule(),
+        new ArtifactSyntaxRule(),
+        new ArtifactInputsRule(knownHandlerTypes),
+        new ArtifactOrderRule(knownHandlerTypes),
+        new ArtifactHandlersRule(knownHandlerTypes),
     ];
 }

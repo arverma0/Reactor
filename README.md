@@ -110,6 +110,11 @@ Edges route on `condition="outcome=success"`, `condition="context.tests_passed=t
 `label` matching the stage's preferred label, `weight`, and finally lexical order. Agents report non-default
 outcomes by writing `status.json` in their stage directory (the prompt tells them how).
 
+Stages can also declare the artifacts they read and produce (`inputs="spec, design"`,
+`outputs="design:docs/DESIGN.md, verdict"`): prompts list them, a stage that does not write a declared file fails
+(and can be retried), and each produced artifact is recorded in the context and announced as an `ArtifactProduced`
+event — see [artifacts](docs/pipelines.md#artifacts-reactor-extension).
+
 Full reference: [docs/pipelines.md](docs/pipelines.md). Examples in [examples/](examples):
 
 | Example | Shows |
@@ -121,6 +126,7 @@ Full reference: [docs/pipelines.md](docs/pipelines.md). Examples in [examples/](
 | [stylesheet.dot](examples/stylesheet.dot) | per-node models via a CSS-like `model_stylesheet` |
 | [supervisor.dot](examples/supervisor.dot) | a manager loop observing and steering a child pipeline |
 | [factory.dot](examples/factory.dot) | a 15-node build/test/review/sign-off pipeline |
+| [artifacts.dot](examples/artifacts.dot) | artifact pins: stages declare `inputs`/`outputs` (spec → design → code → test report → verdict) |
 
 ## Command line
 

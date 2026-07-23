@@ -57,7 +57,7 @@ public static class StudioApi
     public static WebApplication MapStudioApi(this WebApplication app)
     {
         ArgumentNullException.ThrowIfNull(app);
-        app.Services.GetRequiredService<StudioFeatures>().Add("workspace", "parse", "models", "prompt_preview");
+        app.Services.GetRequiredService<StudioFeatures>().Add("workspace", "parse", "models", "prompt_preview", "artifacts");
         var api = app.MapGroup("/studio/api");
         api.MapGet("/info", Info);
         api.MapPost("/graph/parse", ParseAsync);
