@@ -66,6 +66,8 @@ interface StudioState {
   layers: { data: boolean; notes: boolean; minimap: boolean };
   paletteOpen: boolean;
   architectOpen: boolean;
+  /** Questions waiting on a person across live runs. */
+  waiting: number;
   saveAsOpen: boolean;
   runOpen: boolean;
   toasts: Toast[];
@@ -105,6 +107,7 @@ export const useStudio = create<StudioState>()(() => ({
   layers: { data: true, notes: true, minimap: true },
   paletteOpen: false,
   architectOpen: false,
+  waiting: 0,
   saveAsOpen: false,
   runOpen: false,
   toasts: [],

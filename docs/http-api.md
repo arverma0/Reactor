@@ -1,15 +1,17 @@
 # HTTP API
 
-`reactor serve` hosts the Attractor HTTP mode (spec 9.5) and a web console. Start it with:
+`reactor serve` hosts the Attractor HTTP mode (spec 9.5), [Reactor Studio](studio.md) (at `/`), and the classic web
+console (at `/console`). `reactor studio` starts the same server and opens the Studio in a browser. Start it with:
 
 ```powershell
 reactor serve --backend copilot --urls http://127.0.0.1:5180 --token <secret> [-C <workdir>] [--max-concurrent 4]
 ```
 
 - **Auth**: with `--token` (or `REACTOR_SERVER_TOKEN`), every API call needs `Authorization: Bearer <token>`; the
-  event stream also accepts `?access_token=<token>` because browsers' `EventSource` cannot send headers. `/` (the
-  console) and `/healthz` are open. The server binds to loopback by default and warns when exposed without a token —
-  pipelines run shell commands, so treat access as code execution.
+  event stream also accepts `?access_token=<token>` because browsers' `EventSource` cannot send headers. The Studio
+  and console pages (`/`, `/console`, and their static assets) and `/healthz` are open; the Studio asks for the token
+  and keeps it in the browser's local storage. The server binds to loopback by default and warns when exposed without a
+  token — pipelines run shell commands, so treat access as code execution.
 - **Runs** execute in the server's working directory (clients may choose one only with `--allow-client-workdir`),
   at most `--max-concurrent` at a time (others are `queued`), each limited to 1000 stage executions.
 - JSON uses `snake_case`. Errors are `{"error": "..."}` with a 4xx/5xx status.
@@ -41,7 +43,8 @@ await app.RunAsync("http://127.0.0.1:5180");
 | `GET` | `/pipelines/{id}/stages/{node}` | A stage's outcome and file list. |
 | `GET` | `/pipelines/{id}/stages/{node}/files/{name}` | One stage file (`prompt.md`, `response.md`, `status.json`, `backend.json`, transcripts…). |
 | `GET` | `/healthz` | `{"status":"ok"}`. |
-| `GET` | `/` | Web console. |
+| `GET` | `/` | Reactor Studio (see [studio.md](studio.md)). |
+| `GET` | `/console` | The classic web console. |
 
 Run states: `queued`, `running`, `success`, `partial_success`, `fail`, `cancelled`, `error` (the run could not
 execute, e.g. an engine exception).
@@ -86,6 +89,28 @@ data: {"node_id":"architect","name":"design","kind":"file","path":"docs/DESIGN.m
 ```
 
 The latest record of each artifact is in the run's context (`GET /pipelines/{id}/context`) as `artifacts.<name>`.
+
+## Studio: editor
+
+The Studio's editing endpoints, under `/studio/api` (same auth). `GET /studio/api/info` describes the server for the
+Studio — `version`, `working_directory`, `runs_directory`, the `backend` (`kind`, `description`, `routes`,
+`status_file`), `handler_types`, `fidelity_modes`, `auth`, and the `features` the server supports (`workspace`,
+`parse`, `models`, `prompt_preview`, `artifacts`, `history`, `telemetry`, `fork`, `steering`, `simulation`,
+`architect`), so the Studio can hide what a server cannot do.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/studio/api/graph/parse` | Parse and validate with the server's transforms and lint rules. Body: DOT, or JSON `{"dot"}`. `{ok: true, valid, graph, diagnostics}`, or `{ok: false, error, message, line, column}` for a syntax error. `graph` has the name, graph attributes, `node_defaults`/`edge_defaults`, and per node its `attributes` (effective), `explicit` keys, `classes`, `subgraph`, `handler`, `effective` model settings (with the stylesheet rule they came from), and artifact `pins`; edges; and `subgraphs` (nested, with their own defaults). |
+| `POST` | `/studio/api/graph/prompt-preview` | `{"dot", "node", "history": [completed stage ids], "fidelity"?, "context"?}` → `{node, handler, fidelity, status_protocol, prompt}`: the exact prompt the stage would get, preamble and artifact sections included. |
+| `GET` | `/studio/api/models` | `{models: [{id, provider, source, display_name, context_window, reasoning_efforts, billing_multiplier, available, …}], error?}`: the catalog, or the models the Copilot account can use with `--backend copilot`. |
+| `GET` | `/studio/api/workspace` | `{root, files: [{path, name, size, modified, has_layout, graph_name, goal, node_count, error}]}`: the `.dot` files under the working directory (up to 500, 8 levels deep; hidden and tooling directories such as `.git`, `.reactor`, `node_modules`, `bin`, `obj` are skipped). |
+| `GET` | `/studio/api/workspace/file?path=a/b.dot` | `{path, dot, layout, modified}`; `layout` is the `a/b.layout.json` sidecar or null. |
+| `PUT` | `/studio/api/workspace/file` | `{"path", "dot", "layout"?, "base_modified"?}` writes the file (and the sidecar when `layout` is given) atomically. `409` when the file changed on disk after `base_modified`. Paths are workspace-relative and must end in `.dot`. |
+| `GET` | `/studio/api/pipelines/{id}/source` | `{id, name, dot, logs_root, studio}`: the DOT a live run was started with, and its Studio metadata. |
+
+The **layout sidecar** (`name.layout.json`) holds what the engine does not need: node positions, sticky notes, the
+viewport, and colors of artifacts and threads. The DOT file stays the source of truth; the Studio writes it with
+attributes in a stable order and keeps the leading comment block (comments inside the graph body are not kept).
 
 ## Studio: flights
 
@@ -337,3 +362,56 @@ history and telemetry never include them; their `studio.json` has `"simulated": 
 `GET /pipelines` and `GET /pipelines/{id}` add `"simulated": true` and `"simulation_mode"` (the detail also has
 `"simulation_seed"`; replay its draws with `/studio/api/simulate/trace`, run index 0). Resuming a simulated run keeps its
 settings and per-node execution counts, so scripts continue where they stopped.
+
+## Studio: Architect
+
+The Architect drafts, revises, or critiques a pipeline with the server's backend and checks every draft before
+returning it. It is itself a Reactor pipeline (built-in `architect.dot`; a workspace can replace it with
+`.reactor/studio/architect.dot`, and the guide sent with every request with `.reactor/studio/architect.md`):
+
+```text
+start → design (studio.architect) → check (studio.check) → exit
+                       ↑______________________| on failure, up to 3 drafts
+```
+
+- `design` sends the guide (Reactor's DOT dialect, factory principles, an example) and the request — mode, brief,
+  current pipeline, evidence, available models, and on a repair the previous draft and the checker's findings — to the
+  backend verbatim (no `$goal` expansion, no status-file protocol), and keeps the last fenced DOT block of the answer as
+  the proposal and the rest as the rationale.
+- `check` parses and validates the proposal with the server's rules (errors fail it; warnings are reported), then flies
+  it in the wind tunnel: with every stage succeeding, 100% of 60 simulated flights must land; a realistic pass (400
+  flights; agents succeed 90%, tools 75%) gives the forecast and warns when more than 5% of flights loop until the step
+  limit. Findings fail the stage and go back to `design`; after the third failing draft the run fails.
+
+Architect runs are ordinary runs (listed by `/pipelines`, streamed, cancellable, with stage files and cost) whose
+working directory is a scratch directory under `.reactor/studio/architect/`. The server needs a real backend: a server
+started with `--backend simulate` answers `409`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/studio/api/architect` | Start. `201 {id, status, name, logs_root, links}`. |
+| `GET` | `/studio/api/architect/{id}` | The job's state (below); `404` for runs that are not Architect runs. |
+
+```http
+POST /studio/api/architect
+{"mode": "critique", "dot": "<current pipeline>", "brief": "Why do flights stall at the tests?",
+ "evidence": "<Markdown: flight record, wind tunnel report>", "models": ["claude-sonnet-5", "gpt-5.6-luna"],
+ "model": "claude-sonnet-5", "reasoning_effort": "high"}
+```
+
+`mode` is `draft` (needs `brief`), `revise` (needs `brief` and `dot`), or `critique` (needs `dot`; `brief` is an
+optional focus). `models` lists the model ids the Architect may assign; `model` and `reasoning_effort` choose the model
+of the design stage itself (default: the backend's).
+
+```json
+{"id": "8da91d15d6aa", "status": "success", "current_node": null, "mode": "draft", "attempt": 2, "max_drafts": 3,
+ "rationale": "- **Flow fix:** …",
+ "proposal": {"dot": "digraph bug_fix_factory { … }", "checked": true, "valid": true, "problems": [], "warnings": [],
+              "forecast": {"happy_path": 1, "realistic": 1, "step_limit": 0, "mean_steps": 10.3, "p90_steps": 17,
+                           "stages": 11, "routes": 15, "failures": []}},
+ "feedback": "", "error": null, "links": {"run": "/pipelines/8da91d15d6aa", "events": "/pipelines/8da91d15d6aa/events"}}
+```
+
+`attempt` counts checked drafts. While the run is going, the state reflects its latest checkpoint (after each stage),
+so `proposal` may be a draft that is about to be repaired (`checked` false, or `valid` false with the run still
+`running`).

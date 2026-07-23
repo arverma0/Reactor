@@ -11,7 +11,7 @@
  ┌────────────────┐ ┌──────────┐ ┌───────────────┐ ┌──────────────────┐
  │ Reactor.Server │ │ Reactor. │ │ Reactor.      │ │ GitHub.Copilot.  │
  │ HTTP + SSE +   │ │ Copilot  │─▶ Backends      │ │ SDK (+ bundled   │
- │ web console    │ │ (SDK)    │ │ agent/direct/ │ │ runtime)         │
+ │ Studio, console│ │ (SDK)    │ │ agent/direct/ │ │ runtime)         │
  └───────┬────────┘ └────┬─────┘ │ CLI agents,   │ └──────────────────┘
          │               │       │ router, hooks │
          │               │       └──┬─────────┬──┘
@@ -131,6 +131,25 @@ journal with gap-free replay, web interviewer per run) and minimal-API endpoints
 directories from disk (cached per directory, refreshed incrementally) for the Studio's history, telemetry, and forks.
 `Reactor.Cli` composes everything from command-line options and the environment.
 
+## Reactor Studio
+
+`src/Reactor.Studio` is a React/TypeScript single-page app (React Flow canvas, CodeMirror, zustand stores), built by
+Vite during `dotnet build` and embedded into `Reactor.Server` as resources served at `/` (see [studio.md](studio.md)).
+It keeps no rules of its own about pipelines: parsing, effective models, validation, prompts, simulation, and runs all
+go through the Studio API (`Reactor.Server/Studio`), which calls the same parser, transforms, validator, runner, and
+simulator as the CLI.
+
+| Studio | Studio API (`Reactor.Server/Studio`) | Engine |
+|---|---|---|
+| Design: document model, DOT writer, canvas, inspector | `StudioApi`: parse with editor metadata, prompt preview, models, workspace files | `DotParser`, transforms, `PipelineValidator`, `CodergenHandler.BuildPrompt` |
+| Wind tunnel | `SimulationEndpoints`: Monte Carlo reports, single-flight traces | `Reactor.Simulation` on in-memory runs |
+| Flights | `/pipelines` and SSE; `FlightsEndpoints`: history, telemetry, forks, steering | `PipelineRunManager`, `RunHistory`, checkpoint snapshots |
+| Architect | `ArchitectApi`: runs `architect.dot` (a design stage and a check stage) | the server's backend, `PipelineValidator`, `MonteCarloSimulator` |
+
+The document model (`StudioDoc`) mirrors DOT's structure — nodes with their explicit attributes, edges, subgraphs as
+groups, default blocks — so the writer can produce the same graph the engine parsed (checked by round-tripping every
+example through the server's parser). Everything visual lives in the `.layout.json` sidecar.
+
 ## Testing
 
 | Project | Focus |
@@ -140,7 +159,8 @@ directories from disk (cached per directory, refreshed incrementally) for the St
 | `Reactor.Agent.Tests` | tools (read/write/edit/apply_patch/shell/grep/glob/web_fetch), environments, truncation, the session loop, subagents, profiles |
 | `Reactor.Backends.Tests` | agent backend in real pipelines with real tools and a scripted model, CLI backends against fake CLIs replaying recorded output, hooks, routing |
 | `Reactor.Copilot.Tests` | SDK backend orchestration through a fake runtime (threads, models, errors, hooks) |
-| `Reactor.Server.Tests` | the HTTP API on an in-memory test server: runs, SSE, human gates, cancel/queue/resume, auth, run history, telemetry, forks, steering |
+| `Reactor.Server.Tests` | the HTTP API on an in-memory test server: runs, SSE, human gates, cancel/queue/resume, auth, Studio API, run history, telemetry, forks, steering, simulation, the Architect (with a scripted backend) |
+| Studio (Vitest) | DOT writer and importer, routes, conditions, stylesheet, doc diffs, fork checkpoints, flight merging, wind tunnel calibration, Architect evidence |
 
 Live runs against real agents (Copilot SDK, Copilot CLI) were used to validate the end-to-end behavior described
 in these documents; see [spec-conformance.md](spec-conformance.md).

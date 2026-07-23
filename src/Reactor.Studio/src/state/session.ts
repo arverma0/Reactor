@@ -80,4 +80,16 @@ export function startSession() {
   setInterval(() => {
     if (!get().connected) void loadInfo();
   }, 5000);
+  // Questions waiting on a person in any run, for the Flights tab badge (whatever mode is open).
+  const pollWaiting = async () => {
+    if (!get().connected) return;
+    try {
+      const runs = await api.runs();
+      const waiting = runs.reduce((n, r) => n + (r.pending_questions ?? 0), 0);
+      if (waiting !== get().waiting) set({ waiting });
+    } catch {
+      // offline: keep the last count
+    }
+  };
+  setInterval(() => void pollWaiting(), 4000);
 }

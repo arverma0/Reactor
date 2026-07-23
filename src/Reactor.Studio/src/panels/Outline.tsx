@@ -41,7 +41,7 @@ export function Outline() {
           <Glyph name={kind} size={13} />
         </span>
         <span className="rs-outline__label">{nodeLabel(doc, n)}</span>
-        <span className="rs-outline__id mono">{n.id}</span>
+        {nodeLabel(doc, n) !== n.id ? <span className="rs-outline__id mono">{n.id}</span> : null}
         {issues.length > 0 ? <span className={cx("rs-outline__diag", issues.some((d) => d.severity === "error") ? "is-error" : "is-warning")} /> : null}
       </button>
     );

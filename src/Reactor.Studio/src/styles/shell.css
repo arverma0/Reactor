@@ -524,3 +524,17 @@
   position: absolute;
   inset: 0;
 }
+
+.rs-modes__badge {
+  min-width: 17px;
+  height: 17px;
+  margin-left: 2px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--kind-human);
+  color: #1a1204;
+  font: 600 10px/17px var(--font-mono);
+  text-align: center;
+  box-shadow: 0 0 0 3px rgba(232, 184, 74, 0.16);
+  animation: rs-breathe 1.6s ease-in-out infinite;
+}

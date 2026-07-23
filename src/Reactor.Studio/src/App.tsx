@@ -125,6 +125,7 @@ function TopBar() {
   const connected = useStudio((s) => s.connected);
   const info = useStudio((s) => s.info);
   const architectOpen = useStudio((s) => s.architectOpen);
+  const waiting = useStudio((s) => s.waiting);
   const errors = analysis.diagnostics.filter((d) => d.severity === "error").length + (analysis.parseError ? 1 : 0);
   const warnings = analysis.diagnostics.filter((d) => d.severity === "warning").length;
   const dir = file.path?.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -146,6 +147,11 @@ function TopBar() {
           <button key={m.value} type="button" role="tab" aria-selected={mode === m.value} className={cx("rs-modes__tab", mode === m.value && "is-on")} onClick={() => setMode(m.value)} title={`${m.hint} (${i + 1})`}>
             <Glyph name={m.icon} size={14} />
             {m.label}
+            {m.value === "flights" && waiting > 0 ? (
+              <span className="rs-modes__badge num" title={`${waiting} question${waiting === 1 ? "" : "s"} waiting for you`}>
+                {waiting}
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
