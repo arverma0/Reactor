@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -35,6 +36,14 @@ public sealed record StageRecord(string NodeId, string Label, StageStatus Status
 public sealed class Checkpoint
 {
     public const string FileName = "checkpoint.json";
+
+    /// <summary>
+    /// Subdirectory of a run directory holding per-stage checkpoint snapshots (see <see cref="RunOptions.KeepCheckpointHistory"/>).
+    /// </summary>
+    public const string SnapshotDirectoryName = "checkpoints";
+
+    /// <summary>The snapshot name for the checkpoint saved after stage execution <paramref name="index"/> (<c>0004-plan</c>).</summary>
+    public static string SnapshotName(int index, string nodeId) => $"{index.ToString("D4", CultureInfo.InvariantCulture)}-{nodeId}";
 
     public DateTimeOffset Timestamp { get; set; } = DateTimeOffset.UtcNow;
 

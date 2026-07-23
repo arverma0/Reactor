@@ -273,8 +273,20 @@ time per session so audit scripts can append to files safely.
   manifest.json  graph.dot  checkpoint.json  events.jsonl  result.json
   plan/          prompt.md  response.md  status.json  backend.json  (+ transcript.md, agent-events.jsonl, ...)
   implement/     ...        history/visit-1/ (files from earlier visits of a stage that ran more than once)
+  checkpoints/   0001-start.json  0002-plan.json  ...   (server runs: the checkpoint after each stage)
+  studio.json    (server runs started from the Studio: source file, layout, forked_from)
 ```
 
 `events.jsonl` has one JSON object per event (`PipelineStarted`, `StageStarted`, `StageCompleted`, `StageLog`,
 `EdgeSelected`, `InterviewStarted`, `CheckpointSaved`, `ArtifactProduced`, …). `reactor resume <run-dir>` continues from
 `checkpoint.json`.
+
+**Checkpoint snapshots and forks.** With `RunOptions.KeepCheckpointHistory` (on for runs started by `reactor serve`),
+every checkpoint saved after a top-level stage is also kept as `checkpoints/{index:D4}-{node}.json`, where `index` is
+the stage execution index (the `index` of its `StageStarted`/`StageCompleted` events; parallel branch stages use
+indexes but get no snapshot of their own). The final save that records the run's outcome is not a snapshot. A
+snapshot is an ordinary checkpoint: copy it as `checkpoint.json` into a new directory with a `graph.dot` and
+`reactor resume` (or `POST /studio/api/runs/{id}/fork`, see [http-api.md](http-api.md)) continues **after** that
+stage, routing on its recorded outcome — so to re-run a stage, start from the snapshot taken just before it. The
+graph may be edited first (prompts, models, edges) as long as it still has the snapshot's stage. Only engine state
+is restored: files the agents changed in the working directory are not rewound.

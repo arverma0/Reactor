@@ -220,6 +220,10 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
             return reply?.Data?.Content;
         }
 
+        // "immediate" interjects into the in-progress turn instead of queueing a new one (the SDK's steering mode).
+        public Task SteerAsync(string message, CancellationToken cancellationToken) =>
+            session.SendAsync(new MessageOptions { Prompt = message, Mode = "immediate" }, cancellationToken);
+
         public Task AbortAsync() => session.AbortAsync(CancellationToken.None);
 
         public Task SetModelAsync(string model, string? reasoningEffort, CancellationToken cancellationToken) =>

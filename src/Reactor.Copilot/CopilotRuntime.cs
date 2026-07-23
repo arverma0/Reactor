@@ -53,6 +53,9 @@ internal interface ICopilotConversation : IAsyncDisposable
     /// <summary>Sends a prompt and waits until the agent is idle; returns the final assistant message (or null).</summary>
     Task<string?> SendAndWaitAsync(string prompt, TimeSpan timeout, CancellationToken cancellationToken);
 
+    /// <summary>Interjects a message into the turn in progress (steering), without waiting for a reply.</summary>
+    Task SteerAsync(string message, CancellationToken cancellationToken);
+
     Task AbortAsync();
 
     Task SetModelAsync(string model, string? reasoningEffort, CancellationToken cancellationToken);

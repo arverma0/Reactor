@@ -123,8 +123,9 @@ execution loops, retries with backoff and `Retry-After`, timeouts, and structure
 
 `Reactor.Backends` adapts agents to `ICodergenBackend` (see [backends.md](backends.md)); `BackendRouter` composes
 them per node. `Reactor.Server` wraps the runner in a `PipelineRunManager` (run registry, concurrency gate, event
-journal with gap-free replay, web interviewer per run) and minimal-API endpoints. `Reactor.Cli` composes everything
-from command-line options and the environment.
+journal with gap-free replay, web interviewer per run) and minimal-API endpoints; its `RunHistory` reads run
+directories from disk (cached per directory, refreshed incrementally) for the Studio's history, telemetry, and forks.
+`Reactor.Cli` composes everything from command-line options and the environment.
 
 ## Testing
 
@@ -135,7 +136,7 @@ from command-line options and the environment.
 | `Reactor.Agent.Tests` | tools (read/write/edit/apply_patch/shell/grep/glob/web_fetch), environments, truncation, the session loop, subagents, profiles |
 | `Reactor.Backends.Tests` | agent backend in real pipelines with real tools and a scripted model, CLI backends against fake CLIs replaying recorded output, hooks, routing |
 | `Reactor.Copilot.Tests` | SDK backend orchestration through a fake runtime (threads, models, errors, hooks) |
-| `Reactor.Server.Tests` | the HTTP API on an in-memory test server: runs, SSE, human gates, cancel/queue/resume, auth |
+| `Reactor.Server.Tests` | the HTTP API on an in-memory test server: runs, SSE, human gates, cancel/queue/resume, auth, run history, telemetry, forks, steering |
 
 Live runs against real agents (Copilot SDK, Copilot CLI) were used to validate the end-to-end behavior described
 in these documents; see [spec-conformance.md](spec-conformance.md).

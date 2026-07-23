@@ -159,7 +159,9 @@ curl -H "Authorization: Bearer $token" -H "Content-Type: text/vnd.graphviz" --da
 Endpoints: `POST /pipelines`, `GET /pipelines/{id}`, `GET /pipelines/{id}/events` (SSE with replay),
 `POST /pipelines/{id}/cancel`, `/resume`, `GET /pipelines/{id}/graph`, `/questions`,
 `POST /pipelines/{id}/questions/{qid}/answer`, `/checkpoint`, `/context`, plus `POST /run`, `GET /status`,
-`POST /answer`. See [docs/http-api.md](docs/http-api.md).
+`POST /answer`. The Studio API (`/studio/api/...`) adds a run history read from disk (including CLI runs), event
+replay, per-stage telemetry across runs, forking a run from any stage, and steering a running agent. See
+[docs/http-api.md](docs/http-api.md).
 
 ## Using the libraries
 

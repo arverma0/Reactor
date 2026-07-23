@@ -57,6 +57,7 @@ internal sealed class FakeCopilotRuntime : ICopilotRuntime
     public Task<ICopilotConversation> CreateConversationAsync(CopilotConversationOptions options, CancellationToken cancellationToken)
     {
         var conversation = new FakeConversation(this, options);
+        OnCreated?.Invoke(conversation);
         lock (Created)
         {
             Created.Add(options);
@@ -65,6 +66,9 @@ internal sealed class FakeCopilotRuntime : ICopilotRuntime
 
         return Task.FromResult<ICopilotConversation>(conversation);
     }
+
+    /// <summary>Configures each conversation as it is created.</summary>
+    public Action<FakeConversation>? OnCreated { get; set; }
 
     public ValueTask DisposeAsync()
     {
@@ -124,6 +128,35 @@ internal sealed class FakeConversation(FakeCopilotRuntime runtime, CopilotConver
         Prompts.Add(prompt);
         return runtime.OnTurn(this, prompt, cancellationToken);
     }
+
+    /// <summary>Steering messages sent to the turn in progress.</summary>
+    public List<string> Steered { get; } = [];
+
+    /// <summary>Completes with the first steering message.</summary>
+    public TaskCompletionSource<string> FirstSteering { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task SteerAsync(string message, CancellationToken cancellationToken)
+    {
+        SteerAttempted.TrySetResult();
+        if (SteerError is { } error)
+        {
+            return Task.FromException(error);
+        }
+
+        lock (Steered)
+        {
+            Steered.Add(message);
+        }
+
+        FirstSteering.TrySetResult(message);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>When set, <see cref="SteerAsync"/> fails with this exception.</summary>
+    public Exception? SteerError { get; set; }
+
+    /// <summary>Completes when <see cref="SteerAsync"/> is first called (even if it fails).</summary>
+    public TaskCompletionSource SteerAttempted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Task AbortAsync()
     {
@@ -514,6 +547,57 @@ public sealed class CopilotSdkBackendTests
         Assert.Equal(StageStatus.Success, result.Status);
         Assert.Contains(Logs(events, "implement"), l => l.Contains("requested models are not verified", StringComparison.Ordinal));
         Assert.Equal("claude-sonnet-4.5", runtime.Created[0].Model);
+    }
+
+    [Fact]
+    public async Task Steering_file_is_sent_to_the_running_turn()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            OnTurn = async (c, _, ct) =>
+            {
+                await File.WriteAllTextAsync(dir.Combine("run", "implement", "steering.md"), "Use the existing helper.\n", ct);
+                var steering = await c.FirstSteering.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+                return "done after: " + steering;
+            },
+        };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions { SteeringPollInterval = TimeSpan.FromMilliseconds(20) }, runtime);
+        var events = new List<PipelineEvent>();
+
+        var result = await Runner(backend).RunAsync(OneStage, Options(dir, events), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Equal(["Use the existing helper."], runtime.Conversations[0].Steered);
+        Assert.Equal("done after: Use the existing helper.", File.ReadAllText(dir.Combine("run", "implement", "response.md")));
+        Assert.False(File.Exists(dir.Combine("run", "implement", "steering.md")));
+        Assert.Equal("Use the existing helper.\n", File.ReadAllText(dir.Combine("run", "implement", "steering.consumed-1.md")));
+        Assert.Contains(Logs(events, "implement"), l => l.StartsWith("steering sent to Copilot: Use the existing helper.", StringComparison.Ordinal));
+        Assert.Contains("\"type\":\"steering\"", File.ReadAllText(dir.Combine("run", "implement", "copilot-events.jsonl")));
+    }
+
+    [Fact]
+    public async Task Steering_that_cannot_be_sent_is_logged_and_the_stage_continues()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            OnTurn = async (c, _, ct) =>
+            {
+                await File.WriteAllTextAsync(dir.Combine("run", "implement", "steering.md"), "Stop and summarize.", ct);
+                await c.SteerAttempted.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+                return "finished";
+            },
+        };
+        runtime.OnCreated = c => c.SteerError = new InvalidOperationException("session is closing");
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions { SteeringPollInterval = TimeSpan.FromMilliseconds(20) }, runtime);
+        var events = new List<PipelineEvent>();
+
+        var result = await Runner(backend).RunAsync(OneStage, Options(dir, events), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Empty(runtime.Conversations[0].Steered);
+        Assert.Contains(Logs(events, "implement"), l => l.Contains("could not send steering: session is closing", StringComparison.Ordinal));
     }
 
     private sealed record ToolHookSnapshot(string? Pre, string? Post, string? NodeId);

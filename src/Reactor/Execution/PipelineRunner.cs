@@ -406,7 +406,7 @@ public sealed class PipelineRunner
             _lastFidelity = fidelity;
             _lastThreadId = threadId;
             _previousNodeId = node.Id;
-            SaveCheckpoint(node.Id, finalStatus: null);
+            SaveCheckpoint(node.Id, finalStatus: null, snapshotIndex: index);
             return outcome;
         }
 
@@ -967,7 +967,11 @@ public sealed class PipelineRunner
             }
         }
 
-        private void SaveCheckpoint(string nodeId, string? finalStatus, bool emitEvent = true)
+        /// <summary>
+        /// Saves <c>checkpoint.json</c>; with <paramref name="snapshotIndex"/> (top-level stages only) and
+        /// <see cref="RunOptions.KeepCheckpointHistory"/>, also keeps a copy under <c>checkpoints/</c>.
+        /// </summary>
+        private void SaveCheckpoint(string nodeId, string? finalStatus, bool emitEvent = true, int? snapshotIndex = null)
         {
             Checkpoint checkpoint;
             lock (_stateLock)
@@ -991,6 +995,19 @@ public sealed class PipelineRunner
 
             var path = Path.Combine(_logsRoot, Checkpoint.FileName);
             checkpoint.Save(path);
+            if (snapshotIndex is { } index && _options.KeepCheckpointHistory && !_graph.ContainsNode(Checkpoint.SnapshotDirectoryName))
+            {
+                try
+                {
+                    checkpoint.Save(Path.Combine(_logsRoot, Checkpoint.SnapshotDirectoryName, Checkpoint.SnapshotName(index, nodeId) + ".json"));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Snapshots only enable forking; the run itself does not depend on them.
+                    Emit(new StageLog(nodeId, $"Could not save the checkpoint snapshot: {ex.Message}", "warn"));
+                }
+            }
+
             if (emitEvent)
             {
                 Emit(new CheckpointSaved(nodeId, path));
