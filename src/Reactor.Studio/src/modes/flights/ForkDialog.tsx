@@ -17,18 +17,27 @@ interface Candidate {
   visit: number;
 }
 
-/** Stage executions a flight can be re-flown from (each needs a snapshot saved before it). */
+/** Stage executions a flight can be re-flown from: top-level stages with a snapshot saved before them. */
 export function forkCandidates(view: FlightView, replay: RunReplay): Candidate[] {
   const visits = new Map<string, number>();
   const out: Candidate[] = [];
   for (const exec of replay.executions) {
     if (exec.attempt !== 1) continue;
-    const visit = (visits.get(exec.node) ?? 0) + 1;
-    visits.set(exec.node, visit);
+    const key = `${exec.segment}:${exec.node}`;
+    const visit = (visits.get(key) ?? 0) + 1;
+    visits.set(key, visit);
+    if (exec.parent !== undefined) continue;
     const checkpoint = checkpointBefore(exec, view.checkpoints);
     if (checkpoint) out.push({ exec, checkpoint, visit });
   }
   return out;
+}
+
+/** The candidate that re-runs `exec`: itself, or for a stage inside a parallel stage, that parallel stage. */
+function candidateFor(candidates: Candidate[], exec: StageExecution): number {
+  return candidates.findIndex((c) =>
+    exec.parent === undefined ? c.exec === exec : c.exec.segment === exec.segment && c.exec.index === exec.parentIndex && c.exec.node === exec.parent,
+  );
 }
 
 function parseContext(text: string): { value?: Record<string, unknown>; error?: string } {
@@ -60,7 +69,7 @@ export function ForkDialog({ view, replay, doc, initial, onClose }: { view: Flig
   const designBroken = useStudio((s) => !!s.analysis.parseError || s.analysis.diagnostics.some((d) => d.severity === "error"));
   const candidates = useMemo(() => forkCandidates(view, replay), [view, replay]);
   const [choice, setChoice] = useState(() => {
-    const initialIndex = initial ? candidates.findIndex((c) => c.exec === initial) : -1;
+    const initialIndex = initial ? candidateFor(candidates, initial) : -1;
     if (initialIndex >= 0) return initialIndex;
     // The last failure is usually the one that decided the flight.
     const failed = candidates.findLastIndex((c) => c.exec.status === "fail" || !!c.exec.error);
@@ -145,6 +154,12 @@ export function ForkDialog({ view, replay, doc, initial, onClose }: { view: Flig
           {picked ? (
             <p className="rs-fork__explain">
               Restores the state saved after <b>{label(restoredNode)}</b> <span className="mono faint">({picked.checkpoint})</span> and flies on from there: <b>{label(picked.exec.node)}</b> runs next.
+              {initial?.parent !== undefined && choice === candidateFor(candidates, initial) ? (
+                <>
+                  {" "}
+                  <b>{label(initial.node)}</b> ran inside it, so the whole parallel stage runs again.
+                </>
+              ) : null}
             </p>
           ) : null}
           <Field label="Pipeline">

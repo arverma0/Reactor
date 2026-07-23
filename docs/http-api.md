@@ -381,7 +381,8 @@ start → design (studio.architect) → check (studio.check) → exit
 - `check` parses and validates the proposal with the server's rules (errors fail it; warnings are reported), then flies
   it in the wind tunnel: with every stage succeeding, 100% of 60 simulated flights must land; a realistic pass (400
   flights; agents succeed 90%, tools 75%) gives the forecast and warns when more than 5% of flights loop until the step
-  limit. Findings fail the stage and go back to `design`; after the third failing draft the run fails.
+  limit. Findings fail the stage and go back to `design`; after the third failing draft the run fails. A `design`
+  stage that fails (the backend's error) ends the run with that error; nothing is checked.
 
 Architect runs are ordinary runs (listed by `/pipelines`, streamed, cancellable, with stage files and cost) whose
 working directory is a scratch directory under `.reactor/studio/architect/`. The server needs a real backend: a server

@@ -12,11 +12,13 @@ import { api } from "../../api/client";
 import { setMode, toast, useStudio } from "../../state/store";
 import { refreshRuns, rememberRunSource, selectRun } from "../flights/store";
 import { digest, overlayAt } from "../flights/replay";
-import { OUTCOME_KINDS, PRESETS, buildScenario, gateChoices, predictedCost, routeLabels, type Behavior, type Calibration, type Preset, type SimReport } from "./scenario";
+import { MAX_DURATION_MS, OUTCOME_KINDS, PRESETS, buildScenario, gateChoices, predictedCost, routeLabels, withoutDurations, type Behavior, type Calibration, type Preset, type SimReport } from "./scenario";
 import { applyCalibration, closeTrace, focusTunnelNode, loadSettingsForDoc, playTrace, runTunnel, setTraceCursor, toggleTracePlaying, updateSettings, useTunnel } from "./store";
 import { loadTelemetry, useTelemetry } from "../../state/telemetry";
 
 const pct = (n: number, digits = 0) => `${(n * 100).toFixed(digits)}%`;
+
+const NO_FEATURES: string[] = [];
 
 function reportOverlay(doc: StudioDoc, report: SimReport): CanvasOverlay {
   const nodes: Record<string, NodeOverlay> = {};
@@ -54,7 +56,7 @@ function reportOverlay(doc: StudioDoc, report: SimReport): CanvasOverlay {
 
 export function TunnelMode() {
   const doc = useStudio((s) => s.doc);
-  const features = useStudio((s) => s.info?.features ?? []);
+  const features = useStudio((s) => s.info?.features) ?? NO_FEATURES;
   const report = useTunnel((s) => s.report);
   const reportDot = useTunnel((s) => s.reportDot);
   const trace = useTunnel((s) => s.trace);
@@ -125,7 +127,7 @@ async function startWalkthrough(doc: StudioDoc) {
   const settings = useTunnel.getState().settings;
   try {
     const dot = writeDot(doc);
-    const started = await api.startRun({ dot, studio: { source_path: useStudio.getState().file.path, layout: doc.layout }, simulation: { mode: "interactive", scenario: buildScenario(doc, settings) } });
+    const started = await api.startRun({ dot, studio: { source_path: useStudio.getState().file.path, layout: doc.layout }, simulation: { mode: "interactive", scenario: withoutDurations(buildScenario(doc, settings)) } });
     rememberRunSource(started.id, { dot, layout: doc.layout });
     setMode("flights");
     await refreshRuns();
@@ -346,7 +348,7 @@ function StageBehavior({ doc, node, open }: { doc: StudioDoc; node: DocNode; ope
                 placeholder="seconds"
                 onChange={(e) => {
                   const seconds = Number(e.target.value);
-                  set({ ...(override ?? {}), duration_ms: e.target.value.trim() && Number.isFinite(seconds) ? Math.round(seconds * 1000) : undefined });
+                  set({ ...(override ?? {}), duration_ms: e.target.value.trim() && Number.isFinite(seconds) ? Math.max(0, Math.min(MAX_DURATION_MS, Math.round(seconds * 1000))) : undefined });
                 }}
                 onKeyDown={(e) => e.stopPropagation()}
               />

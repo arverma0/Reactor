@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api } from "../../api/client";
+import { api, type ApiError } from "../../api/client";
 import { diffDocs, type DocDiff } from "../../model/diff";
 import { writeDot } from "../../model/dot";
 import type { StudioDoc } from "../../model/types";
@@ -161,7 +161,17 @@ function poll(id: string) {
     let state: ArchitectState;
     try {
       state = await api.get<ArchitectState>(`/studio/api/architect/${encodeURIComponent(id)}`);
-    } catch {
+    } catch (error) {
+      if ((error as ApiError).status === 404) {
+        // The server no longer knows the run (it restarted): stop, keeping whatever the last poll showed.
+        const lost: ArchitectState = {
+          ...(job.state ?? { id, current_node: null, mode: job.mode, attempt: 0, max_drafts: 3, rationale: null, proposal: null, feedback: null }),
+          status: "error",
+          error: "The server no longer knows this Architect run (it was restarted). Start it again.",
+        };
+        set({ job: { ...job, state: lost } });
+        return;
+      }
       poll(id);
       return;
     }

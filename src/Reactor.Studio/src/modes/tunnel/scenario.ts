@@ -65,6 +65,27 @@ function pick(p: { agentSuccess: number; agentRetry: number; toolSuccess: number
 
 const round = (n: number) => Math.round(n * 1000) / 1000;
 
+/** Largest `duration_ms` the server accepts (one hour). */
+export const MAX_DURATION_MS = 3_600_000;
+
+/** Handler types that always run for real in a simulation (scenario entries for them have no effect). */
+const REAL_HANDLERS = new Set(["start", "exit", "conditional", "parallel", "parallel.fan_in"]);
+
+/** The scenario without stage durations, for managed simulated runs, which wait durations out in real time. */
+export function withoutDurations(scenario: Scenario): Scenario {
+  const strip = (behaviors: Record<string, Behavior> | undefined) => {
+    if (!behaviors) return behaviors;
+    const out: Record<string, Behavior> = {};
+    for (const [key, behavior] of Object.entries(behaviors)) {
+      const copy = { ...behavior };
+      delete copy.duration_ms;
+      if (Object.keys(copy).length > 0) out[key] = copy;
+    }
+    return out;
+  };
+  return { ...scenario, defaults: strip(scenario.defaults), nodes: strip(scenario.nodes) };
+}
+
 /** Labels a stage can report as its preferred route (label-only edges out of an agent stage). */
 export function routeLabels(doc: StudioDoc, node: DocNode): string[] {
   const handler = handlerOf(doc, node);
@@ -118,9 +139,10 @@ export function calibrate(doc: StudioDoc, t: Telemetry, base: TunnelSettings): T
     if (!stats || stats.visits === 0) continue;
     const handler = handlerOf(doc, node);
     if (stats.cost?.ai_units !== undefined) costPerVisit[node.id] = stats.cost.ai_units;
+    if (REAL_HANDLERS.has(handler)) continue;
     const behavior: Behavior = {};
     const done = Object.values(stats.outcomes).reduce((a, b) => a + b, 0);
-    if (done > 0 && handler !== "wait.human" && handler !== "start" && handler !== "exit") {
+    if (done > 0 && handler !== "wait.human") {
       const attempts = done + stats.retries;
       const retry = attempts > 0 ? stats.retries / attempts : 0;
       const outcomes: Record<string, number> = {};
@@ -154,7 +176,8 @@ export function calibrate(doc: StudioDoc, t: Telemetry, base: TunnelSettings): T
         if (Object.values(weights).some((c) => c > 0)) behavior.labels = normalize(weights);
       }
     }
-    if (stats.duration_ms) behavior.duration_ms = Math.round(stats.duration_ms.p50);
+    // Typical time (a person's, at a gate), capped at what the simulator accepts.
+    if (stats.duration_ms) behavior.duration_ms = Math.min(MAX_DURATION_MS, Math.round(stats.duration_ms.p50));
     if (Object.keys(behavior).length > 0) nodes[node.id] = behavior;
   }
   const finished = Object.values(t.outcomes).reduce((a, b) => a + b, 0);

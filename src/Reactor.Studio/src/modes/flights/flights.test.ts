@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { HistorySummary, PipelineEventJson, RunSummary, Telemetry } from "../../api/types";
 import { describeDiff, diffDocs } from "../../model/diff";
 import { emptyDoc, type StudioDoc } from "../../model/types";
-import { calibrate, defaultSettings, predictedCost, type SimReport } from "../tunnel/scenario";
+import { MAX_DURATION_MS, buildScenario, calibrate, defaultSettings, predictedCost, withoutDurations, type SimReport } from "../tunnel/scenario";
 import { checkpointBefore, checkpointNode, digest } from "./replay";
 import { mergeFlights } from "./view";
 
@@ -77,6 +77,56 @@ describe("fork checkpoints", () => {
       { type: "StageStarted", timestamp: at(1), node_id: "review", index: 7, attempt: 1 },
     ]);
     expect(checkpointBefore(replay.executions[0], ["0003-fanout", "0006-join"])).toBe("0006-join");
+  });
+
+  it("re-flies a parallel branch stage from before its parallel stage, whose snapshot is saved after every branch", () => {
+    // plan → fanout → {sec, perf} → join → review; the fan-out takes index 3 before its branches take 4 and 5.
+    const replay = digest([
+      { type: "PipelineStarted", timestamp: at(0) },
+      { type: "StageStarted", timestamp: at(1), node_id: "start", index: 1, attempt: 1 },
+      { type: "StageCompleted", timestamp: at(1), node_id: "start", status: "success" },
+      { type: "StageStarted", timestamp: at(2), node_id: "plan", index: 2, attempt: 1 },
+      { type: "StageCompleted", timestamp: at(3), node_id: "plan", status: "success" },
+      { type: "StageStarted", timestamp: at(4), node_id: "fanout", index: 3, attempt: 1 },
+      { type: "StageStarted", timestamp: at(5), node_id: "sec", index: 4, attempt: 1 },
+      { type: "StageStarted", timestamp: at(5), node_id: "perf", index: 5, attempt: 1 },
+      { type: "StageCompleted", timestamp: at(7), node_id: "sec", status: "success" },
+      { type: "StageCompleted", timestamp: at(8), node_id: "perf", status: "fail" },
+      { type: "StageCompleted", timestamp: at(9), node_id: "fanout", status: "partial_success" },
+      { type: "StageStarted", timestamp: at(10), node_id: "join", index: 6, attempt: 1 },
+      { type: "StageCompleted", timestamp: at(11), node_id: "join", status: "success" },
+      { type: "StageStarted", timestamp: at(12), node_id: "review", index: 7, attempt: 1 },
+    ]);
+    const checkpoints = ["0001-start", "0002-plan", "0003-fanout", "0006-join"];
+    const by = (node: string) => replay.executions.find((x) => x.node === node)!;
+    expect(replay.executions.map((x) => [x.node, x.parent ?? null, x.parentIndex ?? null])).toEqual([
+      ["start", null, null],
+      ["plan", null, null],
+      ["fanout", null, null],
+      ["sec", "fanout", 3],
+      ["perf", "fanout", 3],
+      ["join", null, null],
+      ["review", null, null],
+    ]);
+    // Branch stages restore the state before the fan-out (which then runs every branch again), not 0003-fanout:
+    // that snapshot already has the branches' results, and resuming it jumps straight to the join.
+    expect(checkpointBefore(by("sec"), checkpoints)).toBe("0002-plan");
+    expect(checkpointBefore(by("perf"), checkpoints)).toBe("0002-plan");
+    expect(checkpointBefore(by("fanout"), checkpoints)).toBe("0002-plan");
+    expect(checkpointBefore(by("join"), checkpoints)).toBe("0003-fanout");
+    expect(checkpointBefore(by("review"), checkpoints)).toBe("0006-join");
+  });
+
+  it("does not nest stages under one a stopped run left open when the run resumes", () => {
+    const replay = digest([
+      { type: "PipelineStarted", timestamp: at(0) },
+      { type: "StageStarted", timestamp: at(1), node_id: "implement", index: 2, attempt: 1 },
+      { type: "PipelineStarted", timestamp: at(30) },
+      { type: "StageStarted", timestamp: at(31), node_id: "implement", index: 2, attempt: 1 },
+      { type: "StageCompleted", timestamp: at(35), node_id: "implement", status: "success" },
+      { type: "StageStarted", timestamp: at(36), node_id: "test", index: 3, attempt: 1 },
+    ]);
+    expect(replay.executions.map((x) => x.parent ?? null)).toEqual([null, null, null]);
   });
 });
 
@@ -179,5 +229,24 @@ describe("wind tunnel calibration", () => {
     const settings = calibrate(doc(), telemetry, defaultSettings());
     const report = { runs: 100, nodes: { plan: { visits: 120 }, fix: { visits: 250 } } } as unknown as SimReport;
     expect(predictedCost(report, settings.calibration!)).toEqual({ mean: 1.2 * 2 + 2.5 * 4, covered: 2 });
+  });
+
+  it("caps durations at the simulator's hour, skips stages that always run for real, and strips durations for live runs", () => {
+    const withRouter: StudioDoc = { ...doc(), nodes: [...doc().nodes, { id: "route", attrs: { shape: "diamond" }, group: null }] };
+    const record: Telemetry = {
+      ...telemetry,
+      nodes: {
+        ...telemetry.nodes,
+        gate: { ...telemetry.nodes.gate, duration_ms: { mean: 9_000_000, p50: 7_200_000, p95: 20_000_000 } },
+        route: { runs: 10, visits: 10, mean_visits: 1, outcomes: { success: 10 }, retries: 0, duration_ms: { mean: 2, p50: 2, p95: 3 } },
+      },
+    };
+    const settings = calibrate(withRouter, record, defaultSettings());
+    expect(settings.nodes.gate.duration_ms).toBe(MAX_DURATION_MS);
+    expect(settings.nodes.route).toBeUndefined();
+    const scenario = withoutDurations(buildScenario(withRouter, settings));
+    expect(Object.values(scenario.nodes ?? {}).some((b) => b.duration_ms !== undefined)).toBe(false);
+    expect(scenario.nodes?.gate.choices).toEqual({ "[S] Ship": 0.8, "[R] Replan": 0.2 });
+    expect(scenario.nodes?.plan).toEqual({ outcomes: { success: 0.8, retry: 0.2 } });
   });
 });

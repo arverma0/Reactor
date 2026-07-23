@@ -8,6 +8,13 @@ export interface StageExecution {
   index: number;
   /** Loop-restart segment (0 = the run's own directory, n = `<run>-restart-n`). */
   segment: number;
+  /**
+   * The top-level stage this one ran inside (a parallel node, for its branch stages); undefined for top-level stages.
+   * Only top-level stages get checkpoint snapshots.
+   */
+  parent?: string;
+  /** Execution index of {@link parent}. */
+  parentIndex?: number;
   start: number;
   end?: number;
   status?: string;
@@ -91,6 +98,8 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         if (replay.startedAt === null) replay.startedAt = at;
         replay.endedAt = null;
         replay.outcome = "running";
+        // A resume: stages the stopped run left open never completed, and nothing runs inside them now.
+        open.clear();
         break;
       case "PipelineCompleted":
         replay.endedAt = at;
@@ -102,7 +111,19 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         replay.failureReason = e.error;
         break;
       case "StageStarted": {
-        const exec: StageExecution = { node: e.node_id!, attempt: e.attempt ?? 1, index: e.index ?? 0, segment: replay.restarts, start: at };
+        // Top-level stages run one at a time, so a stage that starts while another is open runs inside it (a branch
+        // of a parallel node); the earliest open stage is the top-level one.
+        let parent: StageExecution | undefined;
+        for (const candidate of open.values()) if (candidate.node !== e.node_id && (!parent || candidate.start < parent.start)) parent = candidate;
+        const exec: StageExecution = {
+          node: e.node_id!,
+          attempt: e.attempt ?? 1,
+          index: e.index ?? 0,
+          segment: replay.restarts,
+          parent: parent ? (parent.parent ?? parent.node) : undefined,
+          parentIndex: parent ? (parent.parentIndex ?? parent.index) : undefined,
+          start: at,
+        };
         open.set(exec.node, exec);
         replay.executions.push(exec);
         break;
@@ -203,9 +224,10 @@ export function overlayAt(replay: RunReplay, options: OverlayOptions): CanvasOve
     const finished = last.end !== undefined && last.end <= t;
     const visits = execs.filter((x) => x.attempt === 1).length;
     const state: NodeState = finished ? STATUS_STATE[last.status ?? "success"] ?? "success" : replay.endedAt !== null && replay.endedAt <= t ? "fail" : "running";
-    const total = execs.reduce((sum, x) => sum + ((x.end !== undefined && x.end <= t ? x.end : Math.min(t, options.now)) - x.start), 0);
+    const total = execs.reduce((sum, x) => sum + ((x.end !== undefined && x.end <= t ? x.end : Math.min(t, options.now, replay.endedAt ?? Number.POSITIVE_INFINITY)) - x.start), 0);
     const readouts: NonNullable<NodeOverlay["readouts"]> = [];
-    if (state !== "running") readouts.push({ label: visits > 1 ? "total" : "time", value: formatDuration(total) });
+    // A stage the run stopped in (killed or cancelled) never completed: its time is unknown.
+    if (state !== "running") readouts.push(finished ? { label: visits > 1 ? "total" : "time", value: formatDuration(total) } : { label: "run", value: "stopped here", tone: "fail" });
     if (last.attempt > 1) readouts.push({ label: "attempt", value: String(last.attempt), tone: "warn" });
     for (const r of options.readouts?.[node] ?? []) readouts.push(r);
     const lines = replay.logs
@@ -261,10 +283,13 @@ export function timelineRows(replay: RunReplay): { node: string; executions: Sta
 
 /**
  * The stage snapshot to fork from to re-run `exec`: the latest snapshot of the same run segment saved before it started
- * (snapshots are named `<execution index>-<node>`, prefixed `restart-N/` in loop-restart directories). Null when the
- * execution is the first of its segment (there is nothing to restore; start a new run instead).
+ * (snapshots are named `<execution index>-<node>`, prefixed `restart-N/` in loop-restart directories, and are saved
+ * after top-level stages only). A stage that ran inside a parallel stage maps to the snapshot before that parallel
+ * stage — its own snapshot is saved after every branch finished — so the whole parallel stage runs again. Null when
+ * there is nothing before it in its segment (start a new run instead).
  */
 export function checkpointBefore(exec: StageExecution, checkpoints: string[]): string | null {
+  const before = exec.parentIndex ?? exec.index;
   const prefix = exec.segment === 0 ? "" : `restart-${exec.segment}/`;
   let best: { name: string; index: number } | null = null;
   for (const name of checkpoints) {
@@ -272,7 +297,7 @@ export function checkpointBefore(exec: StageExecution, checkpoints: string[]): s
     const match = /^(\d+)-(.+)$/.exec(name.slice(prefix.length));
     if (!match) continue;
     const index = Number(match[1]);
-    if (index < exec.index && (!best || index > best.index)) best = { name, index };
+    if (index < before && (!best || index > best.index)) best = { name, index };
   }
   return best?.name ?? null;
 }

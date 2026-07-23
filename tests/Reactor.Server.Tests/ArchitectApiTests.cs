@@ -118,6 +118,22 @@ public sealed class ArchitectApiTests
     }
 
     [Fact]
+    public async Task A_backend_failure_ends_the_run_with_the_backends_reason_without_checking()
+    {
+        var backend = new ControllableBackend { Respond = _ => CodergenResult.FromOutcome(Outcome.Fail("429: rate limited by the provider")) };
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend });
+
+        var id = await StartAsync(server, new { mode = "draft", brief = "Anything" });
+        var state = await WaitForArchitectAsync(server, id);
+
+        Assert.True(state["status"]!.GetValue<string>() == "fail", state.ToJsonString());
+        Assert.Equal(1, backend.Calls);
+        Assert.Equal(0, state["attempt"]!.GetValue<int>());
+        Assert.Null(state["proposal"]);
+        Assert.Contains("429: rate limited by the provider", state["error"]!.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task The_wind_tunnel_rejects_a_draft_whose_flights_cannot_land_and_the_architect_gives_up_after_three_drafts()
     {
         var backend = new ControllableBackend { Respond = _ => Answer(DeadEnd) };

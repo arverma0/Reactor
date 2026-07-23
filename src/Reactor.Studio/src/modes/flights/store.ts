@@ -78,16 +78,30 @@ const historySupported = () => useStudio.getState().info?.features.includes("his
 
 let lastLive: RunSummary[] = [];
 let lastHistory: HistorySummary[] = [];
+/** Run directory of each live run, remembered so a run the server forgets (a restart) stays selected as its directory. */
+const liveDirs = new Map<string, string>();
 
 export async function refreshRuns() {
   const [live, history] = await Promise.all([api.runs().catch(() => null), historySupported() ? api.history().catch(() => null) : Promise.resolve(null)]);
   if (live) lastLive = live;
   if (history) lastHistory = history;
   if (!live && !history) return;
-  set({ flights: mergeFlights(lastLive, lastHistory), loaded: true });
+  const flights = mergeFlights(lastLive, lastHistory);
+  for (const f of flights) if (f.liveId && f.dir) liveDirs.set(f.liveId, f.dir);
+  set({ flights, loaded: true });
+  const selected = get().selected;
+  if (live && selected && !selected.startsWith("dir:") && !flights.some((f) => f.key === selected)) {
+    // The server no longer knows the selected run: show it from its directory, or let it go if it had none.
+    const dir = liveDirs.get(selected);
+    if (dir && flights.some((f) => f.key === `dir:${dir}`)) moveSelection(selected, `dir:${dir}`);
+    else if (history || !historySupported()) selectRun(null);
+    return;
+  }
   // A run selected right after it started gains its directory once the history lists it.
   const flight = currentFlight();
   if (flight?.dir && !get().history[flight.dir]) void loadHistory(flight.dir);
+  // Reconnect a live run whose event stream gave up (the server was unreachable for a while).
+  if (flight?.liveId && !streams.has(flight.key) && (flight.status === "running" || flight.status === "queued")) openStream(flight.key, flight.liveId);
 }
 
 export function flightByKey(key: string | null | undefined): Flight | undefined {
@@ -174,21 +188,34 @@ function openStream(key: string, liveId: string) {
       void refreshRuns();
     },
     onError: () => {
-      // The server forgot the run (restart): fall back to its directory on disk.
+      // The server forgot the run (a restart) or the stream gave up: refreshRuns moves the selection to the run's
+      // directory, or reconnects while the server still runs it.
       streams.delete(key);
-      const { dir } = flightIds(key);
-      if (dir) void tailHistoryEvents(key, dir, true);
+      void refreshRuns();
     },
   });
   streams.set(key, close);
 }
 
 const tails = new Map<string, ReturnType<typeof setTimeout>>();
+/** Keys whose events were read to the end of a finished run. */
+const complete = new Set<string>();
+/** Per key, the generation of the latest tail; older loops still awaiting a page stop instead of appending it again. */
+const generations = new Map<string, number>();
+
+const lastSeq = (events: PipelineEventJson[] | undefined) => (events ?? []).reduce((max, e) => Math.max(max, e.seq ?? 0), 0);
 
 /** Reads a run's events.jsonl page by page; keeps tailing while the run is still being written (e.g. `reactor run`). */
 async function tailHistoryEvents(key: string, dir: string, reset = false) {
-  if (reset) set({ events: { ...get().events, [key]: [] } });
-  let since = Math.max(0, ...(get().events[key] ?? []).map((e) => e.seq ?? 0));
+  const generation = (generations.get(key) ?? 0) + 1;
+  generations.set(key, generation);
+  clearTimeout(tails.get(key));
+  if (reset || !get().events[key]) {
+    complete.delete(key);
+    set({ events: { ...get().events, [key]: [] } });
+  }
+  const current = () => generations.get(key) === generation && get().selected === key;
+  let since = lastSeq(get().events[key]);
   for (let page = 0; page < 40; page++) {
     let result;
     try {
@@ -196,20 +223,20 @@ async function tailHistoryEvents(key: string, dir: string, reset = false) {
     } catch {
       return;
     }
-    if (get().selected !== key) return;
+    if (!current()) return;
     if (result.events.length > 0) set({ events: { ...get().events, [key]: [...(get().events[key] ?? []), ...result.events] } });
     since = result.next;
     if (result.done) {
+      complete.add(key);
       void loadHistory(dir);
       return;
     }
     if (result.events.length === 0) break;
   }
-  clearTimeout(tails.get(key));
   tails.set(
     key,
     setTimeout(() => {
-      if (get().selected === key) {
+      if (current()) {
         void loadHistory(dir);
         void tailHistoryEvents(key, dir);
       }
@@ -265,14 +292,22 @@ export function selectRun(key: string | null) {
   if (liveId) {
     openStream(key, liveId);
     void loadLive(liveId);
-  } else if (dir && !(get().events[key]?.length && isFinished(flightByKey(key)?.status))) {
-    void tailHistoryEvents(key, dir, true);
+  } else if (dir && !complete.has(key)) {
+    // Continues where an earlier visit to this flight stopped reading.
+    void tailHistoryEvents(key, dir);
   }
   if (dir) void loadHistory(dir);
   void loadDoc(key);
 }
 
-const isFinished = (status?: string) => !!status && status !== "running" && status !== "queued";
+/** Moves the selection to another key for the same flight (its live id → its run directory), keeping its graph. */
+function moveSelection(from: string, to: string) {
+  const { docs, stage } = get();
+  const doc = docs[from];
+  if (doc && typeof doc === "object" && !docs[to]) set({ docs: { ...docs, [to]: doc } });
+  selectRun(to);
+  set({ stage });
+}
 
 export const selectStage = (stage: string | null) => set({ stage });
 export const scrubTo = (at: number | null) => set({ at, playing: at === null ? false : get().playing });

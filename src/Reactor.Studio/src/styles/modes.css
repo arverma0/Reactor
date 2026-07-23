@@ -1236,7 +1236,7 @@
 .rs-tracebar {
   position: absolute;
   left: 50%;
-  bottom: 16px;
+  bottom: 64px;
   transform: translateX(-50%);
   z-index: 6;
   display: flex;

@@ -16,7 +16,9 @@ digraph architect {
     ]
     check [label="Check in the wind tunnel", type="studio.check"]
 
-    start -> design -> check
+    start -> design
+    // A design stage that fails (the backend's error) ends the run with its reason; only answers are checked.
+    design -> check [condition="outcome=success"]
     check -> exit   [condition="outcome=success"]
     check -> design [condition="outcome=fail && context.architect.give_up!=true", label="Repair"]
 }

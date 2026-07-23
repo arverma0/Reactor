@@ -241,8 +241,8 @@ function StagePanel({
   const node = doc ? findNode(doc, stage) : undefined;
   const features = useStudio((s) => s.info?.features) ?? NO_FEATURES;
   const recorded = view.stages.find((s) => s.node === stage);
-  const visits = recorded ? recorded.history_visits + 1 : 1;
-  const [visit, setVisit] = useState<number | null>(null);
+  /** The visit whose files are shown; null = the latest. Visits count from 1 in each run directory (loop restarts start a new one). */
+  const [shown, setShown] = useState<{ segment: number; visit: number } | null>(null);
   const [files, setFiles] = useState<string[] | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [content, setContent] = useState<string | null>(null);
@@ -252,10 +252,18 @@ function StagePanel({
   const running = execs.some((x) => x.end === undefined) && replay.endedAt === null;
   const logs = replay.logs.filter((l) => l.node === stage).slice(-80);
   const artifacts = replay.artifacts.filter((a) => a.node === stage);
+  const lastSegment = execs.reduce((m, x) => Math.max(m, x.segment), 0);
+  const visitsIn = (segment: number) => execs.filter((x) => x.attempt === 1 && x.segment === segment).length;
+  const latestVisit = Math.max(1, visitsIn(lastSegment));
+  const target = shown ?? { segment: lastSegment, visit: latestVisit };
+  const older = target.segment !== lastSegment || target.visit < latestVisit;
+  const segmentDir = (segment: number) => (!view.dir ? null : segment === 0 ? view.dir : `${view.dir}-restart-${segment}`);
+  const directory = target.segment === lastSegment ? (recorded?.segment ?? segmentDir(lastSegment)) : segmentDir(target.segment);
+  // The latest visit of a directory is the stage directory itself; earlier ones are history/visit-N.
+  const visitParam = target.visit < visitsIn(target.segment) ? target.visit : undefined;
+  const canPickVisit = !!recorded && !!view.dir && execs.filter((x) => x.attempt === 1).length > 1;
   // While the run is live the server's stage listing is freshest; afterwards the run directory has every visit.
   const fromLive = !!view.liveId && (view.active || !recorded);
-  const older = visit !== null && visit < visits;
-  const segment = recorded?.segment ?? view.dir;
 
   useEffect(() => {
     let cancelled = false;
@@ -272,34 +280,34 @@ function StagePanel({
           } else setBackend(null);
         })
         .catch(() => !cancelled && setFiles([]));
-    } else if (recorded && segment) {
+    } else if (recorded && directory) {
       const names = sortFiles(recorded.files);
       setFiles(names);
       setOpen((current) => (current && names.includes(current) ? current : (names.find((f) => f === "response.md") ?? names.find((f) => f === "stdout.txt") ?? names[0] ?? null)));
       if (!older) setBackend(recorded.backend ?? null);
       else
         api
-          .historyFile(segment, stage, "backend.json", visit!)
+          .historyFile(directory, stage, "backend.json", visitParam)
           .then((b) => !cancelled && setBackend(typeof b === "string" ? JSON.parse(b) : (b as Record<string, unknown>)))
           .catch(() => !cancelled && setBackend(null));
     } else setFiles([]);
     return () => {
       cancelled = true;
     };
-  }, [view.liveId, stage, execs.length, running, fromLive, older, visit, recorded, segment]);
+  }, [view.liveId, stage, execs.length, running, fromLive, older, visitParam, recorded, directory]);
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setContent(null);
-    const read = fromLive && !older ? api.stageFile(view.liveId!, stage, open) : segment ? api.historyFile(segment, stage, open, older ? visit! : undefined) : Promise.reject(new Error("not available"));
+    const read = fromLive && !older ? api.stageFile(view.liveId!, stage, open) : directory ? api.historyFile(directory, stage, open, visitParam) : Promise.reject(new Error("not available"));
     read
       .then((c) => !cancelled && setContent(typeof c === "string" ? c : JSON.stringify(c, null, 2)))
       .catch((e) => !cancelled && setContent(`(${(e as Error).message === "Not found." ? "not recorded for this visit" : (e as Error).message})`));
     return () => {
       cancelled = true;
     };
-  }, [view.liveId, stage, open, fromLive, older, visit, segment, execs.length]);
+  }, [view.liveId, stage, open, fromLive, older, visitParam, directory, execs.length]);
 
   const num = (key: string) => (typeof backend?.[key] === "number" ? (backend[key] as number) : undefined);
   const costs = [
@@ -312,7 +320,9 @@ function StagePanel({
     num("tool_calls") !== undefined ? { label: "tools", value: String(num("tool_calls")) } : null,
   ].filter(Boolean) as { label: string; value: string }[];
 
-  let visitNumber = 0;
+  const visitNumbers = new Map<number, number>();
+  let currentVisit = 0;
+  const segmentVisits = [...new Set(execs.map((x) => x.segment))].sort((a, b) => a - b).map((s) => [s, visitsIn(s)] as const);
   return (
     <div className="rs-stagepanel">
       <header className="rs-stagepanel__head">
@@ -338,23 +348,38 @@ function StagePanel({
       <div className="rs-stagepanel__execs">
         {execs.length === 0 ? <span className="faint">Not reached in this run.</span> : null}
         {execs.map((x, i) => {
-          if (x.attempt === 1) visitNumber++;
-          const thisVisit = visitNumber;
+          if (x.attempt === 1) {
+            currentVisit = (visitNumbers.get(x.segment) ?? 0) + 1;
+            visitNumbers.set(x.segment, currentVisit);
+          }
+          const thisVisit = currentVisit;
           const checkpoint = onFork && x.attempt === 1 ? checkpointBefore(x, view.checkpoints) : null;
-          const selectable = !!recorded && x.segment === replay.restarts && visits > 1;
-          const isShown = selectable && (visit ?? visits) === thisVisit;
+          const isShown = canPickVisit && target.segment === x.segment && target.visit === thisVisit;
+          const status = x.status ?? (x.end === undefined ? (replay.endedAt === null ? "running" : "interrupted") : "");
           return (
-            <div key={i} className={cx("rs-exec", isShown && "is-shown", selectable && "is-selectable")} onClick={() => selectable && setVisit(thisVisit === visits ? null : thisVisit)}>
+            <div
+              key={i}
+              className={cx("rs-exec", isShown && "is-shown", canPickVisit && "is-selectable")}
+              onClick={() => canPickVisit && setShown(x.segment === lastSegment && thisVisit === latestVisit ? null : { segment: x.segment, visit: thisVisit })}
+            >
               <span className={cx("rs-led", `is-${x.end === undefined ? (replay.endedAt === null ? "running" : "fail") : (x.status ?? "success")}`)} />
               <span className="mono">#{x.index}</span>
               <span>{x.attempt > 1 ? `attempt ${x.attempt}` : `visit ${thisVisit}`}</span>
-              <span className="faint">{x.status ?? (x.end === undefined ? (replay.endedAt === null ? "running" : "interrupted") : "")}</span>
+              <span className="faint">
+                {status}
+                {x.segment > 0 ? ` · after restart ${x.segment}` : ""}
+                {x.parent ? ` · in ${x.parent}` : ""}
+              </span>
               <span className="num rs-exec__dur">{formatDuration((x.end ?? replay.endedAt ?? Date.now()) - x.start)}</span>
               {checkpoint ? (
                 <button
                   type="button"
                   className="rs-exec__fork"
-                  title={`Re-fly from just before this visit (restores ${checkpoint})`}
+                  title={
+                    x.parent
+                      ? `Re-fly from just before ${x.parent}, the parallel stage this ran in (restores ${checkpoint})`
+                      : `Re-fly from just before this visit (restores ${checkpoint})`
+                  }
                   onClick={(e) => {
                     e.stopPropagation();
                     onFork?.(x);
@@ -409,14 +434,22 @@ function StagePanel({
           ))}
         </div>
       ) : null}
-      {visits > 1 ? (
+      {canPickVisit ? (
         <div className="rs-visits">
           <span className="label">visit</span>
-          {Array.from({ length: visits }, (_, i) => i + 1).map((v) => (
-            <button key={v} type="button" className={cx("rs-visits__btn num", (visit ?? visits) === v && "is-on")} onClick={() => setVisit(v === visits ? null : v)}>
-              {v}
-            </button>
-          ))}
+          {segmentVisits.flatMap(([segment, count]) =>
+            Array.from({ length: count }, (_, i) => i + 1).map((v) => (
+              <button
+                key={`${segment}:${v}`}
+                type="button"
+                className={cx("rs-visits__btn num", target.segment === segment && target.visit === v && "is-on")}
+                title={segment > 0 ? `Visit ${v} after loop restart ${segment}` : `Visit ${v}`}
+                onClick={() => setShown(segment === lastSegment && v === latestVisit ? null : { segment, visit: v })}
+              >
+                {segment > 0 ? `${segment}·${v}` : v}
+              </button>
+            )),
+          )}
           <span className="faint">{older ? "earlier visit" : "latest"}</span>
         </div>
       ) : null}
