@@ -471,6 +471,7 @@ internal static class SampleRunner
         var path = new List<string>();
         var steps = 0;
         var depth = 0;
+        string? section = null;
         string? position = null;
 
         NodeTally Tally(string id)
@@ -552,14 +553,24 @@ internal static class SampleRunner
                     var outcomes = Tally(completed.NodeId).Outcomes;
                     outcomes[completed.Status] = outcomes.GetValueOrDefault(completed.Status) + 1;
                     break;
-                case ParallelStarted:
-                    depth++;
-                    break;
-                case ParallelCompleted parallel:
-                    depth = Math.Max(0, depth - 1);
-                    if (depth == 0 && sample.TryTakeParallel(parallel.NodeId, out var record))
+                case ParallelStarted parallelStarted:
+                    if (depth++ == 0)
                     {
-                        Expand(record);
+                        section = parallelStarted.NodeId;
+                    }
+
+                    break;
+                case ParallelCompleted parallel when depth > 0:
+                    // A nested parallel cancelled mid-way never reports completion, so the outermost section ends when its own
+                    // node completes rather than when the counter returns to zero.
+                    depth = parallel.NodeId == section ? 0 : Math.Max(1, depth - 1);
+                    if (depth == 0)
+                    {
+                        section = null;
+                        if (sample.TryTakeParallel(parallel.NodeId, out var record))
+                        {
+                            Expand(record);
+                        }
                     }
 
                     break;

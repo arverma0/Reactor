@@ -198,11 +198,13 @@ internal sealed class SimulatedHumanGateHandler(SimulationSample sample) : ISelf
 
 /// <summary>
 /// The real <see cref="ParallelHandler"/>, recording each execution's branch paths (from <c>parallel.results</c>) so a
-/// sample's path and edges can be reported in branch order regardless of scheduling.
+/// sample's path and edges can be reported in branch order. Except in real-time samples (animated runs), branches run one
+/// at a time in edge order, so draws, <c>first_success</c> winners, and shared downstream nodes do not depend on thread
+/// scheduling.
 /// </summary>
 internal sealed class RecordingParallelHandler(SimulationSample sample) : INodeHandler
 {
-    private readonly ParallelHandler _inner = new();
+    private readonly ParallelHandler _inner = new(sequential: !sample.RealTime);
 
     public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
     {

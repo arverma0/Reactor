@@ -22,7 +22,8 @@ public enum SimulationMode
 /// <summary>
 /// One simulated execution of a pipeline: the scenario, the sample's identity (<see cref="Seed"/>, <see cref="RunIndex"/>),
 /// and per-run state (execution counts per node). Every random draw is a pure function of (seed, run index, node id,
-/// execution number), so a sample replays identically regardless of how parallel branches are scheduled.
+/// execution number), and except in <see cref="RealTime"/> samples parallel branches run one at a time in edge order, so a
+/// sample replays identically.
 /// <para>
 /// <see cref="CreateRunner"/> builds a dedicated <see cref="PipelineRunner"/> whose stage behaviors are simulated:
 /// codergen, tool, manager-loop, and custom handler types return scenario-drawn outcomes (tool commands are never run and
@@ -58,7 +59,8 @@ public sealed class SimulationSample
 
     /// <summary>
     /// Wait out simulated durations (<c>duration_ms</c>/<c>step_delay_ms</c>) with <see cref="Task.Delay(TimeSpan, CancellationToken)"/>
-    /// (for animated runs). When false (the default) durations only add to <see cref="SimulatedTimeMs"/>.
+    /// and run parallel branches concurrently, as in a real run (for animated runs). When false (the default) durations only
+    /// add to <see cref="SimulatedTimeMs"/> and branches run one at a time in edge order.
     /// </summary>
     public bool RealTime { get; init; }
 
