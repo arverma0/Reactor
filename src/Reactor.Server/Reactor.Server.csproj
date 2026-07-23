@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <RootNamespace>Reactor.Server</RootNamespace>
-    <Description>HTTP server mode for Reactor: REST API, server-sent events, and a web console for human-in-the-loop gates.</Description>
+    <Description>HTTP server mode for Reactor: REST API, server-sent events, the Reactor Studio web app, and a console for human-in-the-loop gates.</Description>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
@@ -15,4 +15,52 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Server.Tests" />
   </ItemGroup>
+
+  <!--
+    Reactor Studio (src/Reactor.Studio) is a Vite/React app embedded into this assembly and served at "/".
+    It is rebuilt only when its sources change, and skipped (with a message) when Node.js 20.19+ is not available or when
+    building with -p:SkipStudio=true (or REACTOR_SKIP_STUDIO=1). Without it, "/" serves a placeholder page.
+  -->
+  <PropertyGroup>
+    <StudioDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..', 'Reactor.Studio'))</StudioDir>
+    <StudioOutDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '$(BaseIntermediateOutputPath)', 'studio'))</StudioOutDir>
+    <StudioStamp>$(StudioOutDir).build.stamp</StudioStamp>
+    <SkipStudio Condition="'$(SkipStudio)' == '' and '$(REACTOR_SKIP_STUDIO)' == '1'">true</SkipStudio>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <StudioInputs Include="$(StudioDir)src\**\*;$(StudioDir)public\**\*" Exclude="$(StudioDir)src\**\*.test.ts" />
+    <StudioInputs Include="$(StudioDir)index.html;$(StudioDir)package.json;$(StudioDir)package-lock.json;$(StudioDir)vite.config.ts;$(StudioDir)tsconfig.json" />
+  </ItemGroup>
+
+  <Target Name="DetectStudioToolchain" Condition="'$(SkipStudio)' != 'true' and Exists('$(StudioDir)package.json')">
+    <Exec Command="node --version" ConsoleToMSBuild="true" IgnoreExitCode="true" EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_StudioNodeOutput" />
+      <Output TaskParameter="ExitCode" PropertyName="_StudioNodeExit" />
+    </Exec>
+    <PropertyGroup>
+      <_StudioNodeVersion Condition="'$(_StudioNodeExit)' == '0'">$(_StudioNodeOutput.Trim().TrimStart('v'))</_StudioNodeVersion>
+      <StudioCanBuild Condition="'$(_StudioNodeVersion)' != '' and $([MSBuild]::VersionGreaterThanOrEquals('$(_StudioNodeVersion)', '20.19.0'))">true</StudioCanBuild>
+    </PropertyGroup>
+    <Message Importance="high" Condition="'$(StudioCanBuild)' != 'true'" Text="Reactor Studio is not built: Node.js 20.19 or later was not found ('$(_StudioNodeOutput)'). The server will serve a placeholder at /." />
+  </Target>
+
+  <Target Name="RestoreStudio" DependsOnTargets="DetectStudioToolchain" Condition="'$(SkipStudio)' != 'true'" Inputs="$(StudioDir)package-lock.json" Outputs="$(StudioOutDir)../studio.restore.stamp">
+    <Exec Condition="'$(StudioCanBuild)' == 'true' and !Exists('$(StudioDir)node_modules')" Command="npm ci --no-audit --no-fund --loglevel=error" WorkingDirectory="$(StudioDir)" />
+    <Exec Condition="'$(StudioCanBuild)' == 'true' and Exists('$(StudioDir)node_modules')" Command="npm install --no-audit --no-fund --loglevel=error" WorkingDirectory="$(StudioDir)" />
+    <Touch Condition="'$(StudioCanBuild)' == 'true'" Files="$(StudioOutDir)../studio.restore.stamp" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="BuildStudio" DependsOnTargets="RestoreStudio" Condition="'$(SkipStudio)' != 'true'" Inputs="@(StudioInputs)" Outputs="$(StudioStamp)">
+    <Exec Condition="'$(StudioCanBuild)' == 'true'" Command="npm run build --silent" WorkingDirectory="$(StudioDir)" EnvironmentVariables="STUDIO_OUT_DIR=$(StudioOutDir)" />
+    <Touch Condition="'$(StudioCanBuild)' == 'true'" Files="$(StudioStamp)" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="EmbedStudio" DependsOnTargets="BuildStudio" BeforeTargets="PrepareResourceNames" Condition="'$(SkipStudio)' != 'true'">
+    <ItemGroup Condition="Exists('$(StudioOutDir)index.html')">
+      <_StudioFiles Include="$(StudioOutDir)**\*" Exclude="$(StudioStamp)" />
+      <EmbeddedResource Include="@(_StudioFiles)" LogicalName="Reactor.Server.studio/%(RecursiveDir)%(Filename)%(Extension)" WithCulture="false" Type="Non-Resx" />
+      <FileWrites Include="@(_StudioFiles);$(StudioStamp)" />
+    </ItemGroup>
+  </Target>
 </Project>

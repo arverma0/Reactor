@@ -1,0 +1,199 @@
+/* Reactor Studio — design tokens and base.
+   Language: an instrument panel. Graphite surfaces, hairline rules, one signal color (international orange) for
+   intent and live state, transit-line colors for data, IBM Plex for type (Sans for reading, Mono for readouts). */
+
+:root {
+  /* surfaces */
+  --bg-0: #0b0c0e;
+  --bg-1: #101114;
+  --bg-2: #15171a;
+  --bg-3: #1b1d21;
+  --bg-4: #23262b;
+  --bg-inset: #08090a;
+
+  /* rules */
+  --line-1: rgba(255, 255, 255, 0.055);
+  --line-2: rgba(255, 255, 255, 0.09);
+  --line-3: rgba(255, 255, 255, 0.14);
+  --line-4: rgba(255, 255, 255, 0.22);
+
+  /* ink */
+  --ink-0: #efebe4;
+  --ink-1: #c9c4bb;
+  --ink-2: #9a958c;
+  --ink-3: #6c6862;
+  --ink-4: #47443f;
+
+  /* signal */
+  --signal: #ff5b14;
+  --signal-ink: #ff7a3d;
+  --signal-soft: rgba(255, 91, 20, 0.14);
+  --signal-line: rgba(255, 91, 20, 0.5);
+
+  /* state */
+  --ok: #4cc38a;
+  --ok-soft: rgba(76, 195, 138, 0.13);
+  --fail: #f0544f;
+  --fail-soft: rgba(240, 84, 79, 0.13);
+  --warn: #e8b84a;
+  --warn-soft: rgba(232, 184, 74, 0.13);
+  --info: #6fa3f7;
+  --info-soft: rgba(111, 163, 247, 0.13);
+
+  /* node kinds */
+  --kind-start: #9a958c;
+  --kind-exit: #9a958c;
+  --kind-agent: #7ea4f5;
+  --kind-tool: #52c9a3;
+  --kind-human: #e8b84a;
+  --kind-router: #e7e2d8;
+  --kind-fanout: #b394ec;
+  --kind-join: #b394ec;
+  --kind-supervisor: #f08a6c;
+  --kind-custom: #8fa3b3;
+
+  /* type */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-serif: "IBM Plex Serif", ui-serif, Georgia, serif;
+
+  /* geometry */
+  --r-1: 4px;
+  --r-2: 6px;
+  --r-3: 9px;
+  --r-4: 12px;
+  --topbar-h: 48px;
+  --rail-w: 52px;
+  --left-w: 288px;
+  --right-w: 368px;
+
+  --shadow-pop: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 18px 50px -12px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.035) inset, 0 10px 28px -14px rgba(0, 0, 0, 0.75);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--ink-0);
+  font: 400 13px/1.45 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "ss02" 1;
+  overflow: hidden;
+  user-select: none;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+::selection {
+  background: rgba(255, 91, 20, 0.35);
+}
+
+a {
+  color: var(--ink-0);
+  text-decoration-color: var(--line-4);
+  text-underline-offset: 2px;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.label {
+  font: 500 10px/1 var(--font-mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.muted {
+  color: var(--ink-2);
+}
+
+.faint {
+  color: var(--ink-3);
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.serif {
+  font-family: var(--font-serif);
+}
+
+/* scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-4) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--bg-4);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 1.5px solid var(--signal);
+  outline-offset: 1px;
+}
+
+@keyframes rs-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes rs-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes rs-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
