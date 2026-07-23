@@ -109,6 +109,10 @@ validated against real agents.
   per stage on the `agent` backend (the session-level default stays unlimited, as specified).
 - Copilot model verification against the account's model list (the runtime otherwise substitutes models silently).
 - `reactor doctor`, `reactor render` with status colors, the web console, stage artifact endpoints.
+- A simulation engine for the Studio's wind tunnel (`Reactor.Simulation`): Monte Carlo runs of the real engine with
+  scenario-driven stage outcomes (no LLM calls, tool commands, or child pipelines), replayable per-sample traces,
+  stochastic or interactive simulated server runs, and the in-memory run mode it uses
+  (`PipelineRunnerOptions.PersistRunState = false`). See [http-api.md](http-api.md#simulation-studio-wind-tunnel).
 
 ## Live validation
 
