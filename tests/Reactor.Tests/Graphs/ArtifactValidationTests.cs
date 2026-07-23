@@ -96,7 +96,7 @@ public class ArtifactValidationTests
     }
 
     [Fact]
-    public void Inputs_produced_only_inside_parallel_branches_are_not_available_after_the_join()
+    public void Inputs_produced_in_parallel_branches_reach_stages_after_the_join_but_not_sibling_branches()
     {
         var diagnostics = Lint("""
             digraph P {
@@ -105,25 +105,23 @@ public class ArtifactValidationTests
                 fork [shape=component]
                 a [prompt="a", inputs="plan", outputs="review_a"]
                 a2 [prompt="a2", inputs="review_a"]
-                b [prompt="b", outputs="review_b"]
+                b [prompt="b", inputs="review_a", outputs="review_b"]
                 join [shape=tripleoctagon]
-                after [prompt="after", inputs="plan, review_a, review_b, combined"]
-                combine [prompt="c", outputs="combined"]
+                after [prompt="after", inputs="plan, review_a, review_b"]
                 start -> prep -> fork
                 fork -> a
                 fork -> b
                 a -> a2 -> join
                 b -> join
-                join -> combine -> after -> exit
+                join -> after -> exit
             }
             """);
 
-        var order = diagnostics.Where(d => d.Rule == "artifact_order").ToList();
-        Assert.Equal(2, order.Count);
-        Assert.All(order, d => Assert.Equal("after", d.NodeId));
-        Assert.Contains(order, d => d.Message == "Input 'review_a' is produced only inside parallel branches ('a'); branch context is not merged at the fan-in, so it is never available here.");
-        Assert.Contains(order, d => d.Message.StartsWith("Input 'review_b' is produced only inside parallel branches ('b')", StringComparison.Ordinal));
-        Assert.DoesNotContain(diagnostics, d => d.Rule.StartsWith("artifact_", StringComparison.Ordinal) && d.NodeId is "a" or "a2");
+        // Branch records are merged back at the join, so only the sibling branch cannot see review_a.
+        var order = Assert.Single(diagnostics, d => d.Rule.StartsWith("artifact_", StringComparison.Ordinal));
+        Assert.Equal("artifact_order", order.Rule);
+        Assert.Equal("b", order.NodeId);
+        Assert.Equal("Input 'review_a' is produced only by 'a', which cannot run before this stage, so it is never available.", order.Message);
     }
 
     [Fact]

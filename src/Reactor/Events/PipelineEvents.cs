@@ -140,10 +140,11 @@ public sealed record CheckpointSaved(string NodeId, string Path) : PipelineEvent
 }
 
 /// <summary>
-/// Reactor extension: a stage produced one of its declared <c>outputs</c> (recorded in the context as
-/// <c>artifacts.&lt;name&gt;</c>). <see cref="Kind"/> is <c>file</c> or <c>text</c>; <see cref="Path"/> is the
-/// working-directory-relative path of a file artifact (null for text); <see cref="Version"/> counts how often the artifact
-/// has been produced in this run; <see cref="Sha256"/> is the hex digest of the content (null for files over 16 MB).
+/// Reactor extension: one of a stage's declared <c>outputs</c> was recorded in the context as <c>artifacts.&lt;name&gt;</c>
+/// (emitted by the engine when it records the stage's outcome, after <see cref="StageCompleted"/>). <see cref="Kind"/> is
+/// <c>file</c> or <c>text</c>; <see cref="Path"/> is the working-directory-relative path of a file artifact (null for
+/// text); <see cref="Version"/> counts how often the artifact has been produced in this run; <see cref="Sha256"/> is the
+/// hex digest of the content (null for files over 16 MB).
 /// </summary>
 public sealed record ArtifactProduced(string NodeId, string Name, string Kind, string? Path, long Bytes, int Version, string? Sha256) : PipelineEvent
 {

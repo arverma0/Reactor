@@ -11,6 +11,8 @@ namespace Reactor.Handlers;
 /// <c>REACTOR_RUN_ID</c>, <c>REACTOR_LOGS_ROOT</c>, <c>REACTOR_STAGE_DIR</c>, <c>REACTOR_NODE_ID</c>, and <c>REACTOR_GOAL</c>.
 /// Artifact pins (Reactor extension): each produced input is passed as <c>REACTOR_INPUT_&lt;NAME&gt;</c> (a file path), a
 /// text output records stdout, and file outputs must exist after a successful run (see <see cref="StageArtifacts"/>).
+/// When the stage fails (the command failed or a declared file is missing), text outputs are still recorded, and so are
+/// file outputs whose files exist.
 /// </summary>
 public sealed class ToolHandler : INodeHandler
 {
@@ -62,21 +64,29 @@ public sealed class ToolHandler : INodeHandler
             ["tool.duration_ms"] = (long)result.Duration.TotalMilliseconds,
         };
 
+        // A failing command's output is often what the next stage needs (a failing test report): record what exists.
         if (result.TimedOut)
         {
-            return Outcome.Fail($"Tool command timed out after {AttributeValues.FormatDuration(timeout)}: {command}", updates);
+            var timedOut = Outcome.Fail($"Tool command timed out after {AttributeValues.FormatDuration(timeout)}: {command}", updates);
+            return await StageArtifacts.RecordAvailableAsync(node, timedOut, context, output, cancellationToken).ConfigureAwait(false);
         }
 
         if (result.ExitCode != 0)
         {
             var detail = Tail(result.Stderr.Trim().Length > 0 ? result.Stderr.Trim() : result.Stdout.Trim(), 1500);
-            return Outcome.Fail(
+            var failed = Outcome.Fail(
                 string.Create(CultureInfo.InvariantCulture, $"Tool command exited with code {result.ExitCode}") + (detail.Length > 0 ? ": " + detail : ""),
                 updates);
+            return await StageArtifacts.RecordAvailableAsync(node, failed, context, output, cancellationToken).ConfigureAwait(false);
         }
 
         var success = Outcome.Success("Tool completed: " + command, updates);
-        return await StageArtifacts.CompleteAsync(node, success, context, output, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var completed = await StageArtifacts.CompleteAsync(node, success, context, output, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        // A declared file is missing: the stage fails, but what the command did produce is still recorded.
+        return completed.Status == StageStatus.Fail
+            ? await StageArtifacts.RecordAvailableAsync(node, completed, context, output, cancellationToken).ConfigureAwait(false)
+            : completed;
     }
 
     private static string Tail(string text, int max) => text.Length <= max ? text : "…" + text[^max..];

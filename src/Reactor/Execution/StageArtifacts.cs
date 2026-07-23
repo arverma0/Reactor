@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Nodes;
 using Reactor.Events;
 using Reactor.Graphs;
 
@@ -100,8 +101,9 @@ public sealed record ArtifactRecord
 
 /// <summary>
 /// Runtime side of artifact pins (Reactor extension, see <see cref="ArtifactPins"/>): the prompt sections that list a
-/// stage's inputs and outputs, the output contract, artifact records, and <see cref="ArtifactProduced"/> events. Used by
-/// the codergen and tool handlers; custom handlers can opt in with <see cref="CompleteAsync"/>.
+/// stage's inputs and outputs, the output contract, and artifact records (which the engine announces with
+/// <see cref="ArtifactProduced"/> events when it records the outcome). Used by the codergen and tool handlers; custom
+/// handlers can opt in with <see cref="CompleteAsync"/>.
 /// </summary>
 public static class StageArtifacts
 {
@@ -186,11 +188,12 @@ public static class StageArtifacts
     /// affected: if a declared file output does not exist under the run's working directory, the outcome becomes FAIL
     /// (<c>Declared output `x` (path) was not written.</c>), which the engine retries and routes like any failure.
     /// Otherwise every output is added to the outcome's context updates as <c>artifacts.&lt;name&gt;</c> (text outputs record
-    /// <paramref name="text"/>) and an <see cref="ArtifactProduced"/> event is emitted for each.
+    /// <paramref name="text"/>) and listed in <see cref="Outcome.Artifacts"/>; the engine emits an
+    /// <see cref="ArtifactProduced"/> event for each when it records the outcome.
     /// </summary>
     /// <param name="node">The stage.</param>
     /// <param name="outcome">The stage's outcome as determined so far.</param>
-    /// <param name="context">The run context (records are versioned against it; events go to <see cref="PipelineContext.Run"/>).</param>
+    /// <param name="context">The run context (records are versioned against it).</param>
     /// <param name="text">The stage's text result: a codergen stage's final response, or a tool's stdout.</param>
     /// <param name="simulated">Simulation mode: file outputs are recorded without requiring the file to exist.</param>
     /// <param name="cancellationToken">Cancels hashing.</param>
@@ -216,10 +219,9 @@ public static class StageArtifacts
             return outcome;
         }
 
-        var run = context.Run;
-        var workingDirectory = WorkingDirectory(context);
         if (!simulated)
         {
+            var workingDirectory = WorkingDirectory(context);
             var problems = pins.Where(p => p.Kind == ArtifactKind.File).Select(p => MissingFile(p, workingDirectory)).OfType<string>().ToList();
             if (problems.Count > 0)
             {
@@ -235,6 +237,40 @@ public static class StageArtifacts
             }
         }
 
+        return await RecordAsync(node, outcome, context, text, pins, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Records the declared outputs that are available, without the output contract and whatever the outcome's status:
+    /// text outputs record <paramref name="text"/>, and a file output is recorded only if its file exists. The tool handler
+    /// uses this when a command fails, because its output (a failing test report, say) is what the next stage needs.
+    /// </summary>
+    /// <param name="node">The stage.</param>
+    /// <param name="outcome">The stage's outcome (kept as is apart from the added records).</param>
+    /// <param name="context">The run context (records are versioned against it).</param>
+    /// <param name="text">The stage's text result (a tool's stdout).</param>
+    /// <param name="cancellationToken">Cancels hashing.</param>
+    public static async Task<Outcome> RecordAvailableAsync(Node node, Outcome outcome, PipelineContext context, string? text, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(node);
+        ArgumentNullException.ThrowIfNull(outcome);
+        ArgumentNullException.ThrowIfNull(context);
+        var workingDirectory = WorkingDirectory(context);
+        var pins = ArtifactPins.Parse(node).Outputs
+            .Where(p => p.Kind == ArtifactKind.Text || MissingFile(p, workingDirectory) is null)
+            .ToList();
+        return pins.Count == 0 ? outcome : await RecordAsync(node, outcome, context, text, pins, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Outcome> RecordAsync(
+        Node node,
+        Outcome outcome,
+        PipelineContext context,
+        string? text,
+        IReadOnlyList<ArtifactPin> pins,
+        CancellationToken cancellationToken)
+    {
+        var workingDirectory = WorkingDirectory(context);
         var updates = new Dictionary<string, object?>(outcome.ContextUpdates, StringComparer.Ordinal);
         var records = new List<ArtifactRecord>();
         var producedAt = DateTimeOffset.UtcNow;
@@ -249,15 +285,7 @@ public static class StageArtifacts
             records.Add(record);
         }
 
-        if (run is not null)
-        {
-            foreach (var record in records)
-            {
-                run.Events.Emit(new ArtifactProduced(node.Id, record.Name, record.Kind, record.Path, record.Bytes, record.Version, record.Sha256) { RunId = run.RunId });
-            }
-        }
-
-        return outcome with { ContextUpdates = updates };
+        return outcome with { ContextUpdates = updates, Artifacts = [.. outcome.Artifacts, .. records] };
     }
 
     /// <summary>
@@ -299,6 +327,62 @@ public static class StageArtifacts
         }
 
         return environment;
+    }
+
+    /// <summary>
+    /// The artifact records that parallel branches made, to merge into the parent context when the branches finish (branch
+    /// contexts are otherwise not merged back). <paramref name="branches"/> are the branches' final context values in branch
+    /// declaration order; a record counts as made in a branch when it differs from the parent's record at the fork. When
+    /// several branches made the same artifact, the later branch's record wins and its <c>version</c> becomes the parent's
+    /// version at the fork plus every production in every branch, so versions keep increasing; a record made in a single
+    /// branch is kept as is.
+    /// </summary>
+    /// <param name="parent">The parent context's values at the fork.</param>
+    /// <param name="branches">Each branch's final context values, in branch declaration order (empty for branches that did not run).</param>
+    public static Dictionary<string, object?> MergeBranchRecords(
+        IReadOnlyDictionary<string, object?> parent,
+        IEnumerable<IReadOnlyDictionary<string, object?>> branches)
+    {
+        ArgumentNullException.ThrowIfNull(parent);
+        ArgumentNullException.ThrowIfNull(branches);
+        var merged = new Dictionary<string, object?>(StringComparer.Ordinal);
+        var productions = new Dictionary<string, int>(StringComparer.Ordinal);
+        var producingBranches = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var branch in branches)
+        {
+            foreach (var (key, value) in branch)
+            {
+                if (!key.StartsWith(ArtifactPins.ContextPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                parent.TryGetValue(key, out var before);
+                if (JsonNode.DeepEquals(ContextValues.ToJson(before), ContextValues.ToJson(value)))
+                {
+                    continue;
+                }
+
+                var name = key[ArtifactPins.ContextPrefix.Length..];
+                var forkVersion = ArtifactRecord.FromContextValue(name, before)?.Version ?? 0;
+                var branchVersion = ArtifactRecord.FromContextValue(name, value)?.Version ?? 0;
+                productions[key] = productions.GetValueOrDefault(key) + Math.Max(1, branchVersion - forkVersion);
+                producingBranches[key] = producingBranches.GetValueOrDefault(key) + 1;
+                merged[key] = value;
+            }
+        }
+
+        foreach (var (key, count) in producingBranches)
+        {
+            if (count > 1 && merged[key] is Dictionary<string, object?> record)
+            {
+                parent.TryGetValue(key, out var before);
+                var forkVersion = ArtifactRecord.FromContextValue(key[ArtifactPins.ContextPrefix.Length..], before)?.Version ?? 0;
+                merged[key] = new Dictionary<string, object?>(record, StringComparer.Ordinal) { ["version"] = (long)(forkVersion + productions[key]) };
+            }
+        }
+
+        return merged;
     }
 
     /// <summary>

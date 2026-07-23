@@ -93,6 +93,7 @@ public sealed class ExampleTests
 
         var implement = File.ReadAllText(Path.Combine(result.LogsRoot, "implement", "prompt.md"));
         Assert.Contains("- `design` — file `docs/DESIGN.md` (written by stage `architect`). Read it.", implement, StringComparison.Ordinal);
+        Assert.Contains("- `test_report` — not produced yet in this run.", implement, StringComparison.Ordinal);
         Assert.Contains("- `verdict` — not produced yet in this run.", implement, StringComparison.Ordinal);
         Assert.Contains("- `changes` → your final response is recorded as this artifact", implement, StringComparison.Ordinal);
     }

@@ -625,8 +625,10 @@ public class ArtifactTests
         Assert.Equal(
             new ArtifactProduced("architect", "summary", "text", null, 12, 1, Convert.ToHexStringLower(SHA256.HashData("summary text"u8))) { RunId = result.RunId, Timestamp = produced[1].Timestamp },
             produced[1]);
+        // Announced when the engine records the outcome: after the stage completes, before its checkpoint.
         var index = events.IndexOf(produced[0]);
-        Assert.IsType<StageCompleted>(events.Skip(index).First(e => e is StageCompleted or StageStarted));
+        Assert.IsType<StageCompleted>(events.Take(index).Last(e => e is StageCompleted or StageStarted));
+        Assert.IsType<CheckpointSaved>(events.Skip(index).First(e => e is not ArtifactProduced));
 
         var lines = File.ReadAllLines(Path.Combine(result.LogsRoot, "events.jsonl"))
             .Select(l => JsonNode.Parse(l)!)
@@ -662,58 +664,327 @@ public class ArtifactTests
         Assert.Equal("design", Assert.Single(events.OfType<ArtifactProduced>()).Name);
     }
 
+    private const string ReviewPanel = """
+        digraph Panel {
+            start [shape=Mdiamond] exit [shape=Msquare]
+            panel [shape=component, max_parallel=3]
+            security [prompt="Security review", outputs="security_findings"]
+            performance [prompt="Performance review", outputs="performance_findings"]
+            clarity [prompt="Clarity review", outputs="clarity_findings"]
+            clarity_check [prompt="Check the clarity review"]
+            gather [shape=tripleoctagon]
+            apply [prompt="Apply the findings", inputs="security_findings, performance_findings, clarity_findings"]
+            start -> panel
+            panel -> security
+            panel -> performance
+            panel -> clarity
+            security -> gather
+            performance -> gather
+            clarity -> clarity_check -> gather
+            gather -> apply -> exit
+        }
+        """;
+
     [Fact]
-    public async Task Records_made_in_parallel_branches_stay_in_their_branch()
+    public async Task Review_panel_branches_hand_their_findings_to_the_stage_after_the_join()
+    {
+        using var dir = new TempDir();
+        var backend = new ScriptedBackend()
+            .On("security", "No injection risks found.")
+            .On("performance", "The cache is never invalidated.")
+            .On("clarity", "Rename tmp2.")
+            .On("clarity_check", Outcome.Fail("could not verify the clarity review"));
+        var events = new List<PipelineEvent>();
+        var runner = TestPipelines.Runner(backend);
+
+        Assert.DoesNotContain(runner.Prepare(ReviewPanel).Diagnostics, d => d.Rule.StartsWith("artifact_", StringComparison.Ordinal));
+        var result = await runner.RunAsync(ReviewPanel, TestPipelines.Options(dir) with { OnEvent = Collect(events) });
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Equal(StageStatus.PartialSuccess, result.NodeOutcomes["panel"].Status);
+        Assert.EndsWith(
+            "## Inputs\n" +
+            "- `security_findings` — text from stage `security`:\n  > No injection risks found.\n" +
+            "- `performance_findings` — text from stage `performance`:\n  > The cache is never invalidated.\n" +
+            "- `clarity_findings` — text from stage `clarity`:\n  > Rename tmp2.",
+            backend.Calls.Single(c => c.NodeId == "apply").Prompt,
+            StringComparison.Ordinal);
+
+        // The clarity branch failed after producing its findings; they are merged all the same.
+        foreach (var (name, producer) in new[] { ("security_findings", "security"), ("performance_findings", "performance"), ("clarity_findings", "clarity") })
+        {
+            Assert.Equal(producer, Record(result.Context, name)["producer"]);
+            Assert.Equal(1L, Record(result.Context, name)["version"]);
+            Assert.True(result.NodeOutcomes["panel"].ContextUpdates.ContainsKey(ArtifactPins.ContextKey(name)));
+        }
+
+        // The merge announces nothing new: one event per production, emitted in the branches.
+        Assert.Equal(["clarity_findings", "performance_findings", "security_findings"], events.OfType<ArtifactProduced>().Select(e => e.Name).Order(StringComparer.Ordinal));
+        Assert.Empty(result.NodeOutcomes["panel"].Artifacts);
+    }
+
+    [Fact]
+    public async Task When_branches_produce_the_same_artifact_the_later_branch_wins_and_versions_keep_counting()
     {
         const string source = """
-            digraph P {
+            digraph Collide {
                 start [shape=Mdiamond] exit [shape=Msquare]
+                draft [prompt="Draft notes", outputs="notes"]
                 fork [shape=component]
-                a [prompt="a", outputs="review_a"]
-                a2 [prompt="a2", inputs="review_a"]
-                b [prompt="b", outputs="review_b"]
+                first [prompt="First take", outputs="notes"]
+                first_again [prompt="First take, revised", outputs="notes"]
+                second [prompt="Second take", outputs="notes"]
                 join [shape=tripleoctagon]
-                after [prompt="after", inputs="review_a"]
-                start -> fork
-                fork -> a
-                fork -> b
-                a -> a2 -> join
-                b -> join
+                after [prompt="Use the notes", inputs="notes", outputs="notes"]
+                start -> draft -> fork
+                fork -> first
+                fork -> second
+                first -> first_again -> join
+                second -> join
                 join -> after -> exit
             }
             """;
         using var dir = new TempDir();
-        var prompts = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
-        CodergenResult Capture(Node node, string prompt, PipelineContext ctx)
-        {
-            prompts[node.Id] = prompt;
-            return "review by " + node.Id;
-        }
-
-        var backend = new ScriptedBackend().On("a", Capture).On("a2", Capture).On("b", Capture).On("after", Capture);
+        var backend = new ScriptedBackend()
+            .On("draft", "draft notes")
+            .On("first", "first notes")
+            .On("first_again", "first notes, revised")
+            .On("second", "second notes")
+            .On("after", "final notes");
         var events = new List<PipelineEvent>();
 
-        var runner = TestPipelines.Runner(backend);
-        var diagnostics = runner.Prepare(source).Diagnostics;
-        var result = await runner.RunAsync(source, TestPipelines.Options(dir) with
+        var result = await TestPipelines.Runner(backend).RunAsync(source, TestPipelines.Options(dir) with { OnEvent = Collect(events) });
+
+        // draft made v1; the first branch v2 and v3, the second branch v2. The second branch is declared later, so its record
+        // wins, and its version counts all four productions.
+        var merged = Assert.IsType<Dictionary<string, object?>>(result.NodeOutcomes["fork"].ContextUpdates["artifacts.notes"]);
+        Assert.Equal("second notes", merged["text"]);
+        Assert.Equal("second", merged["producer"]);
+        Assert.Equal(4L, merged["version"]);
+        Assert.EndsWith("- `notes` — text from stage `second` (version 4):\n  > second notes\n\n## Outputs\nProduce these before you finish:\n- `notes` → your final response is recorded as this artifact",
+            backend.Calls.Single(c => c.NodeId == "after").Prompt, StringComparison.Ordinal);
+        Assert.Equal(5L, Record(result.Context, "notes")["version"]);
+        Assert.Equal("final notes", Record(result.Context, "notes")["text"]);
+        Assert.Equal([1, 2, 2, 3, 5], events.OfType<ArtifactProduced>().Select(e => e.Version).Order());
+    }
+
+    [Fact]
+    public async Task First_success_merges_only_the_branches_that_finished()
+    {
+        const string source = """
+            digraph First {
+                start [shape=Mdiamond] exit [shape=Msquare]
+                race [shape=component, join_policy="first_success", max_parallel=3]
+                probe [prompt="Probe", outputs="probe_notes"]
+                probe_check [prompt="Check the probe"]
+                fast [prompt="Fast", outputs="fast_result"]
+                slow [prompt="Slow", outputs="slow_result"]
+                join [shape=tripleoctagon]
+                after [prompt="After", inputs="probe_notes, fast_result, slow_result"]
+                start -> race
+                race -> probe
+                race -> fast
+                race -> slow
+                probe -> probe_check -> join
+                fast -> join
+                slow -> join
+                join -> after -> exit
+            }
+            """;
+        using var dir = new TempDir();
+        var probeFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prompts = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
+        var backend = new AsyncBackend(async (node, prompt, _, cancellationToken) =>
+        {
+            prompts[node.Id] = prompt;
+            switch (node.Id)
+            {
+                case "probe_check":
+                    return Outcome.Fail("probe inconclusive");
+                case "fast":
+                    // Finish after the failing probe branch, so that branch has completed when first_success cancels the rest.
+                    await probeFinished.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+                    return "fast result";
+                case "slow":
+                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                    return "never";
+                default:
+                    return node.Id + " output";
+            }
+        });
+        var events = new List<PipelineEvent>();
+        var collect = Collect(events);
+
+        var result = await TestPipelines.Runner(backend).RunAsync(source, TestPipelines.Options(dir) with
         {
             OnEvent = e =>
             {
-                lock (events)
+                collect(e);
+                if (e is ParallelBranchCompleted { Branch: "probe" })
                 {
-                    events.Add(e);
+                    probeFinished.TrySetResult();
                 }
             },
         });
 
         Assert.Equal(StageStatus.Success, result.Status);
-        Assert.Contains("- `review_a` — text from stage `a`:\n  > review by a", prompts["a2"], StringComparison.Ordinal);
-        Assert.Contains("- `review_a` — not produced yet in this run.", prompts["after"], StringComparison.Ordinal);
-        Assert.False(result.Context.ContainsKey("artifacts.review_a"));
-        Assert.Equal(["review_a", "review_b"], events.OfType<ArtifactProduced>().Select(e => e.Name).Order(StringComparer.Ordinal));
-        var warning = Assert.Single(diagnostics, d => d.Rule == "artifact_order");
-        Assert.Equal("after", warning.NodeId);
-        Assert.Contains("parallel branches", warning.Message, StringComparison.Ordinal);
+        Assert.Equal(StageStatus.Success, result.NodeOutcomes["race"].Status);
+        Assert.EndsWith(
+            "- `probe_notes` — text from stage `probe`:\n  > probe output\n" +
+            "- `fast_result` — text from stage `fast`:\n  > fast result\n" +
+            "- `slow_result` — not produced yet in this run.",
+            prompts["after"],
+            StringComparison.Ordinal);
+        Assert.False(result.Context.ContainsKey("artifacts.slow_result"));
+        Assert.DoesNotContain(events.OfType<ArtifactProduced>(), e => e.Name == "slow_result");
+    }
+
+    [Fact]
+    public async Task Merged_records_survive_a_resume_after_the_join()
+    {
+        using var dir = new TempDir();
+        using var cts = new CancellationTokenSource();
+        var first = new ScriptedBackend()
+            .On("security", "No injection risks found.")
+            .On("performance", "The cache is never invalidated.")
+            .On("clarity", "Rename tmp2.")
+            .On("apply", (_, _, _) =>
+            {
+                cts.Cancel();
+                throw new OperationCanceledException(cts.Token);
+            });
+
+        var interrupted = await TestPipelines.Runner(first).RunAsync(ReviewPanel, TestPipelines.Options(dir), cts.Token);
+
+        Assert.True(interrupted.Cancelled);
+        var checkpoint = Checkpoint.Load(Path.Combine(interrupted.LogsRoot, Checkpoint.FileName));
+        Assert.Equal("gather", checkpoint.CurrentNode);
+        Assert.Equal("security", Assert.IsType<Dictionary<string, object?>>(checkpoint.ContextValues["artifacts.security_findings"])["producer"]);
+
+        var second = new ScriptedBackend();
+        var resumed = await TestPipelines.Runner(second).ResumeAsync(interrupted.LogsRoot, TestPipelines.Options(dir));
+
+        Assert.Equal(StageStatus.Success, resumed.Status);
+        Assert.Equal(["apply"], second.Calls.Select(c => c.NodeId));
+        Assert.EndsWith(
+            "- `security_findings` — text from stage `security`:\n  > No injection risks found.\n" +
+            "- `performance_findings` — text from stage `performance`:\n  > The cache is never invalidated.\n" +
+            "- `clarity_findings` — text from stage `clarity`:\n  > Rename tmp2.",
+            second.Calls.Single().Prompt,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Branch_merge_skips_unchanged_records_and_counts_versions_from_the_fork()
+    {
+        var parent = new Dictionary<string, object?> { ["artifacts.spec"] = TextRecord("spec", "planner", 2), ["notes"] = "kept" };
+        var idle = new Dictionary<string, object?>(parent);
+        var a = new Dictionary<string, object?>(parent) { ["artifacts.spec"] = TextRecord("spec", "a", 3), ["artifacts.extra"] = TextRecord("extra", "a", 1), ["notes"] = "changed" };
+        var b = new Dictionary<string, object?>(parent) { ["artifacts.spec"] = TextRecord("spec", "b", 4) };
+
+        var merged = StageArtifacts.MergeBranchRecords(parent, [idle, a, b, new Dictionary<string, object?>()]);
+
+        Assert.Equal(["artifacts.extra", "artifacts.spec"], merged.Keys.Order(StringComparer.Ordinal));
+        Assert.Same(a["artifacts.extra"], merged["artifacts.extra"]);
+        var spec = Assert.IsType<Dictionary<string, object?>>(merged["artifacts.spec"]);
+        Assert.Equal("b", spec["producer"]);
+        Assert.Equal(5L, spec["version"]);
+        Assert.Equal(4L, Assert.IsType<Dictionary<string, object?>>(b["artifacts.spec"])["version"]);
+    }
+
+    // ---- Failing tools ----
+
+    [Fact]
+    public async Task A_failing_test_report_reaches_the_fixer_and_versions_count_each_run()
+    {
+        const string source = """
+            digraph Loop {
+                start [shape=Mdiamond] exit [shape=Msquare]
+                implement [prompt="Implement"]
+                test [shape=parallelogram, tool_command="CHECK", outputs="test_report", max_retries=1]
+                fix [prompt="Fix the failures", inputs="test_report"]
+                start -> implement -> test
+                test -> exit [condition="outcome=success"]
+                test -> fix [condition="outcome=fail"]
+                fix -> test
+            }
+            """;
+        using var dir = new TempDir();
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllText(dir.Combine("check.cmd"), "@echo off\r\ntype state.txt\r\nfindstr /b /c:\"ok\" state.txt >nul || exit /b 1\r\n");
+        }
+        else
+        {
+            File.WriteAllText(dir.Combine("check.sh"), "cat state.txt\ngrep -q '^ok' state.txt\n");
+        }
+
+        var fixes = 0;
+        var backend = new ScriptedBackend()
+            .On("implement", (_, _, ctx) =>
+            {
+                WriteFile(ctx, "state.txt", "2 tests failed");
+                return "implemented";
+            })
+            .On("fix", (_, _, ctx) =>
+            {
+                WriteFile(ctx, "state.txt", ++fixes == 1 ? "1 test failed" : "ok: 3 passed");
+                return "fixed";
+            });
+        var events = new List<PipelineEvent>();
+        var command = OperatingSystem.IsWindows() ? ".\\check.cmd" : "sh check.sh";
+
+        var result = await TestPipelines.Runner(backend).RunAsync(source.Replace("CHECK", command, StringComparison.Ordinal), TestPipelines.Options(dir) with { OnEvent = events.Add });
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var fixPrompts = backend.Calls.Where(c => c.NodeId == "fix").Select(c => c.Prompt).ToList();
+        Assert.Equal(2, fixPrompts.Count);
+        Assert.EndsWith("- `test_report` — text from stage `test`:\n  > 2 tests failed", fixPrompts[0], StringComparison.Ordinal);
+        Assert.EndsWith("- `test_report` — text from stage `test` (version 2):\n  > 1 test failed", fixPrompts[1], StringComparison.Ordinal);
+        var report = Record(result.Context, "test_report");
+        Assert.Equal(3L, report["version"]);
+        Assert.Equal("ok: 3 passed", report["text"]);
+
+        // Each failing run was attempted twice (max_retries=1); only the attempt that was recorded is announced.
+        Assert.Equal(5, events.OfType<StageStarted>().Count(e => e.NodeId == "test"));
+        Assert.Equal([1, 2, 3], events.OfType<ArtifactProduced>().Where(e => e.Name == "test_report").Select(e => e.Version));
+    }
+
+    [Fact]
+    public async Task Failing_tools_record_their_text_and_existing_files_without_the_contract()
+    {
+        const string source = """
+            digraph F {
+                start [shape=Mdiamond] exit [shape=Msquare]
+                junit  [shape=parallelogram, tool_command="echo failures> junit.xml && echo ran junit && exit 1", outputs="junit:junit.xml, junit_log"]
+                broken [shape=parallelogram, tool_command="echo oops && exit 3", outputs="coverage:coverage.xml, broken_log"]
+                quiet  [shape=parallelogram, tool_command="echo done", outputs="summary:summary.md, quiet_log"]
+                start -> junit -> broken -> quiet -> exit
+            }
+            """;
+        using var dir = new TempDir();
+        var events = new List<PipelineEvent>();
+
+        var result = await TestPipelines.Runner().RunAsync(source, TestPipelines.Options(dir) with { OnEvent = events.Add });
+
+        Assert.StartsWith("Tool command exited with code 1", result.NodeOutcomes["junit"].FailureReason, StringComparison.Ordinal);
+        var junit = Record(result.Context, "junit");
+        var bytes = File.ReadAllBytes(dir.Combine("junit.xml"));
+        Assert.Equal("junit.xml", junit["path"]);
+        Assert.Equal(bytes.LongLength, junit["bytes"]);
+        Assert.Equal(Convert.ToHexStringLower(SHA256.HashData(bytes)), junit["sha256"]);
+        Assert.Equal("ran junit", Record(result.Context, "junit_log")["text"]);
+
+        Assert.Equal("Tool command exited with code 3: oops", result.NodeOutcomes["broken"].FailureReason);
+        Assert.Equal("oops", Record(result.Context, "broken_log")["text"]);
+        Assert.False(result.Context.ContainsKey("artifacts.coverage"));
+
+        // A command that succeeds without writing a declared file fails the contract, and still records its text.
+        Assert.Equal("Declared output `summary` (summary.md) was not written.", result.NodeOutcomes["quiet"].FailureReason);
+        Assert.Equal("done", Record(result.Context, "quiet_log")["text"]);
+        Assert.False(result.Context.ContainsKey("artifacts.summary"));
+
+        Assert.Equal(["junit", "junit_log", "broken_log", "quiet_log"], events.OfType<ArtifactProduced>().Select(e => e.Name));
     }
 
     [Fact]
@@ -761,6 +1032,17 @@ public class ArtifactTests
     private static Dictionary<string, object?> FileRecord(string name, string path, string producer, int version) =>
         new ArtifactRecord { Name = name, Kind = "file", Path = path, Producer = producer, Version = version, Bytes = 10 }.ToContextValue();
 
+    private static Dictionary<string, object?> TextRecord(string name, string producer, int version) =>
+        new ArtifactRecord { Name = name, Kind = "text", Text = $"{name} by {producer}", Producer = producer, Version = version, Bytes = 1 }.ToContextValue();
+
+    private static Action<PipelineEvent> Collect(List<PipelineEvent> events) => e =>
+    {
+        lock (events)
+        {
+            events.Add(e);
+        }
+    };
+
     private static Dictionary<string, object?> Record(IReadOnlyDictionary<string, object?> context, string name) =>
         Assert.IsType<Dictionary<string, object?>>(context[ArtifactPins.ContextKey(name)]);
 
@@ -769,5 +1051,12 @@ public class ArtifactTests
         var path = Path.Combine(context.Run!.WorkingDirectory, relativePath);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, content);
+    }
+
+    /// <summary>A backend whose responses can await (and observe cancellation).</summary>
+    private sealed class AsyncBackend(Func<Node, string, PipelineContext, CancellationToken, Task<CodergenResult>> respond) : ICodergenBackend
+    {
+        public Task<CodergenResult> RunAsync(Node node, string prompt, PipelineContext context, CancellationToken cancellationToken) =>
+            respond(node, prompt, context, cancellationToken);
     }
 }

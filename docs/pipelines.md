@@ -57,7 +57,7 @@ Errors report line and column: `reactor validate file.dot`.
 | Handler (shape) | Attributes |
 |---|---|
 | wait.human (`hexagon`) | `human.timeout`, `human.default_choice` (target id, key, or label), `human.input="freeform"` with `human.question` |
-| parallel (`component`) | `join_policy` = `wait_all` (default; `partial_success` if any branch fails) or `first_success` (cancels the other branches once one succeeds); `max_parallel` (default 4) |
+| parallel (`component`) | `join_policy` = `wait_all` (default; `partial_success` if any branch fails) or `first_success` (cancels the other branches once one succeeds); `max_parallel` (default 4). Branch context changes are not merged back, except [artifact records](#artifacts-reactor-extension) |
 | fan-in (`tripleoctagon`) | optional `prompt`: an LLM picks the best branch (reply `BEST: <id>`); otherwise ranked by status and score |
 | tool (`parallelogram`) | `tool_command` (run with `cmd.exe /c` on Windows, `bash -c` elsewhere); `timeout` (default 10m); produced `inputs` arrive as `REACTOR_INPUT_<NAME>` file paths |
 | manager (`house`) | `manager.poll_interval` (45s), `manager.max_cycles` (1000), `manager.stop_condition`, `manager.actions` (`observe,wait`; add `steer`), `manager.steer_cooldown` (5m), `manager.steer_prompt`, `stack.child_autostart`, `stack.child_logs_root` |
@@ -181,10 +181,22 @@ agent-written `status.json`, or by a tool's exit code — every file output must
 fails with ``Declared output `design` (docs/DESIGN.md) was not written.``, which is retried (`max_retries`) and
 routed like any other failure (`condition="outcome=fail"`, retry targets); the routing hints of the reported outcome
 are dropped. Only existence is checked, so a file left by an earlier visit satisfies the contract. Text outputs
-cannot be missing (empty text is recorded as is). Stages that fail record nothing.
+cannot be missing (empty text is recorded as is).
 
-**Records.** Each output of a successful stage is stored in the context as `artifacts.<name>` (always the latest
-version) and announced with an `ArtifactProduced` event:
+**Failures.** A codergen stage that fails records nothing. A tool stage that fails — its command exits non-zero or
+times out, or a declared file is missing — still records its text outputs (stdout) and every declared file that
+exists, without the contract, because a failing run's output is what the next stage needs:
+
+```dot
+test [shape=parallelogram, tool_command="python -m pytest -q", outputs="test_report"]
+fix  [prompt="Make the failing tests pass", inputs="test_report"]
+test -> fix [condition="outcome=fail"]
+fix -> test
+```
+
+**Records.** Each recorded output is stored in the context as `artifacts.<name>` (always the latest version) and
+announced with an `ArtifactProduced` event when the engine records the stage's outcome (after its `StageCompleted`;
+attempts that are retried announce nothing):
 
 ```json
 {"name": "design", "kind": "file", "path": "docs/DESIGN.md", "text": null, "producer": "architect", "version": 2,
@@ -198,18 +210,23 @@ text. Records are ordinary context values: checkpointed, restored by `reactor re
 `GET /pipelines/{id}/context`. They are left out of the context preamble, since a stage sees what it declares as
 inputs. A plain value seeded with `--set artifacts.ticket="..."` reads as a text artifact (version 0).
 
-**Parallel branches** run on cloned contexts that are not merged back at the fan-in (spec behavior), so an artifact
-produced inside a branch is an input only for later stages of the same branch; its `ArtifactProduced` event is
-emitted all the same. Produce what stages after the join need in a stage after the fan-in.
+**Parallel branches** run on cloned contexts, and artifact records are the one thing merged back: when the branches
+finish, the records made in them — failed branches included — are copied into the parent context in branch
+declaration order, so stages after the join can read them (a review panel whose reviewers each produce findings, and
+an `apply` stage after the fan-in with all of them as inputs). Branches cannot see each other's records while they
+run. When several branches produce the same artifact, the branch declared last wins, and its `version` becomes the
+version before the fork plus every production in every branch, so versions keep increasing (a record made in a
+single branch is kept as is). Branches cancelled by `join_policy="first_success"` contribute nothing. The merge emits
+no events of its own; each production was announced in its branch.
 
 **Simulation.** Without a backend, codergen stages write no files, so their file outputs are recorded without the
 existence check (`bytes` 0 and no digest unless the file exists).
 
 **Validation.** `artifact_syntax` (error): malformed entries — invalid or duplicate names; empty, absolute, or
 escaping paths; directories; wildcards. `artifact_inputs` (warning): an input that no stage produces.
-`artifact_order` (warning): no producer of an input can run before the consuming stage, counting a producer that
-only runs inside parallel branches as reaching the rest of its branch only. `artifact_handlers` (warning): `inputs`
-or `outputs` on a node type that ignores them.
+`artifact_order` (warning): no producer of an input can run before the consuming stage (records made in parallel
+branches count for the stages after the join). `artifact_handlers` (warning): `inputs` or `outputs` on a node type
+that ignores them.
 
 ## Fidelity and threads
 

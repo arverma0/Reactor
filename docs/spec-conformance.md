@@ -75,7 +75,9 @@ validated against real agents.
   `loop_restart` starts new ones); a stage whose thread session was lost (timeout, eviction, parallel fork) gets a
   `summary:high` preamble rather than starting blind.
 - *Parallel*: branches run on cloned contexts until they reach a fan-in, the exit, or a dead end; the parallel
-  outcome always jumps to the join (fan-in decides how to treat failures); `first_success` cancels the rest.
+  outcome always jumps to the join (fan-in decides how to treat failures); `first_success` cancels the rest. Branch
+  context changes are not merged back, except Reactor's artifact records (`artifacts.*`), which are merged in branch
+  declaration order.
 - *Human gates*: `human.timeout` (else the node timeout) and `human.default_choice` (matched against target id,
   accelerator key, or label); `human.input="freeform"` stores text in `human.gate.text`.
 - *Codergen*: non-`full` fidelity prepends a context preamble; agent backends get the status-file protocol appended;
@@ -109,8 +111,9 @@ validated against real agents.
   (text, or files relative to the working directory). Prompts list them, a successful stage that did not write a
   declared file fails (and is retried and routed like any failure), produced artifacts are recorded as versioned
   `artifacts.<name>` context values with an `ArtifactProduced` event, and four lint rules (`artifact_syntax`,
-  `artifact_inputs`, `artifact_order`, `artifact_handlers`) check the wiring. Branch contexts are still not merged at
-  a fan-in, so artifacts made inside parallel branches stay in their branch. See
+  `artifact_inputs`, `artifact_order`, `artifact_handlers`) check the wiring. Failing tool stages still record their
+  stdout (a failing test report reaches the fixer), and artifact records made in parallel branches are merged back
+  into the parent context at the join, in branch declaration order. See
   [pipelines.md](pipelines.md#artifacts-reactor-extension). (Unrelated to the spec's `ArtifactStore`.)
 - A default budget of 500 (CLI) / 1000 (server) stage executions per run against runaway loops, and 200 tool rounds
   per stage on the `agent` backend (the session-level default stays unlimited, as specified).

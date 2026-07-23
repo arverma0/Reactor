@@ -63,7 +63,8 @@ Supporting pieces:
   handlers but is never checkpointed.
 - **Parallel** — the parallel handler runs each branch through `IBranchExecutor` (the engine's own traversal, on a
   cloned context) with a `max_parallel` semaphore until branches reach a fan-in, exit, or dead end; results go to
-  `parallel.results`, and the outcome jumps to the join node.
+  `parallel.results`, artifact records made in the branches are merged back in branch order, and the outcome jumps to
+  the join node.
 - **Child pipelines** — the manager handler starts a child run through `IChildPipelineLauncher` (same runner,
   backend, and interviewer, separate logs root) and observes it via its events.
 - **Human interaction** — handlers only see `IInterviewer` (`AskAsync(Question)`); console, queue, callback,
@@ -73,8 +74,10 @@ Supporting pieces:
 - **Artifact pins** (Reactor extension) — `ArtifactPins` parses the `inputs`/`outputs` node attributes;
   `StageArtifacts` renders a codergen prompt's Inputs/Outputs sections, enforces the output contract on successful
   stages (a missing declared file turns the outcome into FAIL, so retries and routing apply), and adds versioned
-  `artifacts.<name>` records to the outcome's context updates with an `ArtifactProduced` event. The codergen and tool
-  handlers call it; custom handlers can too. Not to be confused with `ArtifactStore`, the spec's store for large values.
+  `artifacts.<name>` records to the outcome's context updates (failing tool stages still record their stdout). The
+  engine announces each record with an `ArtifactProduced` event when it records the outcome, and the parallel
+  handler merges records made in branches back into the parent context. The codergen and tool handlers call it;
+  custom handlers can too. Not to be confused with `ArtifactStore`, the spec's store for large values.
 - **Resume** — `ResumeAsync(logsRoot)` reloads `checkpoint.json` (context, completed nodes, retry counts, node
   outcomes, last fidelity/thread, history) and continues after the checkpointed node; a `full`-fidelity stage right
   after resume degrades to `summary:high` because agent sessions are not persisted.
