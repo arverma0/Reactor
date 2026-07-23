@@ -151,6 +151,64 @@ public class DotParserTests
     }
 
     [Fact]
+    public void Subgraph_structure_and_declared_defaults_are_recorded_for_editors()
+    {
+        var graph = DotParser.Parse("""
+            digraph G {
+                node [timeout="5m"]
+                edge [weight=2]
+                start [shape=Mdiamond]
+                subgraph cluster_outer {
+                    label="Deep thinking"
+                    node [reasoning_effort=high]
+                    plan [prompt="Plan"]
+                    subgraph inner {
+                        edge [fidelity=full]
+                        build [prompt="Build"]
+                        build -> check
+                    }
+                    review [prompt="Review"]
+                }
+                { loose [prompt="Anonymous scope"] }
+                start -> plan -> build
+            }
+            """);
+
+        Assert.Equal(new Dictionary<string, string> { ["timeout"] = "5m" }, graph.NodeDefaults);
+        Assert.Equal(new Dictionary<string, string> { ["weight"] = "2" }, graph.EdgeDefaults);
+        Assert.Equal(3, graph.Subgraphs.Count);
+
+        var outer = graph.Subgraphs[0];
+        Assert.Equal("cluster_outer", outer.Name);
+        Assert.Null(outer.ParentName);
+        Assert.Equal(-1, outer.ParentIndex);
+        Assert.Equal("Deep thinking", outer.Label);
+        Assert.Equal("deep-thinking", outer.DerivedClass);
+        Assert.Equal(new Dictionary<string, string> { ["reasoning_effort"] = "high" }, outer.NodeDefaults);
+        Assert.Equal(["plan", "review"], outer.NodeIds);
+
+        var inner = graph.Subgraphs[1];
+        Assert.Equal("inner", inner.Name);
+        Assert.Equal("cluster_outer", inner.ParentName);
+        Assert.Equal(0, inner.ParentIndex);
+        Assert.Null(inner.Label);
+        Assert.Empty(inner.NodeDefaults);
+        Assert.Equal(new Dictionary<string, string> { ["fidelity"] = "full" }, inner.EdgeDefaults);
+        Assert.Equal(["build", "check"], inner.NodeIds);
+
+        var anonymous = graph.Subgraphs[2];
+        Assert.Null(anonymous.Name);
+        Assert.Equal(["loose"], anonymous.NodeIds);
+
+        // Inherited defaults still apply to members, and the clone keeps the structure.
+        Assert.Equal("high", graph.Nodes["build"].ReasoningEffort);
+        Assert.Equal("full", graph.Edges.Single(e => e.From == "build").Fidelity);
+        var clone = graph.Clone();
+        Assert.Equal(["plan", "review"], clone.Subgraphs[0].NodeIds);
+        Assert.Equal("5m", clone.NodeDefaults["timeout"]);
+    }
+
+    [Fact]
     public void Class_attribute_is_comma_separated()
     {
         var graph = DotParser.Parse("""digraph G { review_code [shape=box, class="code,critical", prompt="Review the code"] }""");

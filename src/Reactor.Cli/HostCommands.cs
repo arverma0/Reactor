@@ -11,19 +11,30 @@ using Reactor.Backends;
 using Reactor.Backends.Cli;
 using Reactor.Llm;
 using Reactor.Server;
+using Reactor.Server.Studio;
 
 namespace Reactor.Cli;
 
 internal static class HostCommands
 {
-    public static Command Serve()
+    public static Command Serve() => CreateServer("serve", "Run the HTTP server, the Studio web app, and the console", openBrowser: false);
+
+    public static Command Studio() => CreateServer("studio", "Open Reactor Studio: design, simulate, run, and review pipelines in the browser", openBrowser: true);
+
+    private static Command CreateServer(string name, string description, bool openBrowser)
     {
         var urls = new Option<string>("--urls") { Description = "Listen address(es)", DefaultValueFactory = _ => Environment.GetEnvironmentVariable("REACTOR_URLS") ?? "http://127.0.0.1:5180" };
         var token = new Option<string?>("--token") { Description = "Require this bearer token for API calls (default: $REACTOR_SERVER_TOKEN)" };
         var maxRuns = new Option<int>("--max-concurrent") { Description = "Runs executing at once (others queue)", DefaultValueFactory = _ => 4 };
         var allowWorkdir = new Option<bool>("--allow-client-workdir") { Description = "Let API clients choose a run's working directory" };
+        var noBrowser = new Option<bool>("--no-browser") { Description = "Do not open the Studio in a browser" };
         var options = new RunOptionSet();
-        var command = new Command("serve", "Run the HTTP server and web console") { urls, token, maxRuns, allowWorkdir };
+        var command = new Command(name, description) { urls, token, maxRuns, allowWorkdir };
+        if (openBrowser)
+        {
+            command.Options.Add(noBrowser);
+        }
+
         foreach (var option in new Option[] { options.Backend, options.Model, options.Provider, options.WorkingDirectory, options.CopilotRuntime, options.CopilotCli, options.ClaudeCli })
         {
             command.Options.Add(option);
@@ -65,12 +76,18 @@ internal static class HostCommands
                         AuthToken = string.IsNullOrEmpty(authToken) ? null : authToken,
                         MaxConcurrentRuns = result.GetValue(maxRuns),
                         AllowClientWorkingDirectory = result.GetValue(allowWorkdir),
+                        BackendKind = selection.Kind,
+                        BackendDescription = selection.Description,
+                        BackendRoutes = selection.Routes,
+                        ListModels = StudioModels.Lister(selection),
                     },
                     configure: builder => builder.WebHost.UseUrls(listen.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)));
                 await using (app.ConfigureAwait(false))
                 {
+                    var consoleUrl = listen.Split([';', ','])[0].Trim();
                     Console.WriteLine($"⚛ Reactor server — backend: {selection.Description}");
-                    Console.WriteLine($"  console: {listen.Split([';', ','])[0].Trim()}/");
+                    Console.WriteLine($"  studio:  {consoleUrl}/" + (StudioAssets.IsAvailable ? "" : "  (not built: install Node.js 20.19+ and rebuild)"));
+                    Console.WriteLine($"  console: {consoleUrl}/console");
                     Console.WriteLine($"  workdir: {workDir}");
                     if (!string.IsNullOrEmpty(authToken))
                     {
@@ -78,6 +95,11 @@ internal static class HostCommands
                     }
 
                     await app.StartAsync(cancellationToken).ConfigureAwait(false);
+                    if (openBrowser && !result.GetValue(noBrowser))
+                    {
+                        OpenBrowser(BrowserUrl(consoleUrl));
+                    }
+
                     try
                     {
                         await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
@@ -396,6 +418,26 @@ internal static class HostCommands
         urls.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).All(url =>
             Uri.TryCreate(url.Replace("://*", "://0.0.0.0", StringComparison.Ordinal).Replace("://+", "://0.0.0.0", StringComparison.Ordinal), UriKind.Absolute, out var uri) &&
             (uri.IsLoopback || (IPAddress.TryParse(uri.Host.Trim('[', ']'), out var address) && IPAddress.IsLoopback(address))));
+
+    /// <summary>A browsable URL for a listen address (wildcard hosts become localhost).</summary>
+    private static string BrowserUrl(string listen) =>
+        listen.Replace("://*", "://localhost", StringComparison.Ordinal).Replace("://+", "://localhost", StringComparison.Ordinal)
+            .Replace("://0.0.0.0", "://localhost", StringComparison.Ordinal).TrimEnd('/') + "/";
+
+    private static void OpenBrowser(string url)
+    {
+        try
+        {
+            var start = OperatingSystem.IsWindows() ? new ProcessStartInfo(url) { UseShellExecute = true }
+                : OperatingSystem.IsMacOS() ? new ProcessStartInfo("open", url)
+                : new ProcessStartInfo("xdg-open", url);
+            using var _ = Process.Start(start);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or PlatformNotSupportedException)
+        {
+            Console.WriteLine($"  open {url} in a browser");
+        }
+    }
 }
 
 internal static class ServiceProviderExtensions

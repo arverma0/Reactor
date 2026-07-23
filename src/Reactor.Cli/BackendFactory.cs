@@ -41,6 +41,9 @@ internal sealed class BackendSelection : IAsyncDisposable
 
     public Client? Client { get; init; }
 
+    /// <summary>The Copilot SDK backend when one was configured (used to list the account's models).</summary>
+    public CopilotSdkBackend? Copilot { get; init; }
+
     public async ValueTask DisposeAsync()
     {
         if (Backend is IAsyncDisposable disposable)
@@ -170,7 +173,7 @@ internal static class BackendFactory
             description += $", default model {settings.Model}";
         }
 
-        return new BackendSelection { Backend = router, Kind = kind, Description = description, Routes = routes, Client = client };
+        return new BackendSelection { Backend = router, Kind = kind, Description = description, Routes = routes, Client = client, Copilot = copilot };
     }
 
     /// <summary>The Copilot runtime bundled next to the CLI (or <c>COPILOT_CLI_PATH</c>), if any.</summary>

@@ -44,6 +44,49 @@ public sealed record ReactorServerOptions
 
     /// <summary>Maximum DOT source size accepted (default 1 MiB).</summary>
     public int MaxDotBytes { get; init; } = 1024 * 1024;
+
+    /// <summary>The default backend kind (e.g. <c>copilot</c>, <c>agent</c>, <c>simulate</c>), shown in the Studio.</summary>
+    public string? BackendKind { get; init; }
+
+    /// <summary>Human-readable description of the configured backend, shown in the Studio.</summary>
+    public string? BackendDescription { get; init; }
+
+    /// <summary>Backend route names that nodes may select with <c>backend="..."</c>.</summary>
+    public IReadOnlyList<string> BackendRoutes { get; init; } = [];
+
+    /// <summary>Lists the models stages can use (catalog and account models), for the Studio's model pickers.</summary>
+    public Func<CancellationToken, Task<IReadOnlyList<ModelDescriptor>>>? ListModels { get; init; }
+}
+
+/// <summary>A model offered to pipeline authors by the Studio.</summary>
+public sealed record ModelDescriptor
+{
+    public required string Id { get; init; }
+
+    /// <summary>Provider name (<c>openai</c>, <c>anthropic</c>, ...), or <c>copilot</c> for GitHub Copilot account models.</summary>
+    public required string Provider { get; init; }
+
+    /// <summary>Where the entry came from: <c>catalog</c> or <c>copilot</c>.</summary>
+    public required string Source { get; init; }
+
+    public string? DisplayName { get; init; }
+
+    public long? ContextWindow { get; init; }
+
+    public IReadOnlyList<string> ReasoningEfforts { get; init; } = [];
+
+    public bool? SupportsTools { get; init; }
+
+    public bool? SupportsReasoning { get; init; }
+
+    /// <summary>Copilot billing multiplier, when known.</summary>
+    public double? BillingMultiplier { get; init; }
+
+    /// <summary>Copilot policy state (<c>enabled</c>, <c>disabled</c>, ...), when known.</summary>
+    public string? PolicyState { get; init; }
+
+    /// <summary>False when the model's provider is not configured (for example no API key).</summary>
+    public bool Available { get; init; } = true;
 }
 
 /// <summary>Run states reported by the API.</summary>
@@ -336,6 +379,12 @@ public sealed record StartRequest
     public IReadOnlyDictionary<string, object?>? Context { get; init; }
 
     public string? WorkingDirectory { get; init; }
+
+    /// <summary>Optional simulation settings (<c>"simulation"</c> in the JSON body): run with simulated stages instead of the backend.</summary>
+    public System.Text.Json.Nodes.JsonObject? Simulation { get; init; }
+
+    /// <summary>Optional Studio metadata (<c>"studio"</c> in the JSON body), e.g. the source file and layout of the pipeline.</summary>
+    public System.Text.Json.Nodes.JsonObject? Studio { get; init; }
 }
 
 /// <summary>Starts, tracks, cancels, and resumes pipeline runs for the HTTP server.</summary>

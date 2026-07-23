@@ -14,6 +14,7 @@ using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Human;
 using Reactor.Rendering;
+using Reactor.Server.Studio;
 using Reactor.Validation;
 
 namespace Reactor.Server;
@@ -48,6 +49,8 @@ public static class ReactorServer
         ArgumentNullException.ThrowIfNull(options);
         services.AddSingleton(options);
         services.AddSingleton<PipelineRunManager>();
+        services.AddSingleton(new Studio.StudioWorkspace(options.WorkingDirectory, options.MaxDotBytes));
+        services.AddSingleton<Studio.StudioFeatures>();
         services.ConfigureHttpJsonOptions(json =>
         {
             json.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
@@ -74,8 +77,10 @@ public static class ReactorServer
             await next(http).ConfigureAwait(false);
         });
 
-        app.MapGet("/", () => Asset("index.html", "text/html; charset=utf-8"));
+        app.MapStudioAssets();
+        app.MapGet("/console", () => Asset("index.html", "text/html; charset=utf-8"));
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+        app.MapStudioApi();
 
         app.MapPost("/pipelines", StartAsync);
         app.MapPost("/run", StartAsync);
@@ -440,7 +445,14 @@ public static class ReactorServer
         }
 
         var workingDirectory = json["working_directory"] is JsonValue wd && wd.TryGetValue<string>(out var dir) ? dir : null;
-        return (new StartRequest { Dot = dot, Context = context, WorkingDirectory = workingDirectory }, null);
+        return (new StartRequest
+        {
+            Dot = dot,
+            Context = context,
+            WorkingDirectory = workingDirectory,
+            Simulation = json["simulation"] as JsonObject,
+            Studio = json["studio"] as JsonObject,
+        }, null);
     }
 
     private static IResult WithRun(PipelineRunManager manager, string id, Func<ManagedRun, IResult> action) =>
@@ -509,7 +521,7 @@ public static class ReactorServer
     };
 
     private static bool RequiresAuth(PathString path) =>
-        !(path == "/" || path == "/healthz" || path.StartsWithSegments("/assets", StringComparison.Ordinal));
+        !(path == "/console" || path == "/healthz" || StudioAssets.IsPublicPath(path));
 
     private static bool Authorized(HttpContext http, string? token)
     {

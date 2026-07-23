@@ -110,15 +110,41 @@ public sealed class CodergenHandler : INodeHandler
     /// <summary>Builds the full prompt sent to the backend.</summary>
     public static string BuildPrompt(Node node, PipelineContext context, Graph graph, RunServices? run, ICodergenBackend? backend, string stageDir)
     {
+        ArgumentNullException.ThrowIfNull(context);
+        return BuildPrompt(
+            node,
+            context,
+            graph,
+            run?.History ?? [],
+            run?.RunId ?? context.GetString("internal.run_id"),
+            backend,
+            stageDir,
+            run?.RunnerOptions.IncludeStatusProtocol ?? true);
+    }
+
+    /// <summary>
+    /// Builds the full prompt sent to the backend from explicit run state (used by editors to preview what a stage will see).
+    /// </summary>
+    public static string BuildPrompt(
+        Node node,
+        PipelineContext context,
+        Graph graph,
+        IReadOnlyList<StageRecord> history,
+        string runId,
+        ICodergenBackend? backend,
+        string stageDir,
+        bool includeStatusProtocol)
+    {
         ArgumentNullException.ThrowIfNull(node);
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(graph);
+        ArgumentNullException.ThrowIfNull(history);
 
         var task = string.IsNullOrWhiteSpace(node.Prompt) ? node.Label : node.Prompt;
         task = VariableExpansionTransform.Expand(task, graph.Goal);
 
         var fidelity = context.GetString("internal.fidelity", FidelityModes.Default);
-        var preamble = PreambleBuilder.Build(fidelity, graph, context, run?.History ?? [], run?.RunId ?? context.GetString("internal.run_id"));
+        var preamble = PreambleBuilder.Build(fidelity, graph, context, history, runId);
 
         var sb = new StringBuilder();
         if (preamble.Length > 0)
@@ -128,7 +154,7 @@ public sealed class CodergenHandler : INodeHandler
 
         sb.Append(task);
 
-        if (backend is not null && backend.SupportsStatusFileFor(node) && (run?.RunnerOptions.IncludeStatusProtocol ?? true))
+        if (backend is not null && backend.SupportsStatusFileFor(node) && includeStatusProtocol)
         {
             sb.AppendLine().AppendLine().Append(StatusProtocol(node, graph, stageDir));
         }
