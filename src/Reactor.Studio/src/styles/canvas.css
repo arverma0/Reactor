@@ -580,14 +580,12 @@
   animation: rs-breathe 1.4s ease-in-out infinite;
 }
 
-.rs-node.has-overlay.is-dim,
-.rs-node.has-overlay:not([class*="is-"]) {
-  opacity: 0.38;
+.rs-node.is-dim {
+  opacity: 0.34;
 }
 
-.rs-node.has-overlay.overlay-heat,
-.rs-node.has-overlay.overlay-sim {
-  opacity: 1;
+.rs-node.is-dim:hover {
+  opacity: 0.8;
 }
 
 .rs-node.is-running {

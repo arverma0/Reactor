@@ -78,6 +78,29 @@ public static class StudioApi
                 ? Results.Ok(new { path = result.Value!.Path, modified = result.Value.Modified })
                 : Results.Json(new { error = result.Error }, statusCode: result.Status);
         });
+        api.MapGet("/pipelines/{id}/source", (string id, PipelineRunManager manager) =>
+        {
+            if (manager.Get(id) is not { } run)
+            {
+                return Results.NotFound(new { error = $"Unknown run '{id}'." });
+            }
+
+            JsonNode? studio = null;
+            var studioPath = Path.Combine(run.CurrentLogsRoot, "studio.json");
+            if (File.Exists(studioPath))
+            {
+                try
+                {
+                    studio = JsonNode.Parse(StudioWorkspace.ReadShared(studioPath));
+                }
+                catch (Exception ex) when (ex is JsonException or IOException)
+                {
+                    studio = null;
+                }
+            }
+
+            return Results.Ok(new { id = run.Id, name = run.Name, dot = run.Source, logs_root = run.CurrentLogsRoot, studio });
+        });
         return app;
     }
 

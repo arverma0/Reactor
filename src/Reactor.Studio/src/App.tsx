@@ -18,6 +18,7 @@ import { newDocument, openFile } from "./state/files";
 import { loadInfo, startSession } from "./state/session";
 import { dismissToast, emptySelection, redo, requestFit, requestLayout, select, setBottomPanel, setLeftPanel, setMode, undo, useStudio, type LeftPanel, type Mode } from "./state/store";
 import { ModeStage } from "./modes/ModeStage";
+import { RunDialog } from "./modes/RunDialog";
 
 const HOTKEYS: Record<string, NodeKind> = { a: "agent", t: "tool", h: "human", r: "router", p: "fanout", j: "join", s: "supervisor" };
 
@@ -364,6 +365,7 @@ export function App() {
           ) : null}
         </div>
         <CommandPalette />
+        <RunDialog />
         <Toasts />
         <TokenDialog />
         {saveAsOpen ? <SaveAsDialog onClose={() => useStudio.setState({ saveAsOpen: false })} /> : null}

@@ -24,7 +24,7 @@ import { addEdge, addNode, findNode, groupChain, handlerOf, kindOf, moveNodes, n
 import { KINDS, LIBRARY_KINDS, type NodeKind } from "../model/handlers";
 import { placeMissing, autoLayout, type Size } from "../model/layout";
 import { attrsForRoute } from "../model/routes";
-import type { StudioDoc } from "../model/types";
+import type { Diagnostic, StudioDoc } from "../model/types";
 import { applyDoc, emptySelection, select, toast, useStudio } from "../state/store";
 import { canvasActions } from "./actions";
 import { buildEdges, buildFrames, buildStageData, buildStageNode, frameAt, type Box, type CanvasOverlay, type NoteData } from "./build";
@@ -61,10 +61,33 @@ function membersDeep(doc: StudioDoc, uid: string): Set<string> {
   return ids;
 }
 
-export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay | null; readOnly?: boolean }) {
-  const doc = useStudio((s) => s.doc);
-  const analysis = useStudio((s) => s.analysis);
-  const selection = useStudio((s) => s.selection);
+export interface CanvasProps {
+  overlay: CanvasOverlay | null;
+  readOnly?: boolean;
+  /** A document to show instead of the design document (run and simulation views); implies read-only. */
+  doc?: StudioDoc;
+  /** Selection for read-only views (the design canvas uses the store's selection). */
+  selectedNode?: string | null;
+  onSelectNode?: (id: string | null) => void;
+}
+
+const EMPTY_DIAGNOSTICS: Diagnostic[] = [];
+const EMPTY_EFFECTIVE = {};
+
+export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, selectedNode, onSelectNode }: CanvasProps) {
+  const designDoc = useStudio((s) => s.doc);
+  const designAnalysis = useStudio((s) => s.analysis);
+  const designSelection = useStudio((s) => s.selection);
+  const external = docProp !== undefined;
+  const doc = docProp ?? designDoc;
+  const readOnly = readOnlyProp || external;
+  const diagnostics = external ? EMPTY_DIAGNOSTICS : designAnalysis.diagnostics;
+  const effective = external ? EMPTY_EFFECTIVE : designAnalysis.effective;
+  const selection = useMemo(
+    () => (external ? { ...emptySelection, nodes: selectedNode ? [selectedNode] : [] } : designSelection),
+    [external, selectedNode, designSelection],
+  );
+  const analysis = useMemo(() => ({ diagnostics, effective }), [diagnostics, effective]);
   const layers = useStudio((s) => s.layers);
   const fitRequest = useStudio((s) => s.fitRequest);
   const fitAllRequest = useStudio((s) => s.fitAllRequest);
@@ -84,6 +107,7 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
     nodesRef.current = next;
     setNodes(next);
   }, []);
+  const smartFitRef = useRef<() => void>(() => undefined);
 
   const stageData = useMemo(() => buildStageData(doc, analysis.diagnostics, analysis.effective, overlay), [doc, analysis.diagnostics, analysis.effective, overlay]);
 
@@ -122,9 +146,21 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
 
   // Safety net: place nodes that have no position (e.g. created by an edit that did not place them).
   useEffect(() => {
+    if (external) return;
     const missing = placeMissing(doc, measuredSizes(nodesRef.current));
     if (missing) useStudio.setState({ doc: moveNodes(doc, missing) });
-  }, [doc]);
+  }, [doc, external]);
+
+  // A different document (another run) re-fits the view.
+  const lastDocName = useRef<string | null>(null);
+  useEffect(() => {
+    if (!external) return;
+    const key = `${doc.name}:${doc.nodes.length}`;
+    if (lastDocName.current === key) return;
+    lastDocName.current = key;
+    const timer = setTimeout(smartFitRef.current, 120);
+    return () => clearTimeout(timer);
+  }, [doc, external]);
 
   const { frames, boxes } = useMemo(() => buildFrames(doc, nodes, frozen.current), [doc, nodes]);
   lastBoxes.current = boxes;
@@ -166,6 +202,7 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
     const centerY = Math.min(...ys) + height / 2;
     rf.setViewport({ x: -(start.position.x - 60) * zoom, y: bounds.height / 2 - centerY * zoom, zoom }, { duration: 380 });
   }, [rf]);
+  smartFitRef.current = smartFit;
 
   useEffect(() => {
     if (fitRequest === 0) return;
@@ -198,6 +235,15 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
   // ---------- changes ----------
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
+      if (external) {
+        let working = nodesRef.current;
+        for (const change of changes) {
+          if (change.type === "dimensions") working = working.map((n) => (n.id === change.id ? { ...n, measured: change.dimensions ?? n.measured } : n));
+          else if (change.type === "select" && change.selected && !change.id.startsWith("frame:")) onSelectNode?.(change.id);
+        }
+        if (working !== nodesRef.current) commitNodes(working);
+        return;
+      }
       const state = useStudio.getState();
       const current = state.doc;
       let nextSelection = state.selection;
@@ -290,10 +336,11 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
         }
       }
     },
-    [commitNodes, readOnly],
+    [commitNodes, readOnly, external, onSelectNode],
   );
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
+    if (external) return;
     let next = useStudio.getState().selection;
     let changed = false;
     for (const change of changes) {
@@ -306,7 +353,7 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
       next = { ...next, edges: [...set], group: null };
     }
     if (changed) select(next);
-  }, []);
+  }, [external]);
 
   const onNodeDragStart = useCallback(() => {
     frozen.current = { ...lastBoxes.current };
@@ -511,12 +558,13 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
         onConnect={onConnect}
         onConnectEnd={onConnectEnd}
         isValidConnection={isValidConnection}
-        onNodeContextMenu={onNodeContextMenu}
-        onEdgeContextMenu={onEdgeContextMenu}
-        onPaneContextMenu={onPaneContextMenu}
+        onNodeContextMenu={external ? undefined : onNodeContextMenu}
+        onEdgeContextMenu={external ? undefined : onEdgeContextMenu}
+        onPaneContextMenu={external ? undefined : onPaneContextMenu}
         onPaneClick={() => {
           setPending(null);
-          select(emptySelection);
+          if (external) onSelectNode?.(null);
+          else select(emptySelection);
         }}
         deleteKeyCode={null}
         snapToGrid
@@ -547,7 +595,7 @@ export function Canvas({ overlay, readOnly = false }: { overlay: CanvasOverlay |
         ) : null}
         <CanvasControls readOnly={readOnly} />
       </ReactFlow>
-      {doc.nodes.length === 0 ? <CanvasEmpty /> : null}
+      {doc.nodes.length === 0 && !external ? <CanvasEmpty /> : null}
       {pending
         ? createPortal(
             <div className="rs-quickadd" style={{ left: pending.screen.x, top: pending.screen.y }}>
