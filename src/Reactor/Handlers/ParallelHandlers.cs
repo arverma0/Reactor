@@ -10,9 +10,11 @@ namespace Reactor.Handlers;
 /// <summary>
 /// Parallel fan-out (spec 4.8): runs every outgoing branch concurrently (bounded by <c>max_parallel</c>, default 4), each
 /// on an isolated clone of the context, until each branch reaches a join point (fan-in node, exit, or dead end).
-/// Results are stored in <c>parallel.results</c>; branch context changes are not merged back. The engine then continues at
-/// the branches' common join node. Join policies: <c>wait_all</c> (default; SUCCESS when no branch failed, else
-/// PARTIAL_SUCCESS) and <c>first_success</c> (SUCCESS as soon as one branch succeeds; the rest are cancelled).
+/// Results are stored in <c>parallel.results</c>; branch context changes are not merged back, except artifact records
+/// (<c>artifacts.*</c>, a Reactor extension; see <see cref="StageArtifacts.MergeBranchRecords"/>), which are merged in branch
+/// declaration order from every branch that ran, failed ones included. The engine then continues at the branches' common
+/// join node. Join policies: <c>wait_all</c> (default; SUCCESS when no branch failed, else PARTIAL_SUCCESS) and
+/// <c>first_success</c> (SUCCESS as soon as one branch succeeds; the rest are cancelled and contribute no artifacts).
 /// </summary>
 public sealed class ParallelHandler : INodeHandler
 {
@@ -36,6 +38,7 @@ public sealed class ParallelHandler : INodeHandler
         }
 
         var maxParallel = Math.Max(1, AttributeValues.ParseInt(node[AttrKeys.MaxParallel]) ?? run.RunnerOptions.DefaultMaxParallel);
+        var forkValues = context.Snapshot();
         var stopwatch = Stopwatch.StartNew();
         run.Events.Emit(new ParallelStarted(node.Id, branches.Count));
 
@@ -105,6 +108,12 @@ public sealed class ParallelHandler : INodeHandler
             ["parallel.join_node"] = join ?? "",
             ["parallel.source_node"] = node.Id,
         };
+
+        // Reactor extension: artifact records are the one part of branch contexts merged back (in branch declaration order).
+        foreach (var (key, value) in StageArtifacts.MergeBranchRecords(forkValues, results.Select(r => r.Context)))
+        {
+            updates[key] = value;
+        }
 
         var summary = Summarize(results);
         Outcome outcome = joinPolicy switch

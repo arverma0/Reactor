@@ -8,7 +8,7 @@ namespace Reactor.Server.Studio;
 /// <summary>
 /// Describes a parsed graph for the Studio: everything needed to rebuild the document losslessly (attributes, explicit keys,
 /// default blocks, subgraphs) plus derived information (handler types, classes, the effective model settings and which
-/// stylesheet rule supplied them).
+/// stylesheet rule supplied them, and parsed artifact pins).
 /// </summary>
 public static class StudioGraphJson
 {
@@ -38,6 +38,7 @@ public static class StudioGraphJson
                 ["subgraph"] = innermost.TryGetValue(node.Id, out var index) ? index : null,
                 ["handler"] = HandlerTypes.Resolve(node),
                 ["effective"] = Effective(node, stylesheet),
+                ["pins"] = Pins(node),
             });
         }
 
@@ -104,6 +105,24 @@ public static class StudioGraphJson
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// A node's declared artifact pins (Reactor extension): <c>inputs</c> (names) and <c>outputs</c> (<c>name</c>,
+    /// <c>kind</c> = <c>file</c>/<c>text</c>, and the normalized <c>path</c> of a file). Malformed entries are left out;
+    /// the <c>artifact_syntax</c> diagnostics report them.
+    /// </summary>
+    public static JsonObject Pins(Node node)
+    {
+        ArgumentNullException.ThrowIfNull(node);
+        var declared = ArtifactPins.Parse(node);
+        return new JsonObject
+        {
+            ["inputs"] = new JsonArray(declared.Inputs.Select(name => (JsonNode?)name).ToArray()),
+            ["outputs"] = new JsonArray(declared.Outputs
+                .Select(pin => (JsonNode?)new JsonObject { ["name"] = pin.Name, ["kind"] = pin.KindName, ["path"] = pin.Path })
+                .ToArray()),
+        };
     }
 
     /// <summary>Validation diagnostics in the API's wire format.</summary>

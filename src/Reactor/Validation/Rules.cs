@@ -1,6 +1,7 @@
 using Reactor.Conditions;
 using Reactor.Execution;
 using Reactor.Graphs;
+using Reactor.Handlers;
 using Reactor.Stylesheets;
 
 namespace Reactor.Validation;
@@ -520,6 +521,181 @@ public sealed class ManagerLoopChildRule : ILintRule
                     NodeId = node.Id,
                 };
             }
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_syntax</c> (ERROR, Reactor extension): <c>inputs</c>/<c>outputs</c> entries must be well formed — identifier
+/// names, no duplicates, and output paths that are non-empty, relative, and inside the working directory.
+/// </summary>
+public sealed class ArtifactSyntaxRule : ILintRule
+{
+    public string Name => "artifact_syntax";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        foreach (var node in graph.Nodes.Values)
+        {
+            foreach (var error in ArtifactPins.Parse(node).Errors)
+            {
+                yield return new Diagnostic(Name, Severity.Error, error.Message) { NodeId = node.Id, Fix = error.Fix };
+            }
+        }
+    }
+}
+
+/// <summary><c>artifact_inputs</c> (WARNING, Reactor extension): every declared input should be an output of some stage.</summary>
+public sealed class ArtifactInputsRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_inputs";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        var producers = ArtifactFlow.Producers(graph, _types);
+        foreach (var (node, input) in ArtifactFlow.Consumed(graph, _types))
+        {
+            if (!producers.ContainsKey(input))
+            {
+                yield return new Diagnostic(Name, Severity.Warning, $"Input '{input}' is not produced by any stage, so it is never available.")
+                {
+                    NodeId = node.Id,
+                    Fix = $"Add outputs=\"{input}:…\" to the stage that produces it (or outputs=\"{input}\" for a text artifact).",
+                };
+            }
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_order</c> (WARNING, Reactor extension): some producer of each input must be able to run before the
+/// consuming stage. Records made inside parallel branches are merged back at the join, so plain reachability applies.
+/// </summary>
+public sealed class ArtifactOrderRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_order";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        var producers = ArtifactFlow.Producers(graph, _types);
+        var flow = new ArtifactFlow(graph);
+        foreach (var (node, input) in ArtifactFlow.Consumed(graph, _types))
+        {
+            if (!producers.TryGetValue(input, out var ids) || ids.Any(p => flow.Reaches(p, node.Id)))
+            {
+                continue;
+            }
+
+            yield return new Diagnostic(Name, Severity.Warning,
+                $"Input '{input}' is produced only by {string.Join(", ", ids.Select(id => $"'{id}'"))}, which cannot run before this stage, so it is never available.")
+            {
+                NodeId = node.Id,
+                Fix = "Produce it in an earlier stage, or reorder the stages.",
+            };
+        }
+    }
+}
+
+/// <summary>
+/// <c>artifact_handlers</c> (WARNING, Reactor extension): only codergen and tool stages consume and produce artifacts;
+/// <c>inputs</c>/<c>outputs</c> on other node types are ignored.
+/// </summary>
+public sealed class ArtifactHandlersRule(IEnumerable<string>? knownTypes = null) : ILintRule
+{
+    private readonly ArtifactFlow.Types _types = new(knownTypes);
+
+    public string Name => "artifact_handlers";
+
+    public IEnumerable<Diagnostic> Apply(Graph graph)
+    {
+        foreach (var node in graph.Nodes.Values)
+        {
+            var type = _types.Of(node);
+            if (!ArtifactPins.Declares(node) || ArtifactPins.IsSupportedHandlerType(type))
+            {
+                continue;
+            }
+
+            var attributes = new[] { AttrKeys.Inputs, AttrKeys.Outputs }.Where(k => !string.IsNullOrWhiteSpace(node[k])).ToList();
+            yield return new Diagnostic(Name, Severity.Warning,
+                $"{string.Join(" and ", attributes)} {(attributes.Count > 1 ? "are" : "is")} ignored on {type} nodes; only codergen and tool stages consume and produce artifacts.")
+            {
+                NodeId = node.Id,
+                Fix = "Declare artifacts on a codergen (box) or tool (parallelogram) stage.",
+            };
+        }
+    }
+}
+
+/// <summary>How artifact records flow through a graph (shared by the artifact lint rules).</summary>
+internal sealed class ArtifactFlow(Graph graph)
+{
+    private readonly Dictionary<string, HashSet<string>> _reach = new(StringComparer.Ordinal);
+
+    /// <summary>Artifact name → ids of the stages that produce it (stages whose handler supports artifacts).</summary>
+    public static Dictionary<string, List<string>> Producers(Graph graph, Types types)
+    {
+        var producers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes.Values.Where(n => ArtifactPins.IsSupportedHandlerType(types.Of(n))))
+        {
+            foreach (var pin in ArtifactPins.Parse(node).Outputs)
+            {
+                if (!producers.TryGetValue(pin.Name, out var ids))
+                {
+                    producers[pin.Name] = ids = [];
+                }
+
+                ids.Add(node.Id);
+            }
+        }
+
+        return producers;
+    }
+
+    /// <summary>Every (stage, input) pair for stages whose handler supports artifacts.</summary>
+    public static IEnumerable<(Node Node, string Input)> Consumed(Graph graph, Types types) =>
+        graph.Nodes.Values
+            .Where(n => ArtifactPins.IsSupportedHandlerType(types.Of(n)))
+            .SelectMany(n => ArtifactPins.Parse(n).Inputs.Select(input => (n, input)));
+
+    /// <summary>
+    /// True when <paramref name="to"/> can run after <paramref name="from"/> (a path of at least one edge), so a record made
+    /// by <paramref name="from"/> can be in the context then. Parallel branches merge their records back at the join.
+    /// </summary>
+    public bool Reaches(string from, string to)
+    {
+        if (!_reach.TryGetValue(from, out var reach))
+        {
+            reach = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var edge in graph.OutgoingEdges(from))
+            {
+                reach.UnionWith(ReachabilityRule.Reachable(graph, edge.To));
+            }
+
+            _reach[from] = reach;
+        }
+
+        return reach.Contains(to);
+    }
+
+    /// <summary>Resolves the handler type a node runs with, as <see cref="HandlerRegistry.TryResolve"/> does.</summary>
+    internal sealed class Types(IEnumerable<string>? knownTypes)
+    {
+        private readonly HashSet<string> _known = new(knownTypes ?? HandlerTypes.BuiltIn, StringComparer.Ordinal);
+
+        public string Of(Node node)
+        {
+            if (node.Type.Length > 0 && _known.Contains(node.Type))
+            {
+                return node.Type;
+            }
+
+            var shapeType = HandlerRegistry.ShapeType(node);
+            return _known.Contains(shapeType) ? shapeType : HandlerTypes.Codergen;
         }
     }
 }

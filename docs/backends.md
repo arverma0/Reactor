@@ -130,7 +130,8 @@ prompt on stdin (or `--permission-mode acceptEdits` with `SkipPermissions = fals
 ## `simulate`
 
 No backend: codergen stages succeed with `[Simulated] Response for stage: <id>`. Human gates, tool nodes, parallel
-branches, and manager loops still run, so this is the quickest way to check a pipeline's routing.
+branches, and manager loops still run, so this is the quickest way to check a pipeline's routing. Simulated stages
+write no files, so their declared file `outputs` are recorded without the existence check.
 
 ## Writing your own
 

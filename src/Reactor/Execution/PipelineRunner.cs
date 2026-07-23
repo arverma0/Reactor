@@ -608,6 +608,12 @@ public sealed class PipelineRunner
             context.ApplyUpdates(outcome.ContextUpdates);
             context.Set("outcome", outcome.Status.ToWire());
 
+            // Artifact records are announced only once they are part of the context (never for retried attempts).
+            foreach (var artifact in outcome.Artifacts)
+            {
+                Emit(new ArtifactProduced(node.Id, artifact.Name, artifact.Kind, artifact.Path, artifact.Bytes, artifact.Version, artifact.Sha256));
+            }
+
             // Always refresh (clearing stale values) so pass-through routing nodes see the latest stage's routing data.
             context.Set("preferred_label", outcome.PreferredLabel);
             context.Set("failure_reason", outcome.FailureReason);

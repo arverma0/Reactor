@@ -9,7 +9,7 @@ validated against real agents.
 | DoD section | Implementation | Tests (`tests/Reactor.Tests`) |
 |---|---|---|
 | 11.1 DOT parsing | `Graphs/DotParser.cs` | `Graphs.DotParserTests` (linear, graph attrs, multi-line blocks, chained edges, defaults, subgraphs, classes, quoting, comments, errors with line/column) |
-| 11.2 Validation | `Validation/PipelineValidator.cs`, `Rules.cs` (19 rules) | `Graphs.ValidationTests` |
+| 11.2 Validation | `Validation/PipelineValidator.cs`, `Rules.cs` (23 rules, 4 of them for Reactor's artifact pins) | `Graphs.ValidationTests`, `Graphs.ArtifactValidationTests` |
 | 11.3 Execution engine | `Execution/PipelineRunner.cs`, `EdgeSelector.cs` | `Engine.EngineTests`, `Engine.EdgeSelectionTests` |
 | 11.4 Goal gates | `PipelineRunner` terminal check | `EngineTests.Goal_gate_*` |
 | 11.5 Retry logic | `NodeRetryPolicy.cs` (presets, backoff + jitter, `Retryable` classification) | `EngineTests.Retries_*`, `Retry_exhaustion_*`, `StateTests.Backoff_*`, `Retry_policy_presets_*` |
@@ -75,7 +75,9 @@ validated against real agents.
   `loop_restart` starts new ones); a stage whose thread session was lost (timeout, eviction, parallel fork) gets a
   `summary:high` preamble rather than starting blind.
 - *Parallel*: branches run on cloned contexts until they reach a fan-in, the exit, or a dead end; the parallel
-  outcome always jumps to the join (fan-in decides how to treat failures); `first_success` cancels the rest.
+  outcome always jumps to the join (fan-in decides how to treat failures); `first_success` cancels the rest. Branch
+  context changes are not merged back, except Reactor's artifact records (`artifacts.*`), which are merged in branch
+  declaration order.
 - *Human gates*: `human.timeout` (else the node timeout) and `human.default_choice` (matched against target id,
   accelerator key, or label); `human.input="freeform"` stores text in `human.gate.text`.
 - *Codergen*: non-`full` fidelity prepends a context preamble; agent backends get the status-file protocol appended;
@@ -105,6 +107,14 @@ validated against real agents.
 **Additions beyond the specs**
 
 - Backends for the GitHub Copilot SDK, the Copilot CLI, and Claude Code; a per-node `backend` attribute and router.
+- Artifact pins: `inputs`/`outputs` node attributes declare the artifacts a codergen or tool stage reads and produces
+  (text, or files relative to the working directory). Prompts list them, a successful stage that did not write a
+  declared file fails (and is retried and routed like any failure), produced artifacts are recorded as versioned
+  `artifacts.<name>` context values with an `ArtifactProduced` event, and four lint rules (`artifact_syntax`,
+  `artifact_inputs`, `artifact_order`, `artifact_handlers`) check the wiring. Failing tool stages still record their
+  stdout (a failing test report reaches the fixer), and artifact records made in parallel branches are merged back
+  into the parent context at the join, in branch declaration order. See
+  [pipelines.md](pipelines.md#artifacts-reactor-extension). (Unrelated to the spec's `ArtifactStore`.)
 - A default budget of 500 (CLI) / 1000 (server) stage executions per run against runaway loops, and 200 tool rounds
   per stage on the `agent` backend (the session-level default stays unlimited, as specified).
 - Copilot model verification against the account's model list (the runtime otherwise substitutes models silently).
