@@ -89,13 +89,40 @@ public static partial class MonteCarloSimulator
         var results = new SampleResult[options.Runs];
         var parallel = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, options.Parallelism), CancellationToken = cancellationToken };
         await Parallel.ForEachAsync(Enumerable.Range(0, options.Runs), parallel, async (index, token) =>
-            results[index] = await SampleRunner.RunAsync(graph, scenario, seed, index, options, keepEvents: false, token).ConfigureAwait(false)).ConfigureAwait(false);
+            results[index] = await SampleRunner.RunAsync(graph, scenario, seed, index, options, SampleDetail.Summary, token).ConfigureAwait(false)).ConfigureAwait(false);
+
+        // Samples keep no paths (they can be long); replaying the few notable ones is cheap and exact.
+        async Task<SimulationSampleSummary> SummarizeAsync(SampleResult result)
+        {
+            var replay = await SampleRunner.RunAsync(graph, scenario, seed, result.RunIndex, options, SampleDetail.Path, cancellationToken).ConfigureAwait(false);
+            return new SimulationSampleSummary(seed, result.RunIndex, result.Status, result.Kind, result.FailureReason, result.Steps, replay.Path);
+        }
+
+        var steps = results.Select(r => r.Steps).Order().ToArray();
+        var median = Percentile(steps, 0.5);
+        var firstFailure = results.Where(r => r.Kind != SimulationOutcomeKinds.Success).MinBy(r => r.RunIndex);
+        var longest = results.OrderByDescending(r => r.Steps).ThenBy(r => r.RunIndex).First();
+        var typical = results.OrderBy(r => Math.Abs(r.Steps - median)).ThenBy(r => r.RunIndex).First();
+        var samples = new NotableSamples(
+            firstFailure is null ? null : await SummarizeAsync(firstFailure).ConfigureAwait(false),
+            await SummarizeAsync(longest).ConfigureAwait(false),
+            await SummarizeAsync(typical).ConfigureAwait(false));
         stopwatch.Stop();
 
-        return Aggregate(graph, scenario, seed, options, results, stopwatch.Elapsed);
+        return Aggregate(graph, scenario, seed, options, results, steps, samples, stopwatch.Elapsed);
     }
 
-    private static SimulationReport Aggregate(Graph graph, SimulationScenario scenario, long seed, MonteCarloOptions options, SampleResult[] results, TimeSpan elapsed)
+    private sealed record NotableSamples(SimulationSampleSummary? FirstFailure, SimulationSampleSummary Longest, SimulationSampleSummary Typical);
+
+    private static SimulationReport Aggregate(
+        Graph graph,
+        SimulationScenario scenario,
+        long seed,
+        MonteCarloOptions options,
+        SampleResult[] results,
+        int[] steps,
+        NotableSamples samples,
+        TimeSpan elapsed)
     {
         var runs = results.Length;
         var outcomes = SimulationOutcomeKinds.All.ToDictionary(k => k, _ => 0, StringComparer.Ordinal);
@@ -105,7 +132,6 @@ public static partial class MonteCarloSimulator
         }
 
         var successes = outcomes[SimulationOutcomeKinds.Success];
-        var steps = results.Select(r => r.Steps).Order().ToArray();
         var durations = results.Select(r => r.SimulatedDurationMs).Order().ToArray();
 
         var nodeIds = graph.Nodes.Keys.Concat(results.SelectMany(r => r.Nodes.Keys)).Distinct(StringComparer.Ordinal).ToList();
@@ -164,10 +190,6 @@ public static partial class MonteCarloSimulator
             .ThenBy(f => f.Reason, StringComparer.Ordinal)
             .ToList();
 
-        var median = Percentile(steps, 0.5);
-        SimulationSampleSummary Summary(SampleResult r) => new(seed, r.RunIndex, r.Status, r.Kind, r.FailureReason, r.Steps, r.Path);
-        var firstFailure = results.Where(r => r.Kind != SimulationOutcomeKinds.Success).MinBy(r => r.RunIndex);
-
         return new SimulationReport
         {
             Runs = runs,
@@ -182,9 +204,9 @@ public static partial class MonteCarloSimulator
             Nodes = nodes,
             Edges = edges,
             Failures = failures,
-            FirstFailure = firstFailure is null ? null : Summary(firstFailure),
-            Longest = Summary(results.OrderByDescending(r => r.Steps).ThenBy(r => r.RunIndex).First()),
-            Typical = Summary(results.OrderBy(r => Math.Abs(r.Steps - median)).ThenBy(r => r.RunIndex).First()),
+            FirstFailure = samples.FirstFailure,
+            Longest = samples.Longest,
+            Typical = samples.Typical,
             Warnings = scenario.Check(graph, options.CustomHandlerTypes),
         };
     }
@@ -275,7 +297,7 @@ public sealed record SimulationTrace
         options ??= new MonteCarloOptions();
         options.Validate(checkRuns: false);
         SampleRunner.EnsureValid(graph, scenario, options);
-        var result = await SampleRunner.RunAsync(graph, scenario, seed, runIndex, options, keepEvents: true, cancellationToken).ConfigureAwait(false);
+        var result = await SampleRunner.RunAsync(graph, scenario, seed, runIndex, options, SampleDetail.Events, cancellationToken).ConfigureAwait(false);
         return new SimulationTrace
         {
             Seed = seed,
@@ -322,6 +344,19 @@ internal sealed class NodeTally
 
 internal readonly record struct EdgeKey(string From, string To, string Kind, string Label);
 
+/// <summary>How much of a sample to keep beyond its statistics.</summary>
+internal enum SampleDetail
+{
+    /// <summary>Statistics and the last node only (Monte Carlo samples).</summary>
+    Summary,
+
+    /// <summary>Plus the path (notable samples).</summary>
+    Path,
+
+    /// <summary>Plus the path and every event (traces).</summary>
+    Events,
+}
+
 /// <summary>What one sample did, derived from its events.</summary>
 internal sealed class SampleResult
 {
@@ -335,7 +370,8 @@ internal sealed class SampleResult
 
     public required int Steps { get; init; }
 
-    public required IReadOnlyList<string> Path { get; init; }
+    /// <summary>The last node of the path (kept even when the path is not).</summary>
+    public required string? LastNode { get; init; }
 
     public required Dictionary<string, NodeTally> Nodes { get; init; }
 
@@ -343,9 +379,9 @@ internal sealed class SampleResult
 
     public required long SimulatedDurationMs { get; init; }
 
-    public IReadOnlyList<PipelineEvent> Events { get; init; } = [];
+    public IReadOnlyList<string> Path { get; init; } = [];
 
-    public string? LastNode => Path.Count > 0 ? Path[^1] : null;
+    public IReadOnlyList<PipelineEvent> Events { get; init; } = [];
 }
 
 /// <summary>Executes one sample through the engine and analyzes its events.</summary>
@@ -369,7 +405,7 @@ internal static class SampleRunner
         long seed,
         int runIndex,
         MonteCarloOptions options,
-        bool keepEvents,
+        SampleDetail detail,
         CancellationToken cancellationToken)
     {
         var sample = new SimulationSample(scenario, seed, runIndex);
@@ -419,7 +455,7 @@ internal static class SampleRunner
             snapshot = [.. events];
         }
 
-        return Analyze(graph, sample, snapshot, result, error, keepEvents);
+        return Analyze(graph, sample, snapshot, result, error, detail);
     }
 
     /// <summary>
@@ -428,7 +464,7 @@ internal static class SampleRunner
     /// sections are expanded from the recorded branch results, in branch order, so the path does not depend on how the
     /// branches were scheduled.
     /// </summary>
-    internal static SampleResult Analyze(Graph graph, SimulationSample sample, IReadOnlyList<PipelineEvent> events, PipelineResult? result, Exception? error, bool keepEvents)
+    internal static SampleResult Analyze(Graph graph, SimulationSample sample, IReadOnlyList<PipelineEvent> events, PipelineResult? result, Exception? error, SampleDetail detail)
     {
         var nodes = new Dictionary<string, NodeTally>(StringComparer.Ordinal);
         var edges = new Dictionary<EdgeKey, int>();
@@ -546,11 +582,12 @@ internal static class SampleRunner
             Kind = kind,
             FailureReason = error is not null ? error.GetBaseException().Message : result?.FailureReason ?? "",
             Steps = steps,
-            Path = path,
+            LastNode = path.Count > 0 ? path[^1] : null,
             Nodes = nodes,
             Edges = edges,
             SimulatedDurationMs = sample.SimulatedTimeMs,
-            Events = keepEvents ? events : [],
+            Path = detail >= SampleDetail.Path ? path : [],
+            Events = detail >= SampleDetail.Events ? events : [],
         };
     }
 

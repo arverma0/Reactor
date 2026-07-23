@@ -81,6 +81,7 @@ public static class ReactorServer
         app.MapGet("/console", () => Asset("index.html", "text/html; charset=utf-8"));
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
         app.MapStudioApi();
+        app.MapSimulationApi();
 
         app.MapPost("/pipelines", StartAsync);
         app.MapPost("/run", StartAsync);
@@ -164,6 +165,9 @@ public static class ReactorServer
             status = run.Status,
             name = run.Name,
             logs_root = run.LogsRoot,
+            simulated = run.Simulation is null ? (bool?)null : true,
+            simulation_mode = run.Simulation?.ModeName,
+            simulation_seed = run.Simulation?.Seed,
             diagnostics = result.Diagnostics.Select(DiagnosticDto.From),
             links = Links(run),
         });
@@ -445,12 +449,34 @@ public static class ReactorServer
         }
 
         var workingDirectory = json["working_directory"] is JsonValue wd && wd.TryGetValue<string>(out var dir) ? dir : null;
+
+        // "simulation": {...}; true and "stochastic"/"interactive" are shorthands. Anything else is rejected rather than
+        // ignored, so a malformed simulation request can never start a real run.
+        JsonObject? simulation;
+        switch (json["simulation"])
+        {
+            case null:
+                simulation = null;
+                break;
+            case JsonObject settings:
+                simulation = settings;
+                break;
+            case JsonValue flag when flag.GetValueKind() is JsonValueKind.True or JsonValueKind.False:
+                simulation = flag.GetValueKind() == JsonValueKind.True ? new JsonObject() : null;
+                break;
+            case JsonValue mode when mode.GetValueKind() == JsonValueKind.String:
+                simulation = new JsonObject { ["mode"] = mode.GetValue<string>() };
+                break;
+            default:
+                return (null, "'simulation' must be an object such as {\"mode\": \"stochastic\", \"scenario\": {...}}.");
+        }
+
         return (new StartRequest
         {
             Dot = dot,
             Context = context,
             WorkingDirectory = workingDirectory,
-            Simulation = json["simulation"] as JsonObject,
+            Simulation = simulation,
             Studio = json["studio"] as JsonObject,
         }, null);
     }
@@ -471,6 +497,8 @@ public static class ReactorServer
         started_at = run.StartedAt,
         finished_at = run.FinishedAt,
         pending_questions = run.Interviewer.Pending.Count,
+        simulated = run.Simulation is null ? (bool?)null : true,
+        simulation_mode = run.Simulation?.ModeName,
     };
 
     private static object Detail(ManagedRun run)
@@ -505,6 +533,9 @@ public static class ReactorServer
                     completed_nodes = result.CompletedNodes,
                 }
                 : null,
+            simulated = run.Simulation is null ? (bool?)null : true,
+            simulation_mode = run.Simulation?.ModeName,
+            simulation_seed = run.Simulation?.Seed,
             links = Links(run),
         };
     }

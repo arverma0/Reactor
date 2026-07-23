@@ -77,29 +77,36 @@ public sealed class InMemoryRunTests
         Assert.Empty(Directory.EnumerateFileSystemEntries(dir.Path));
     }
 
-    [Fact]
-    public async Task Event_logs_and_handler_written_status_files_still_work_in_memory()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Handler_written_status_files_are_read_once_per_attempt(bool persist)
     {
         const string source = """
             digraph S {
                 start [shape=Mdiamond] exit [shape=Msquare]
-                agent [type="file.writer"]
-                start -> agent
-                agent -> exit [condition="outcome=success"]
+                agent [type="file.writer", max_retries=1, auto_status=true]
+                start -> agent -> exit
             }
             """;
         using var dir = new TempDir();
-        var runner = new PipelineRunner(new PipelineRunnerOptions { PersistRunState = false, WriteEventLog = true, LogsBaseDirectory = dir.Path });
-        runner.RegisterHandler("file.writer", new StatusFileWriter());
+        var runner = new PipelineRunner(new PipelineRunnerOptions { PersistRunState = persist, WriteEventLog = true, LogsBaseDirectory = dir.Path });
+        var writer = new StatusFileWriter();
+        runner.RegisterHandler("file.writer", writer);
+        var events = new List<PipelineEvent>();
 
-        var result = await runner.RunAsync(source, TestPipelines.Options(dir, "run"), TestContext.Current.CancellationToken);
+        var result = await runner.RunAsync(source, TestPipelines.Options(dir, "run") with { OnEvent = events.Add }, TestContext.Current.CancellationToken);
 
-        Assert.Equal(StageStatus.Fail, result.Status);
-        Assert.Equal("written by the handler", result.NodeOutcomes["agent"].FailureReason);
+        // Attempt 1 reports failure through status.json; attempt 2 writes nothing, so auto_status applies (no stale read).
+        Assert.Equal(2, writer.Calls);
+        Assert.Equal("written by the handler", events.OfType<StageFailed>().Single(e => e.NodeId == "agent").Error);
+        Assert.Equal(StageStatus.Success, result.NodeOutcomes["agent"].Status);
+        Assert.Equal(StageStatus.Success, result.Status);
         Assert.True(File.Exists(Path.Combine(result.LogsRoot, "events.jsonl")));
-        Assert.False(File.Exists(Path.Combine(result.LogsRoot, "checkpoint.json")));
-        Assert.False(File.Exists(Path.Combine(result.LogsRoot, "result.json")));
-        Assert.False(File.Exists(Path.Combine(result.LogsRoot, "graph.dot")));
+        Assert.Equal(persist, File.Exists(Path.Combine(result.LogsRoot, "checkpoint.json")));
+        Assert.Equal(persist, File.Exists(Path.Combine(result.LogsRoot, "result.json")));
+        Assert.Equal(persist, File.Exists(Path.Combine(result.LogsRoot, "graph.dot")));
+        Assert.Equal(persist, File.Exists(Path.Combine(result.LogsRoot, "agent", "status.json")));
     }
 
     private static PipelineRunner Runner(bool persist)
@@ -137,14 +144,20 @@ public sealed class InMemoryRunTests
         }
     }
 
-    /// <summary>Reports its outcome the way agents do: by writing status.json and returning null.</summary>
+    /// <summary>Reports a failure the way agents do (status.json, no returned outcome) on its first call only.</summary>
     private sealed class StatusFileWriter : INodeHandler
     {
+        public int Calls;
+
         public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
         {
-            var stageDir = Path.Combine(logsRoot, node.Id);
-            Directory.CreateDirectory(stageDir);
-            await File.WriteAllTextAsync(Path.Combine(stageDir, "status.json"), """{"outcome": "fail", "failure_reason": "written by the handler"}""", cancellationToken);
+            if (Interlocked.Increment(ref Calls) == 1)
+            {
+                var stageDir = Path.Combine(logsRoot, node.Id);
+                Directory.CreateDirectory(stageDir);
+                await File.WriteAllTextAsync(Path.Combine(stageDir, "status.json"), """{"outcome": "fail", "failure_reason": "written by the handler"}""", cancellationToken);
+            }
+
             return null;
         }
     }

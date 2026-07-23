@@ -465,7 +465,10 @@ public sealed class PipelineRunner
             {
                 SetRetryCount(node.Id, attempt - 1, context);
                 Emit(new StageStarted(node.Id, node.Label, index, handlerType, attempt));
-                DeleteFile(Path.Combine(stageDir, "status.json"));
+                if (Persist)
+                {
+                    DeleteFile(Path.Combine(stageDir, "status.json"));
+                }
 
                 var stopwatch = Stopwatch.StartNew();
                 Outcome? outcome = null;
@@ -581,6 +584,14 @@ public sealed class PipelineRunner
                 catch (Exception ex) when (ex is JsonException or FormatException or IOException)
                 {
                     return Outcome.Fail($"Invalid status.json written for stage '{node.Id}': {ex.Message}");
+                }
+                finally
+                {
+                    // In-memory runs skip the per-attempt cleanup, so consume the file: a later attempt must not read it again.
+                    if (!Persist)
+                    {
+                        TryDeleteFile(path);
+                    }
                 }
             }
 
@@ -1127,6 +1138,18 @@ public sealed class PipelineRunner
             if (File.Exists(path))
             {
                 File.Delete(path);
+            }
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: the handler may still hold the file open.
             }
         }
 

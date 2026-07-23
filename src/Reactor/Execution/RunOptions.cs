@@ -61,10 +61,11 @@ public sealed record PipelineRunnerOptions
 
     /// <summary>
     /// Write the run directory (default true): <c>graph.dot</c>, <c>manifest.json</c>, a directory with <c>status.json</c> per
-    /// stage, <c>checkpoint.json</c> after every stage, and <c>result.json</c>. When false the engine keeps the run in memory:
-    /// it writes none of these files and emits no <see cref="Events.CheckpointSaved"/> events, so the run cannot be resumed.
-    /// Handlers may still write their own files, and <see cref="WriteEventLog"/> still applies. Meant for throwaway runs such
-    /// as simulation samples.
+    /// stage, <c>checkpoint.json</c> after every stage, and <c>result.json</c>. When false the engine keeps the run in memory
+    /// and does no file I/O of its own: it writes none of these files, emits no <see cref="Events.CheckpointSaved"/> events
+    /// (so the run cannot be resumed), and a <c>status.json</c> written by a handler that returns no outcome is read and then
+    /// removed. Handlers may still write their own files, and <see cref="WriteEventLog"/> still applies. Meant for throwaway
+    /// runs such as simulation samples.
     /// </summary>
     public bool PersistRunState { get; init; } = true;
 

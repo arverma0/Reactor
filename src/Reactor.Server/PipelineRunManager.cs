@@ -150,6 +150,9 @@ public sealed class ManagedRun
 
     public IReadOnlyDictionary<string, object?>? InitialContext { get; }
 
+    /// <summary>Simulation settings when the run was started with a <c>"simulation"</c> object; null for real runs.</summary>
+    public RunSimulation? Simulation { get; internal init; }
+
     public WebInterviewer Interviewer { get; } = new();
 
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
@@ -411,6 +414,9 @@ public sealed class PipelineRunManager : IAsyncDisposable
 
     public ReactorServerOptions Options => _options;
 
+    /// <summary>Where simulated runs' directories go (<c>{working directory}/.reactor/simulations</c>), apart from real runs.</summary>
+    public string SimulationsDirectory => Path.Combine(Path.GetFullPath(_options.WorkingDirectory), ".reactor", "simulations");
+
     /// <summary>All runs, newest first.</summary>
     public IReadOnlyList<ManagedRun> Runs => _runs.Values.OrderByDescending(r => r.CreatedAt).ToList();
 
@@ -435,6 +441,12 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, prepared.Diagnostics, "The pipeline has validation errors.");
         }
 
+        RunSimulation? simulation = null;
+        if (request.Simulation is { } simulationJson && !RunSimulation.TryParse(simulationJson, out simulation, out var simulationErrors))
+        {
+            return new StartResult(null, simulationErrors, "The simulation settings are invalid.");
+        }
+
         string workingDirectory;
         if (!string.IsNullOrWhiteSpace(request.WorkingDirectory))
         {
@@ -455,10 +467,16 @@ public sealed class PipelineRunManager : IAsyncDisposable
         }
 
         var id = Guid.NewGuid().ToString("N")[..12];
-        var logsRoot = Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}-{id}");
-        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun));
+        var baseDirectory = simulation is null ? ResolveBase(_options) : SimulationsDirectory;
+        var logsRoot = Path.Combine(baseDirectory, $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}-{id}");
+        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun))
+        {
+            Simulation = simulation,
+        };
         _runs[id] = run;
-        run.Execution = ExecuteAsync(run, (options, ct) => Runner.RunAsync(prepared.Graph, options, ct));
+        run.Execution = simulation is { } simulated
+            ? ExecuteAsync(run, (options, ct) => CreateSimulationRunner(simulated).RunAsync(prepared.Graph, simulated.Apply(options, prepared.Graph), ct))
+            : ExecuteAsync(run, (options, ct) => Runner.RunAsync(prepared.Graph, options, ct));
         return new StartResult(run, prepared.Diagnostics, null);
     }
 
@@ -493,9 +511,15 @@ public sealed class PipelineRunManager : IAsyncDisposable
         }
 
         var logsRoot = run.CurrentLogsRoot;
-        run.Execution = ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options with { LogsRoot = logsRoot }, ct));
+        run.Execution = run.Simulation is { } simulation
+            ? ExecuteAsync(run, (options, ct) => CreateSimulationRunner(simulation).ResumeAsync(logsRoot, simulation.Apply(options with { LogsRoot = logsRoot }, run.Graph), ct))
+            : ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options with { LogsRoot = logsRoot }, ct));
         return new StartResult(run, [], null);
     }
+
+    /// <summary>Handler types registered on <see cref="Runner"/> beyond the built-in ones (simulated like codergen stages).</summary>
+    public IReadOnlyList<string> CustomHandlerTypes() =>
+        Runner.Handlers.Types.Where(t => !HandlerTypes.BuiltIn.Contains(t)).Order(StringComparer.Ordinal).ToList();
 
     /// <summary>Cancels active runs and waits (up to 30 s) for them to stop. The backend is owned by the caller.</summary>
     public async ValueTask DisposeAsync()
@@ -580,6 +604,26 @@ public sealed class PipelineRunManager : IAsyncDisposable
         result.Status is StageStatus.Success or StageStatus.PartialSuccess || string.IsNullOrWhiteSpace(result.FinalOutcome.FailureReason)
             ? null
             : result.FinalOutcome.FailureReason;
+
+    /// <summary>
+    /// A runner like <see cref="Runner"/> (options, transforms, lint rules, custom handler types) whose stages are simulated;
+    /// one per execution, because simulated handlers carry the run's draws.
+    /// </summary>
+    private PipelineRunner CreateSimulationRunner(RunSimulation simulation)
+    {
+        var runner = simulation.Sample.CreateRunner(Runner.Options with { LogsBaseDirectory = SimulationsDirectory }, CustomHandlerTypes());
+        foreach (var transform in Runner.Transforms)
+        {
+            runner.RegisterTransform(transform);
+        }
+
+        foreach (var rule in Runner.LintRules)
+        {
+            runner.RegisterLintRule(rule);
+        }
+
+        return runner;
+    }
 
     private static string ResolveBase(ReactorServerOptions options) =>
         Path.GetFullPath(Path.IsPathRooted(options.LogsBaseDirectory) ? options.LogsBaseDirectory : Path.Combine(options.WorkingDirectory, options.LogsBaseDirectory));
