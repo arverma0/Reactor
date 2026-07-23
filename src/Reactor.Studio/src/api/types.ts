@@ -140,6 +140,109 @@ export interface RunDetail extends Omit<RunSummary, "pending_questions"> {
   studio?: Record<string, unknown> | null;
 }
 
+export interface RunCost {
+  ai_units?: number;
+  premium_requests?: number;
+  cost_usd?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  reasoning_tokens?: number;
+  tool_calls?: number;
+}
+
+export interface ForkOrigin {
+  /** Run directory of the source run. */
+  id: string;
+  checkpoint: string;
+  node: string;
+  run_id: string;
+}
+
+/** A run read from disk by the history API (`/studio/api/runs`); `id` is the run directory name. */
+export interface HistorySummary {
+  id: string;
+  run_id: string;
+  name: string;
+  goal?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  status: string;
+  duration_ms?: number | null;
+  node_count?: number | null;
+  stage_executions?: number | null;
+  failure_reason?: string | null;
+  live_id?: string | null;
+  restarts: string[];
+  source_path?: string | null;
+  simulated?: boolean;
+  forked_from?: ForkOrigin | null;
+  cost?: RunCost | null;
+}
+
+export interface HistoryStage {
+  node: string;
+  visits: number;
+  status?: string | null;
+  duration_ms?: number | null;
+  backend?: Record<string, unknown> | null;
+  files: string[];
+  history_visits: number;
+  /** Directory (run or loop-restart directory) holding the latest visit's files. */
+  segment?: string | null;
+}
+
+export interface HistoryDetail {
+  summary: HistorySummary;
+  manifest?: Record<string, unknown> | null;
+  result?: { status?: string; cancelled?: boolean; failure_reason?: string; notes?: string } | null;
+  checkpoint?: { current_node?: string; completed_nodes: string[]; node_outcomes: Record<string, string>; final_status?: string | null } | null;
+  graph_dot?: string | null;
+  studio?: { layout?: LayoutSidecar; source_path?: string; forked_from?: ForkOrigin } & Record<string, unknown>;
+  stages: HistoryStage[];
+  checkpoints: string[];
+}
+
+export interface Percentiles {
+  mean: number;
+  p50: number;
+  p95: number;
+  max?: number;
+}
+
+export interface TelemetryNode {
+  runs: number;
+  visits: number;
+  mean_visits: number;
+  outcomes: Record<string, number>;
+  fail_rate?: number;
+  retries: number;
+  duration_ms?: Percentiles;
+  cost?: Record<string, number>;
+  models?: Record<string, number>;
+  top_failures?: { reason: string; count: number }[];
+}
+
+export interface Telemetry {
+  name: string;
+  runs: number;
+  window?: { from: string; to: string };
+  outcomes: Record<string, number>;
+  duration_ms?: Percentiles;
+  cost?: Record<string, { mean: number; total: number }>;
+  nodes: Record<string, TelemetryNode>;
+  edges: { from: string; to: string; count: number; runs: number }[];
+  series: { id: string; started_at?: string; status: string; duration_ms?: number; stage_executions?: number; ai_units?: number }[];
+}
+
+export interface ForkResponse {
+  id: string;
+  status: string;
+  name: string;
+  logs_root: string;
+  forked_from: ForkOrigin;
+  diagnostics: Diagnostic[];
+}
+
 /** An engine event as streamed over SSE / stored in events.jsonl (snake_case fields + type + seq). */
 export interface PipelineEventJson {
   type: string;

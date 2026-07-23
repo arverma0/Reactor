@@ -169,8 +169,9 @@ public static partial class FlightsEndpoints
             return Results.BadRequest(new { error = "The 'name' query parameter (the pipeline's graph name) is required." });
         }
 
+        // Forks are partial re-flights (experiments from a snapshot), so they would skew reach and success rates.
         var runs = history.LoadAll()
-            .Where(r => r.OnDisk && r.IsFinished && !r.Simulated && string.Equals(r.Name, name, StringComparison.Ordinal))
+            .Where(r => r.OnDisk && r.IsFinished && !r.Simulated && r.ForkedFromJson is null && string.Equals(r.Name, name, StringComparison.Ordinal))
             .Take(Math.Clamp(limit ?? 50, 1, 1000))
             .ToList();
         return Results.Ok(RunTelemetry.Compute(name, runs));

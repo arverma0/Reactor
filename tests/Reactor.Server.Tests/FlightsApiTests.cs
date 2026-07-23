@@ -544,6 +544,11 @@ public sealed class FlightsApiTests
         Assert.Equal(HttpStatusCode.Created, again.StatusCode);
         await server.WaitForStatusAsync((await ServerHarness.ReadJsonAsync(again))["id"]!.GetValue<string>(), "success");
         Assert.Equal([("c", "C")], calls);
+
+        // Forks are partial re-flights: the telemetry only counts the original flight.
+        var telemetry = await server.GetJsonAsync("/studio/api/telemetry?name=Forkable");
+        Assert.Equal(1, telemetry["runs"]!.GetValue<int>());
+        Assert.Equal(1, telemetry["nodes"]!["b"]!["visits"]!.GetValue<int>());
     }
 
     [Fact]

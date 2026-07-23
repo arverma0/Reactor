@@ -6,6 +6,8 @@ export interface StageExecution {
   node: string;
   attempt: number;
   index: number;
+  /** Loop-restart segment (0 = the run's own directory, n = `<run>-restart-n`). */
+  segment: number;
   start: number;
   end?: number;
   status?: string;
@@ -100,7 +102,7 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         replay.failureReason = e.error;
         break;
       case "StageStarted": {
-        const exec: StageExecution = { node: e.node_id!, attempt: e.attempt ?? 1, index: e.index ?? 0, start: at };
+        const exec: StageExecution = { node: e.node_id!, attempt: e.attempt ?? 1, index: e.index ?? 0, segment: replay.restarts, start: at };
         open.set(exec.node, exec);
         replay.executions.push(exec);
         break;
@@ -256,3 +258,24 @@ export function timelineRows(replay: RunReplay): { node: string; executions: Sta
   for (const exec of replay.executions) rows.set(exec.node, [...(rows.get(exec.node) ?? []), exec]);
   return [...rows.entries()].map(([node, executions]) => ({ node, executions }));
 }
+
+/**
+ * The stage snapshot to fork from to re-run `exec`: the latest snapshot of the same run segment saved before it started
+ * (snapshots are named `<execution index>-<node>`, prefixed `restart-N/` in loop-restart directories). Null when the
+ * execution is the first of its segment (there is nothing to restore; start a new run instead).
+ */
+export function checkpointBefore(exec: StageExecution, checkpoints: string[]): string | null {
+  const prefix = exec.segment === 0 ? "" : `restart-${exec.segment}/`;
+  let best: { name: string; index: number } | null = null;
+  for (const name of checkpoints) {
+    if (exec.segment === 0 ? name.includes("/") : !name.startsWith(prefix)) continue;
+    const match = /^(\d+)-(.+)$/.exec(name.slice(prefix.length));
+    if (!match) continue;
+    const index = Number(match[1]);
+    if (index < exec.index && (!best || index > best.index)) best = { name, index };
+  }
+  return best?.name ?? null;
+}
+
+/** The node a snapshot was taken after (`0004-plan` → `plan`). */
+export const checkpointNode = (name: string) => name.slice(name.lastIndexOf("/") + 1).replace(/^\d+-/, "");

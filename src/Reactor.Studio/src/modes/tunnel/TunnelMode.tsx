@@ -12,8 +12,9 @@ import { api } from "../../api/client";
 import { setMode, toast, useStudio } from "../../state/store";
 import { refreshRuns, rememberRunSource, selectRun } from "../flights/store";
 import { digest, overlayAt } from "../flights/replay";
-import { OUTCOME_KINDS, PRESETS, buildScenario, gateChoices, routeLabels, type Behavior, type Preset, type SimReport } from "./scenario";
-import { closeTrace, focusTunnelNode, loadSettingsForDoc, playTrace, runTunnel, setTraceCursor, toggleTracePlaying, updateSettings, useTunnel } from "./store";
+import { OUTCOME_KINDS, PRESETS, buildScenario, gateChoices, predictedCost, routeLabels, type Behavior, type Calibration, type Preset, type SimReport } from "./scenario";
+import { applyCalibration, closeTrace, focusTunnelNode, loadSettingsForDoc, playTrace, runTunnel, setTraceCursor, toggleTracePlaying, updateSettings, useTunnel } from "./store";
+import { loadTelemetry, useTelemetry } from "../../state/telemetry";
 
 const pct = (n: number, digits = 0) => `${(n * 100).toFixed(digits)}%`;
 
@@ -168,7 +169,12 @@ function Slider({ value, onChange, tone }: { value: number; onChange: (v: number
 
 function ScenarioPanel({ doc, focus }: { doc: StudioDoc; focus: string | null }) {
   const settings = useTunnel((s) => s.settings);
-  const choose = (preset: Exclude<Preset, "custom" | "calibrated">) => updateSettings({ preset, agentSuccess: PRESETS[preset].agentSuccess, agentRetry: PRESETS[preset].agentRetry, toolSuccess: PRESETS[preset].toolSuccess });
+  const record = useTelemetry((s) => s.byName[doc.name]);
+  useEffect(() => {
+    void loadTelemetry(doc.name);
+  }, [doc.name]);
+  const choose = (preset: Exclude<Preset, "custom" | "calibrated">) =>
+    updateSettings({ preset, agentSuccess: PRESETS[preset].agentSuccess, agentRetry: PRESETS[preset].agentRetry, toolSuccess: PRESETS[preset].toolSuccess, nodes: settings.preset === "calibrated" ? {} : settings.nodes, calibration: null });
   const tunable = doc.nodes.filter((n) => {
     const kind = kindOf(doc, n);
     return KINDS[kind].llm || kind === "tool" || kind === "human" || kind === "supervisor";
@@ -180,6 +186,24 @@ function ScenarioPanel({ doc, focus }: { doc: StudioDoc; focus: string | null })
       </header>
       <div className="rs-panel-scroll">
         <div className="rs-presets">
+          {record ? (
+            <button
+              type="button"
+              className={cx("rs-preset rs-preset--calibrated", settings.preset === "calibrated" && "is-on")}
+              onClick={() => {
+                applyCalibration(record);
+                toast(`Calibrated to ${record.runs} real flight${record.runs === 1 ? "" : "s"}.`, "success", undefined, 2200);
+              }}
+            >
+              <span className="rs-preset__name">
+                <Glyph name="gauge" size={12} /> Calibrated
+              </span>
+              <span className="rs-preset__blurb">
+                Fitted to {record.runs} real flight{record.runs === 1 ? "" : "s"}: every stage fails, retries, and picks routes the way it really has.
+                {settings.preset === "calibrated" && settings.calibration ? ` Fitted ${new Date(settings.calibration.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}; click to refit.` : ""}
+              </span>
+            </button>
+          ) : null}
           {(Object.keys(PRESETS) as (keyof typeof PRESETS)[]).map((p) => (
             <button key={p} type="button" className={cx("rs-preset", settings.preset === p && "is-on")} onClick={() => choose(p)}>
               <span className="rs-preset__name">{PRESETS[p].label}</span>
@@ -386,10 +410,51 @@ function Gauge({ value, low, high }: { value: number; low: number; high: number 
   );
 }
 
+/**
+ * With a calibrated scenario the tunnel is a forecast: the same stage behavior real flights showed, applied to the
+ * pipeline as it is now. Compares the forecast with the record (success, and cost from real per-visit costs).
+ */
+function RealityCheck({ report, calibration }: { report: SimReport; calibration: Calibration }) {
+  const cost = predictedCost(report, calibration);
+  const delta = report.success_rate - calibration.successRate;
+  const costDelta = cost && calibration.meanCost !== undefined ? cost.mean - calibration.meanCost : undefined;
+  return (
+    <section className="rs-results__section rs-reality">
+      <div className="label">
+        <Glyph name="gauge" size={11} /> Forecast vs. record
+      </div>
+      <div className="rs-reality__grid">
+        <span className="faint">landed</span>
+        <span className="num">{pct(calibration.successRate)}</span>
+        <span className="rs-reality__arrow">→</span>
+        <span className="num">{pct(report.success_rate)}</span>
+        <span className={cx("num rs-reality__delta", Math.abs(delta) < 0.02 ? "" : delta > 0 ? "is-up" : "is-down")}>
+          {Math.abs(delta) < 0.005 ? "±0" : `${delta > 0 ? "+" : "−"}${(Math.abs(delta) * 100).toFixed(0)} pts`}
+        </span>
+        {cost ? (
+          <>
+            <span className="faint">AIU / flight</span>
+            <span className="num">{calibration.meanCost !== undefined ? calibration.meanCost.toFixed(1) : "—"}</span>
+            <span className="rs-reality__arrow">→</span>
+            <span className="num">{cost.mean.toFixed(1)}</span>
+            <span className={cx("num rs-reality__delta", costDelta === undefined || Math.abs(costDelta) < 0.05 ? "" : costDelta < 0 ? "is-up" : "is-down")}>
+              {costDelta === undefined ? "" : `${costDelta > 0 ? "+" : "−"}${Math.abs(costDelta).toFixed(1)}`}
+            </span>
+          </>
+        ) : null}
+      </div>
+      <p className="faint">
+        Record: {calibration.runs} real flight{calibration.runs === 1 ? "" : "s"}. Forecast: this design, flown {report.runs.toLocaleString()}× with the stage behavior those flights showed.
+      </p>
+    </section>
+  );
+}
+
 function ResultsPanel({ doc }: { doc: StudioDoc }) {
   const report = useTunnel((s) => s.report);
   const running = useTunnel((s) => s.running);
   const error = useTunnel((s) => s.error);
+  const settings = useTunnel((s) => s.settings);
   if (running && !report) {
     return (
       <div className="rs-results__empty">
@@ -426,6 +491,8 @@ function ResultsPanel({ doc }: { doc: StudioDoc }) {
           {landed.toLocaleString()} of {report.runs.toLocaleString()} landed · 95% CI {pct(report.success_ci[0], 1)}–{pct(report.success_ci[1], 1)}
         </div>
       </section>
+
+      {settings.calibration ? <RealityCheck report={report} calibration={settings.calibration} /> : null}
 
       <section className="rs-results__section">
         <div className="label">Outcomes</div>

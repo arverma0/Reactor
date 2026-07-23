@@ -1,4 +1,7 @@
 import type {
+  ForkResponse,
+  HistoryDetail,
+  HistorySummary,
   ModelDescriptor,
   ParseResult,
   PendingQuestion,
@@ -7,6 +10,7 @@ import type {
   RunDetail,
   RunSummary,
   ServerInfo,
+  Telemetry,
   WorkspaceDocument,
   WorkspaceFile,
 } from "./types";
@@ -104,6 +108,21 @@ export const api = {
     ),
   stageFile: (id: string, node: string, name: string) =>
     request<string | object>("GET", `/pipelines/${encodeURIComponent(id)}/stages/${encodeURIComponent(node)}/files/${encodeURIComponent(name)}`),
+  history: (name?: string, limit = 200) =>
+    request<{ runs: HistorySummary[] }>("GET", `/studio/api/runs?limit=${limit}${name ? `&name=${encodeURIComponent(name)}` : ""}`).then((r) => r.runs),
+  historyRun: (dir: string) => request<HistoryDetail>("GET", `/studio/api/runs/${encodeURIComponent(dir)}`),
+  historyEvents: (dir: string, since = 0, limit = 20000) =>
+    request<{ events: PipelineEventJson[]; next: number; done: boolean }>("GET", `/studio/api/runs/${encodeURIComponent(dir)}/events?since=${since}&limit=${limit}`),
+  historyFile: (dir: string, node: string, name: string, visit?: number) =>
+    request<string | object>(
+      "GET",
+      `/studio/api/runs/${encodeURIComponent(dir)}/stages/${encodeURIComponent(node)}/files/${encodeURIComponent(name)}${visit !== undefined ? `?visit=${visit}` : ""}`,
+    ),
+  telemetry: (name: string, limit = 50) => request<Telemetry>("GET", `/studio/api/telemetry?name=${encodeURIComponent(name)}&limit=${limit}`),
+  fork: (dir: string, body: { checkpoint: string; dot?: string; context?: Record<string, unknown> }) =>
+    request<ForkResponse>("POST", `/studio/api/runs/${encodeURIComponent(dir)}/fork`, body),
+  steer: (id: string, message: string, node?: string) =>
+    request<{ status: string; node: string; path: string }>("POST", `/studio/api/pipelines/${encodeURIComponent(id)}/steer`, { message, node }),
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? {}),
 };

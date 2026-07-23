@@ -1,5 +1,5 @@
 import { ReactFlowProvider, useReactFlow } from "@xyflow/react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { setToken } from "./api/client";
 import { Canvas } from "./canvas/Canvas";
 import { CommandPalette, saveOrAsk } from "./components/CommandPalette";
@@ -17,6 +17,7 @@ import { addNodeOfKind, addNote, copySelection, deleteSelection, duplicateSelect
 import { newDocument, openFile } from "./state/files";
 import { loadInfo, startSession } from "./state/session";
 import { dismissToast, emptySelection, redo, requestFit, requestLayout, select, setBottomPanel, setLeftPanel, setMode, undo, useStudio, type LeftPanel, type Mode } from "./state/store";
+import { loadTelemetry, telemetryOverlay, useTelemetry } from "./state/telemetry";
 import { ModeStage } from "./modes/ModeStage";
 import { RunDialog } from "./modes/RunDialog";
 
@@ -308,6 +309,19 @@ function TokenDialog() {
   );
 }
 
+/** The editable canvas, optionally wearing the flight record (telemetry of the pipeline's real flights). */
+function DesignCanvas() {
+  const doc = useStudio((s) => s.doc);
+  const info = useStudio((s) => s.info);
+  const lens = useTelemetry((s) => s.designLens);
+  const record = useTelemetry((s) => s.byName[doc.name]);
+  useEffect(() => {
+    if (info) void loadTelemetry(doc.name, 60000);
+  }, [doc.name, info]);
+  const overlay = useMemo(() => (lens && record ? telemetryOverlay(doc, record, { dimUnvisited: false }) : null), [lens, record, doc]);
+  return <Canvas overlay={overlay} />;
+}
+
 function ViewCenterBridge() {
   const rf = useReactFlow();
   useEffect(() => {
@@ -355,7 +369,7 @@ export function App() {
           <LeftRail />
           {mode === "design" ? <LeftPanelHost /> : null}
           <main className="rs-main">
-            <div className="rs-stage">{mode === "design" ? <Canvas overlay={null} /> : <ModeStage mode={mode} />}</div>
+            <div className="rs-stage">{mode === "design" ? <DesignCanvas /> : <ModeStage mode={mode} />}</div>
             {mode === "design" ? <BottomDrawer /> : null}
           </main>
           {mode === "design" && inspectorOpen ? (

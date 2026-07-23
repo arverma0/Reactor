@@ -1,9 +1,9 @@
 import { create } from "zustand";
 import { api } from "../../api/client";
-import type { PipelineEventJson } from "../../api/types";
+import type { PipelineEventJson, Telemetry } from "../../api/types";
 import { writeDot } from "../../model/dot";
 import { toast, useStudio } from "../../state/store";
-import { buildScenario, defaultSettings, type SimReport, type TunnelSettings } from "./scenario";
+import { buildScenario, calibrate, defaultSettings, type SimReport, type TunnelSettings } from "./scenario";
 
 export interface TraceState {
   label: string;
@@ -65,6 +65,12 @@ export function updateSettings(patch: Partial<TunnelSettings>) {
   } catch {
     // ignore
   }
+}
+
+/** Fits the scenario to the open pipeline's real flights. */
+export function applyCalibration(telemetry: Telemetry) {
+  updateSettings(calibrate(useStudio.getState().doc, telemetry, get().settings));
+  set({ report: null, reportDot: null, trace: null });
 }
 
 export async function runTunnel() {

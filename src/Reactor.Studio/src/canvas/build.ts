@@ -9,7 +9,7 @@ import { ghostRoutes, routeKeyOf, routesOf, type Route } from "../model/routes";
 import { effectiveModel, parseStylesheet } from "../model/stylesheet";
 import type { Diagnostic, DocNode, Effective, StudioDoc } from "../model/types";
 
-export type NodeState = "idle" | "running" | "success" | "partial_success" | "fail" | "retry" | "skipped" | "waiting" | "dim" | "visited";
+export type NodeState = "idle" | "running" | "success" | "partial_success" | "fail" | "retry" | "skipped" | "waiting" | "dim" | "visited" | "restored";
 
 export interface NodeOverlay {
   state?: NodeState;

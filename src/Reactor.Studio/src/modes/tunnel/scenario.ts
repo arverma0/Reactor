@@ -1,3 +1,4 @@
+import type { Telemetry } from "../../api/types";
 import { handlerOf, nodeAttr, outgoing } from "../../model/doc";
 import { routeKeyOf } from "../../model/routes";
 import type { DocNode, StudioDoc } from "../../model/types";
@@ -21,6 +22,19 @@ export interface Scenario {
 
 export type Preset = "happy" | "realistic" | "stress" | "chaos" | "calibrated" | "custom";
 
+export interface Calibration {
+  /** Finished real flights the scenario was fitted to. */
+  runs: number;
+  at: string;
+  window?: { from: string; to: string };
+  /** Real success share over those flights (to compare with the tunnel's prediction). */
+  successRate: number;
+  /** Mean cost per visit, per stage (AI units), for cost predictions. */
+  costPerVisit: Record<string, number>;
+  /** Real mean AI units per flight. */
+  meanCost?: number;
+}
+
 export interface TunnelSettings {
   preset: Preset;
   /** Share of agent executions that succeed. */
@@ -33,6 +47,7 @@ export interface TunnelSettings {
   runs: number;
   maxSteps: number;
   seed: number | null;
+  calibration?: Calibration | null;
 }
 
 export const PRESETS: Record<Exclude<Preset, "custom" | "calibrated">, { label: string; blurb: string; agentSuccess: number; agentRetry: number; toolSuccess: number }> = {
@@ -85,6 +100,102 @@ export function buildScenario(doc: StudioDoc, settings: TunnelSettings, extra: P
     nodes,
     ...extra,
   };
+}
+
+// ---------- calibration from real flights ----------
+
+/**
+ * Fits a scenario to a pipeline's flight record: each stage that has flown gets its observed outcome mix, retry share,
+ * route choices, and typical duration; the global dials become the observed averages per handler (used by stages that
+ * have not flown yet, such as ones just added in Design).
+ */
+export function calibrate(doc: StudioDoc, t: Telemetry, base: TunnelSettings): TunnelSettings {
+  const nodes: Record<string, Behavior> = {};
+  const totals = { agent: { ok: 0, retry: 0, all: 0 }, tool: { ok: 0, all: 0 } };
+  const costPerVisit: Record<string, number> = {};
+  for (const node of doc.nodes) {
+    const stats = t.nodes[node.id];
+    if (!stats || stats.visits === 0) continue;
+    const handler = handlerOf(doc, node);
+    if (stats.cost?.ai_units !== undefined) costPerVisit[node.id] = stats.cost.ai_units;
+    const behavior: Behavior = {};
+    const done = Object.values(stats.outcomes).reduce((a, b) => a + b, 0);
+    if (done > 0 && handler !== "wait.human" && handler !== "start" && handler !== "exit") {
+      const attempts = done + stats.retries;
+      const retry = attempts > 0 ? stats.retries / attempts : 0;
+      const outcomes: Record<string, number> = {};
+      for (const [status, count] of Object.entries(stats.outcomes)) {
+        if (status === "success" || status === "fail" || status === "partial_success") outcomes[status] = round((count / done) * (1 - retry));
+      }
+      if (retry > 0) outcomes.retry = round(retry);
+      if (Object.keys(outcomes).length > 0) behavior.outcomes = outcomes;
+      const ok = (stats.outcomes.success ?? 0) + (stats.outcomes.partial_success ?? 0);
+      if (handler === "tool") {
+        totals.tool.ok += ok;
+        totals.tool.all += done;
+      } else if (handler === "codergen" || handler === "stack.manager_loop") {
+        totals.agent.ok += ok;
+        totals.agent.all += attempts;
+        totals.agent.retry += stats.retries;
+      }
+    }
+    // Route choices: how often each outgoing edge was taken from this stage.
+    const out = outgoing(doc, node.id);
+    const taken = (to: string) => t.edges.filter((e) => e.from === node.id && e.to === to).reduce((a, e) => a + e.count, 0);
+    if (handler === "wait.human") {
+      const choices: Record<string, number> = {};
+      for (const e of out) choices[e.attrs.label || e.to] = (choices[e.attrs.label || e.to] ?? 0) + taken(e.to);
+      if (Object.values(choices).some((c) => c > 0)) behavior.choices = normalize(choices);
+    } else {
+      const labels = routeLabels(doc, node);
+      if (labels.length > 0) {
+        const weights: Record<string, number> = {};
+        for (const e of out) if (e.attrs.label && labels.includes(e.attrs.label)) weights[e.attrs.label] = (weights[e.attrs.label] ?? 0) + taken(e.to);
+        if (Object.values(weights).some((c) => c > 0)) behavior.labels = normalize(weights);
+      }
+    }
+    if (stats.duration_ms) behavior.duration_ms = Math.round(stats.duration_ms.p50);
+    if (Object.keys(behavior).length > 0) nodes[node.id] = behavior;
+  }
+  const finished = Object.values(t.outcomes).reduce((a, b) => a + b, 0);
+  const agentSuccess = totals.agent.all > 0 ? totals.agent.ok / totals.agent.all : base.agentSuccess;
+  const agentRetry = totals.agent.all > 0 ? totals.agent.retry / totals.agent.all : base.agentRetry;
+  return {
+    ...base,
+    preset: "calibrated",
+    agentSuccess: round(Math.min(agentSuccess, 1 - agentRetry)),
+    agentRetry: round(agentRetry),
+    toolSuccess: totals.tool.all > 0 ? round(totals.tool.ok / totals.tool.all) : base.toolSuccess,
+    nodes,
+    calibration: {
+      runs: t.runs,
+      at: new Date().toISOString(),
+      window: t.window,
+      successRate: finished > 0 ? ((t.outcomes.success ?? 0) + (t.outcomes.partial_success ?? 0)) / finished : 0,
+      costPerVisit,
+      meanCost: t.cost?.ai_units?.mean,
+    },
+  };
+}
+
+function normalize(weights: Record<string, number>): Record<string, number> {
+  const total = Object.values(weights).reduce((a, b) => a + b, 0) || 1;
+  return Object.fromEntries(Object.entries(weights).map(([k, v]) => [k, round(v / total)]));
+}
+
+/** Predicted AI units per flight: simulated visits per flight × the real cost per visit of each stage. */
+export function predictedCost(report: SimReport, calibration: Calibration): { mean: number; covered: number } | null {
+  const entries = Object.entries(calibration.costPerVisit);
+  if (entries.length === 0) return null;
+  let mean = 0;
+  let covered = 0;
+  for (const [node, cost] of entries) {
+    const stats = report.nodes[node];
+    if (!stats) continue;
+    mean += (stats.visits / Math.max(1, report.runs)) * cost;
+    covered++;
+  }
+  return { mean, covered };
 }
 
 // ---------- report (server wire format) ----------

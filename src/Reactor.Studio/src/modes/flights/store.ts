@@ -1,9 +1,12 @@
 import { create } from "zustand";
 import { api, streamEvents } from "../../api/client";
-import type { PipelineEventJson, RunDetail, RunSummary } from "../../api/types";
+import type { HistoryDetail, HistorySummary, PipelineEventJson, RunDetail, RunSummary } from "../../api/types";
 import type { LayoutSidecar, StudioDoc } from "../../model/types";
 import { docFromDot } from "../../state/files";
 import { useStudio } from "../../state/store";
+import { mergeFlights, type Flight } from "./view";
+
+export type { Flight } from "./view";
 
 export interface RunSource {
   dot: string;
@@ -11,12 +14,19 @@ export interface RunSource {
   sourcePath?: string | null;
 }
 
+export type Lens = "flight" | "record";
+
 interface FlightsState {
-  runs: RunSummary[];
+  flights: Flight[];
+  loaded: boolean;
+  /** "pipeline": only flights of the pipeline open in Design. */
+  filter: "pipeline" | "all";
   selected: string | null;
-  details: Record<string, RunDetail>;
+  live: Record<string, RunDetail>;
+  history: Record<string, HistoryDetail>;
   events: Record<string, PipelineEventJson[]>;
   docs: Record<string, StudioDoc | "loading" | "missing">;
+  lens: Lens;
   stage: string | null;
   /** Scrub instant (ms epoch); null follows the live edge. */
   at: number | null;
@@ -27,11 +37,15 @@ interface FlightsState {
 }
 
 export const useFlights = create<FlightsState>()(() => ({
-  runs: [],
+  flights: [],
+  loaded: false,
+  filter: (localStorage.getItem("reactor.flights.filter") as "pipeline" | "all" | null) ?? "all",
   selected: null,
-  details: {},
+  live: {},
+  history: {},
   events: {},
   docs: {},
+  lens: "flight",
   stage: null,
   at: null,
   playing: false,
@@ -60,119 +74,215 @@ function recallRunSource(id: string): RunSource | null {
   }
 }
 
+const historySupported = () => useStudio.getState().info?.features.includes("history") ?? false;
+
+let lastLive: RunSummary[] = [];
+let lastHistory: HistorySummary[] = [];
+
 export async function refreshRuns() {
-  try {
-    const runs = await api.runs();
-    set({ runs });
-  } catch {
-    // offline: keep the last list
-  }
+  const [live, history] = await Promise.all([api.runs().catch(() => null), historySupported() ? api.history().catch(() => null) : Promise.resolve(null)]);
+  if (live) lastLive = live;
+  if (history) lastHistory = history;
+  if (!live && !history) return;
+  set({ flights: mergeFlights(lastLive, lastHistory), loaded: true });
+  // A run selected right after it started gains its directory once the history lists it.
+  const flight = currentFlight();
+  if (flight?.dir && !get().history[flight.dir]) void loadHistory(flight.dir);
+}
+
+export function flightByKey(key: string | null | undefined): Flight | undefined {
+  return key ? get().flights.find((f) => f.key === key) : undefined;
+}
+
+export const currentFlight = () => flightByKey(get().selected);
+
+/** Live id and run directory for a flight key (keys of runs not listed yet are live ids). */
+export function flightIds(key: string): { liveId: string | null; dir: string | null } {
+  const flight = flightByKey(key);
+  if (flight) return { liveId: flight.liveId, dir: flight.dir };
+  return key.startsWith("dir:") ? { liveId: null, dir: key.slice(4) } : { liveId: key, dir: null };
 }
 
 const streams = new Map<string, () => void>();
 const buffers = new Map<string, PipelineEventJson[]>();
 let flushScheduled = false;
 let detailTimer: ReturnType<typeof setTimeout> | undefined;
+let historyTimer: ReturnType<typeof setTimeout> | undefined;
 
 function flush() {
   flushScheduled = false;
   const events = { ...get().events };
-  for (const [id, buffer] of buffers) {
+  for (const [key, buffer] of buffers) {
     if (buffer.length === 0) continue;
-    events[id] = [...(events[id] ?? []), ...buffer];
+    events[key] = [...(events[key] ?? []), ...buffer];
     buffer.length = 0;
   }
   set({ events });
 }
 
-function scheduleDetail(id: string, delay = 250) {
+function scheduleDetail(key: string, delay = 250, withHistory = false) {
+  const { liveId, dir } = flightIds(key);
   clearTimeout(detailTimer);
-  detailTimer = setTimeout(() => void loadDetail(id), delay);
+  if (liveId) detailTimer = setTimeout(() => void loadLive(liveId), delay);
+  if (withHistory && dir) {
+    clearTimeout(historyTimer);
+    historyTimer = setTimeout(() => void loadHistory(dir), delay + 150);
+  }
 }
 
-export async function loadDetail(id: string) {
+export async function loadLive(id: string) {
   try {
     const detail = await api.run(id);
-    set({ details: { ...get().details, [id]: detail } });
+    set({ live: { ...get().live, [id]: detail } });
   } catch {
     // ignore
   }
 }
 
-function openStream(id: string) {
-  if (streams.has(id)) return;
-  buffers.set(id, []);
-  set({ events: { ...get().events, [id]: [] } });
-  const close = streamEvents(`/pipelines/${encodeURIComponent(id)}/events`, {
+export async function loadHistory(dir: string) {
+  try {
+    const detail = await api.historyRun(dir);
+    set({ history: { ...get().history, [dir]: detail } });
+  } catch {
+    // ignore
+  }
+}
+
+/** Refreshes whatever the selected flight is backed by. */
+export function loadDetail(key: string) {
+  const { liveId, dir } = flightIds(key);
+  if (liveId) void loadLive(liveId);
+  if (dir) void loadHistory(dir);
+}
+
+function openStream(key: string, liveId: string) {
+  if (streams.has(key)) return;
+  buffers.set(key, []);
+  set({ events: { ...get().events, [key]: [] } });
+  const close = streamEvents(`/pipelines/${encodeURIComponent(liveId)}/events`, {
     onEvent: (event) => {
-      buffers.get(id)?.push(event);
+      buffers.get(key)?.push(event);
       if (!flushScheduled) {
         flushScheduled = true;
         requestAnimationFrame(flush);
       }
-      if (event.type !== "StageLog" && event.type !== "CheckpointSaved") scheduleDetail(id);
+      if (event.type !== "StageLog" && event.type !== "CheckpointSaved") scheduleDetail(key, 250, event.type === "StageCompleted" || event.type.startsWith("Pipeline"));
     },
     onEnd: () => {
-      streams.delete(id);
-      scheduleDetail(id, 50);
+      streams.delete(key);
+      scheduleDetail(key, 50, true);
       void refreshRuns();
     },
+    onError: () => {
+      // The server forgot the run (restart): fall back to its directory on disk.
+      streams.delete(key);
+      const { dir } = flightIds(key);
+      if (dir) void tailHistoryEvents(key, dir, true);
+    },
   });
-  streams.set(id, close);
+  streams.set(key, close);
 }
 
-async function loadDoc(id: string) {
-  if (get().docs[id] && get().docs[id] !== "missing") return;
-  set({ docs: { ...get().docs, [id]: "loading" } });
-  const source = recallRunSource(id);
+const tails = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Reads a run's events.jsonl page by page; keeps tailing while the run is still being written (e.g. `reactor run`). */
+async function tailHistoryEvents(key: string, dir: string, reset = false) {
+  if (reset) set({ events: { ...get().events, [key]: [] } });
+  let since = Math.max(0, ...(get().events[key] ?? []).map((e) => e.seq ?? 0));
+  for (let page = 0; page < 40; page++) {
+    let result;
+    try {
+      result = await api.historyEvents(dir, since);
+    } catch {
+      return;
+    }
+    if (get().selected !== key) return;
+    if (result.events.length > 0) set({ events: { ...get().events, [key]: [...(get().events[key] ?? []), ...result.events] } });
+    since = result.next;
+    if (result.done) {
+      void loadHistory(dir);
+      return;
+    }
+    if (result.events.length === 0) break;
+  }
+  clearTimeout(tails.get(key));
+  tails.set(
+    key,
+    setTimeout(() => {
+      if (get().selected === key) {
+        void loadHistory(dir);
+        void tailHistoryEvents(key, dir);
+      }
+    }, 1500),
+  );
+}
+
+async function docFrom(dot: string, layout: Partial<LayoutSidecar> | null | undefined, name: string | undefined) {
+  const design = useStudio.getState().doc;
+  return docFromDot(dot, layout ?? (name && design.name === name ? design.layout : undefined));
+}
+
+async function loadDoc(key: string) {
+  if (get().docs[key] && get().docs[key] !== "missing") return;
+  set({ docs: { ...get().docs, [key]: "loading" } });
+  const { liveId, dir } = flightIds(key);
+  const done = (doc: StudioDoc | "missing") => set({ docs: { ...get().docs, [key]: doc } });
   try {
-    if (source) {
-      const doc = await docFromDot(source.dot, source.layout);
-      set({ docs: { ...get().docs, [id]: doc } });
-      return;
+    const source = liveId ? recallRunSource(liveId) : null;
+    if (source) return done(await docFromDot(source.dot, source.layout));
+    if (dir) {
+      const history = get().history[dir] ?? (await api.historyRun(dir).catch(() => null));
+      if (history) set({ history: { ...get().history, [dir]: history } });
+      if (history?.graph_dot) return done(await docFrom(history.graph_dot, history.studio?.layout, history.summary.name));
     }
-    // Live runs: the server keeps each run's DOT source (and the Studio metadata it was started with).
-    const live = await api.get<{ dot?: string; name?: string; studio?: { layout?: LayoutSidecar } | null }>(`/studio/api/pipelines/${encodeURIComponent(id)}/source`).catch(() => null);
-    if (live?.dot) {
-      const design = useStudio.getState().doc;
-      const layout = live.studio?.layout ?? (design.name === live.name ? design.layout : undefined);
-      const doc = await docFromDot(live.dot, layout);
-      set({ docs: { ...get().docs, [id]: doc } });
-      return;
+    if (liveId) {
+      // Live runs: the server keeps each run's DOT source (and the Studio metadata it was started with).
+      const live = await api.get<{ dot?: string; name?: string; studio?: { layout?: LayoutSidecar } | null }>(`/studio/api/pipelines/${encodeURIComponent(liveId)}/source`).catch(() => null);
+      if (live?.dot) return done(await docFrom(live.dot, live.studio?.layout, live.name));
     }
-    // Runs started elsewhere: the history API (when available) serves the graph and Studio metadata by run directory.
-    const detail = get().details[id] ?? (await api.run(id).catch(() => null));
-    const dir = detail?.logs_root?.split(/[\\/]/).filter(Boolean).pop();
-    const history = dir ? await api.get<{ graph_dot?: string; studio?: { layout?: LayoutSidecar } | null }>(`/studio/api/runs/${encodeURIComponent(dir)}`).catch(() => null) : null;
-    if (history?.graph_dot) {
-      const doc = await docFromDot(history.graph_dot, history.studio?.layout);
-      set({ docs: { ...get().docs, [id]: doc } });
-      return;
-    }
-    set({ docs: { ...get().docs, [id]: "missing" } });
+    done("missing");
   } catch {
-    set({ docs: { ...get().docs, [id]: "missing" } });
+    done("missing");
   }
 }
 
-export function selectRun(id: string | null) {
-  set({ selected: id, stage: null, at: null, playing: false });
+export function selectRun(key: string | null) {
+  set({ selected: key, stage: null, at: null, playing: false });
   for (const [other, close] of streams) {
-    if (other !== id) {
+    if (other !== key) {
       close();
       streams.delete(other);
     }
   }
-  if (!id) return;
-  openStream(id);
-  void loadDetail(id);
-  void loadDoc(id);
+  for (const [other, timer] of tails) {
+    if (other !== key) {
+      clearTimeout(timer);
+      tails.delete(other);
+    }
+  }
+  if (!key) return;
+  const { liveId, dir } = flightIds(key);
+  if (liveId) {
+    openStream(key, liveId);
+    void loadLive(liveId);
+  } else if (dir && !(get().events[key]?.length && isFinished(flightByKey(key)?.status))) {
+    void tailHistoryEvents(key, dir, true);
+  }
+  if (dir) void loadHistory(dir);
+  void loadDoc(key);
 }
+
+const isFinished = (status?: string) => !!status && status !== "running" && status !== "queued";
 
 export const selectStage = (stage: string | null) => set({ stage });
 export const scrubTo = (at: number | null) => set({ at, playing: at === null ? false : get().playing });
 export const setPlaying = (playing: boolean) => set({ playing });
 export const setSpeed = (speed: number) => set({ speed });
+export const setLens = (lens: Lens) => set({ lens });
+export function setFilter(filter: "pipeline" | "all") {
+  localStorage.setItem("reactor.flights.filter", filter);
+  set({ filter });
+}
 
 let ticker: ReturnType<typeof setInterval> | undefined;
 let lastFrame = 0;

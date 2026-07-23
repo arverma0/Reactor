@@ -26,6 +26,7 @@ import { placeMissing, autoLayout, type Size } from "../model/layout";
 import { attrsForRoute } from "../model/routes";
 import type { Diagnostic, StudioDoc } from "../model/types";
 import { applyDoc, emptySelection, select, toast, useStudio } from "../state/store";
+import { setDesignLens, useTelemetry } from "../state/telemetry";
 import { canvasActions } from "./actions";
 import { buildEdges, buildFrames, buildStageData, buildStageNode, frameAt, type Box, type CanvasOverlay, type NoteData } from "./build";
 import { CableEdge, DataEdge } from "./edges";
@@ -572,7 +573,7 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
         minZoom={0.12}
         maxZoom={2.2}
         onInit={() => setTimeout(smartFit, 120)}
-        proOptions={{ hideAttribution: true }}
+        attributionPosition="top-right"
         nodesConnectable={!readOnly}
         elevateEdgesOnSelect
         connectionRadius={28}
@@ -593,7 +594,7 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
             nodeBorderRadius={3}
           />
         ) : null}
-        <CanvasControls readOnly={readOnly} />
+        <CanvasControls readOnly={readOnly} lens={!external} />
       </ReactFlow>
       {doc.nodes.length === 0 && !external ? <CanvasEmpty /> : null}
       {pending
@@ -658,10 +659,13 @@ function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: Pa
   );
 }
 
-function CanvasControls({ readOnly }: { readOnly: boolean }) {
+function CanvasControls({ readOnly, lens }: { readOnly: boolean; lens: boolean }) {
   const rf = useReactFlow();
   const { zoom } = useViewport();
   const layers = useStudio((s) => s.layers);
+  const name = useStudio((s) => s.doc.name);
+  const record = useTelemetry((s) => (lens ? s.byName[name] : null));
+  const recordOn = useTelemetry((s) => s.designLens);
   const toggle = (key: keyof typeof layers) => useStudio.setState({ layers: { ...layers, [key]: !layers[key] } });
   return (
     <div className="rs-canvas-controls">
@@ -677,6 +681,19 @@ function CanvasControls({ readOnly }: { readOnly: boolean }) {
       <Button variant="ghost" size="sm" icon="data" title="Show artifact wires" active={layers.data} onClick={() => toggle("data")} />
       <Button variant="ghost" size="sm" icon="note" title="Show notes" active={layers.notes} onClick={() => toggle("notes")} />
       <Button variant="ghost" size="sm" icon="library" title="Show minimap" active={layers.minimap} onClick={() => toggle("minimap")} />
+      {lens && record ? (
+        <>
+          <span className="rs-canvas-controls__sep" />
+          <Button
+            variant="ghost"
+            size="sm"
+            icon="gauge"
+            title={recordOn ? "Hide the flight record" : `Show the flight record on the cards: how ${record.runs} real flight${record.runs === 1 ? "" : "s"} went, stage by stage`}
+            active={recordOn}
+            onClick={() => setDesignLens(!recordOn)}
+          />
+        </>
+      ) : null}
     </div>
   );
 }

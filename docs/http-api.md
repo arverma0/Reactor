@@ -100,7 +100,7 @@ run directories on disk (`<workdir>/.reactor/runs`), so it includes runs of earl
 | `GET` | `/studio/api/runs/{id}` | Summary, `manifest`, `result`, `checkpoint`, `graph_dot`, `studio`, `stages`, `checkpoints`. |
 | `GET` | `/studio/api/runs/{id}/events?since=0&limit=20000` | `events.jsonl` paged: `{events, next, done}`; `limit` ≤ 50000. |
 | `GET` | `/studio/api/runs/{id}/stages/{node}/files/{name}?visit=N` | A stage file; `visit` selects `history/visit-N` (the latest visit is the stage directory itself). |
-| `GET` | `/studio/api/telemetry?name=&limit=50` | Aggregates over the latest finished, non-simulated runs of a pipeline. |
+| `GET` | `/studio/api/telemetry?name=&limit=50` | Aggregates over the latest finished runs of a pipeline (not simulated, not forks). |
 | `POST` | `/studio/api/runs/{id}/fork` | Start a new run from a stage snapshot of `{id}`, optionally with another pipeline. `201`. |
 | `POST` | `/studio/api/pipelines/{id}/steer` | Send a message to the agent of a running stage. `202`. |
 
@@ -146,7 +146,8 @@ skipped (their `seq` is not reused). `seq` numbers lines of `events.jsonl`; they
 run, but are not guaranteed to (SSE also carries the server's own notes, such as steering, which are not in the file).
 
 **Telemetry** (`GET /studio/api/telemetry?name=factory`), over the newest `limit` runs whose status is `success`,
-`partial_success`, `fail`, or `cancelled` and that are not simulated:
+`partial_success`, `fail`, or `cancelled` and that are neither simulated nor forks (a fork is a partial re-flight from a
+snapshot, so it would skew reach and success rates):
 
 ```json
 {"name": "factory", "runs": 3, "window": {"from": "...", "to": "..."},
