@@ -114,11 +114,21 @@ public sealed class ManagedRun
     private readonly List<Channel<RunEvent>> _subscribers = [];
     private readonly Dictionary<string, string> _nodeStatuses = new(StringComparer.Ordinal);
     private readonly List<string> _completedNodes = [];
+    private readonly List<string> _activeNodes = [];
     private readonly int _maxEvents;
+    private readonly string? _studio;
     private long _sequence;
     private bool _eventsCompleted;
 
-    internal ManagedRun(string id, Graph graph, string source, string logsRoot, string workingDirectory, IReadOnlyDictionary<string, object?>? initialContext, int maxEvents)
+    internal ManagedRun(
+        string id,
+        Graph graph,
+        string source,
+        string logsRoot,
+        string workingDirectory,
+        IReadOnlyDictionary<string, object?>? initialContext,
+        int maxEvents,
+        System.Text.Json.Nodes.JsonObject? studio = null)
     {
         Id = id;
         Graph = graph;
@@ -127,6 +137,7 @@ public sealed class ManagedRun
         CurrentLogsRoot = logsRoot;
         WorkingDirectory = workingDirectory;
         InitialContext = initialContext;
+        _studio = studio?.ToJsonString();
         _maxEvents = maxEvents;
     }
 
@@ -149,6 +160,12 @@ public sealed class ManagedRun
     public string WorkingDirectory { get; }
 
     public IReadOnlyDictionary<string, object?>? InitialContext { get; }
+
+    /// <summary>
+    /// Studio metadata saved with the run as <c>studio.json</c> (the <c>"studio"</c> object of the start request, plus
+    /// <c>forked_from</c> for forks and <c>simulated</c> for simulated runs), or null. Each read returns a new copy.
+    /// </summary>
+    public System.Text.Json.Nodes.JsonObject? Studio => _studio is null ? null : System.Text.Json.Nodes.JsonNode.Parse(_studio) as System.Text.Json.Nodes.JsonObject;
 
     public WebInterviewer Interviewer { get; } = new();
 
@@ -191,6 +208,18 @@ public sealed class ManagedRun
             lock (_gate)
             {
                 return new Dictionary<string, string>(_nodeStatuses, StringComparer.Ordinal);
+            }
+        }
+    }
+
+    /// <summary>Stages executing right now, oldest first (several while parallel branches run).</summary>
+    public IReadOnlyList<string> ActiveNodes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _activeNodes.ToList();
             }
         }
     }
@@ -265,10 +294,16 @@ public sealed class ManagedRun
             {
                 case StageStarted started:
                     CurrentNode = started.NodeId;
+                    if (!_activeNodes.Contains(started.NodeId))
+                    {
+                        _activeNodes.Add(started.NodeId);
+                    }
+
                     break;
                 case StageCompleted completed:
                     _nodeStatuses[completed.NodeId] = completed.Status;
                     _completedNodes.Add(completed.NodeId);
+                    _activeNodes.Remove(completed.NodeId);
                     if (CurrentNode == completed.NodeId)
                     {
                         CurrentNode = null;
@@ -282,6 +317,7 @@ public sealed class ManagedRun
                     CurrentLogsRoot = restarted.LogsRoot;
                     _nodeStatuses.Clear();
                     _completedNodes.Clear();
+                    _activeNodes.Clear();
                     break;
             }
 
@@ -289,6 +325,25 @@ public sealed class ManagedRun
             {
                 subscriber.Writer.TryWrite(evt);
             }
+        }
+    }
+
+    /// <summary>
+    /// Adds a host-generated event (for example a note that a user queued steering) to the live event journal, but only
+    /// while the run is executing, so it can never appear after the run's final events. Like engine events it gets the
+    /// next sequence number and reaches SSE subscribers; unlike them it is not written to the run's <c>events.jsonl</c>.
+    /// </summary>
+    internal bool TryRecordNote(PipelineEvent pipelineEvent)
+    {
+        lock (_gate)
+        {
+            if (Status != RunStatus.Running || _eventsCompleted)
+            {
+                return false;
+            }
+
+            Record(pipelineEvent);
+            return true;
         }
     }
 
@@ -312,6 +367,7 @@ public sealed class ManagedRun
             Error = error;
             FinishedAt = DateTimeOffset.UtcNow;
             CurrentNode = null;
+            _activeNodes.Clear();
             if (result is not null)
             {
                 foreach (var (node, outcome) in result.NodeOutcomes)
@@ -383,13 +439,41 @@ public sealed record StartRequest
     /// <summary>Optional simulation settings (<c>"simulation"</c> in the JSON body): run with simulated stages instead of the backend.</summary>
     public System.Text.Json.Nodes.JsonObject? Simulation { get; init; }
 
-    /// <summary>Optional Studio metadata (<c>"studio"</c> in the JSON body), e.g. the source file and layout of the pipeline.</summary>
+    /// <summary>
+    /// Optional Studio metadata (<c>"studio"</c> in the JSON body), e.g. the source file and layout of the pipeline. It is
+    /// saved with the run as <c>studio.json</c> (at most <see cref="PipelineRunManager.MaxStudioBytes"/>).
+    /// </summary>
+    public System.Text.Json.Nodes.JsonObject? Studio { get; init; }
+}
+
+/// <summary>A request to start a run that continues from a saved checkpoint, for example a fork of an earlier run.</summary>
+public sealed record CheckpointStartRequest
+{
+    /// <summary>The pipeline to run; it may differ from the pipeline that produced the checkpoint.</summary>
+    public required string Dot { get; init; }
+
+    /// <summary>
+    /// The state to continue from. The run continues after <see cref="Checkpoint.CurrentNode"/>, routing on that stage's
+    /// recorded outcome; the checkpoint's run id and final status are replaced.
+    /// </summary>
+    public required Checkpoint Checkpoint { get; init; }
+
+    public string? WorkingDirectory { get; init; }
+
+    /// <summary>Studio metadata saved with the run as <c>studio.json</c> (for forks, <c>forked_from</c> and the source run's fields).</summary>
     public System.Text.Json.Nodes.JsonObject? Studio { get; init; }
 }
 
 /// <summary>Starts, tracks, cancels, and resumes pipeline runs for the HTTP server.</summary>
 public sealed class PipelineRunManager : IAsyncDisposable
 {
+    /// <summary>Largest Studio metadata object (serialized) accepted with a run.</summary>
+    public const int MaxStudioBytes = 4 * 1024 * 1024;
+
+    /// <summary>Name of the Studio metadata file in a run directory.</summary>
+    public const string StudioFileName = "studio.json";
+
+    private static readonly System.Text.Json.JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
     private readonly ReactorServerOptions _options;
     private readonly ConcurrentDictionary<string, ManagedRun> _runs = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _slots;
@@ -410,6 +494,9 @@ public sealed class PipelineRunManager : IAsyncDisposable
     public PipelineRunner Runner { get; }
 
     public ReactorServerOptions Options => _options;
+
+    /// <summary>The directory that holds run directories (<see cref="ReactorServerOptions.LogsBaseDirectory"/>, resolved).</summary>
+    public string RunsDirectory => Runner.Options.LogsBaseDirectory;
 
     /// <summary>All runs, newest first.</summary>
     public IReadOnlyList<ManagedRun> Runs => _runs.Values.OrderByDescending(r => r.CreatedAt).ToList();
@@ -435,30 +522,117 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, prepared.Diagnostics, "The pipeline has validation errors.");
         }
 
-        string workingDirectory;
-        if (!string.IsNullOrWhiteSpace(request.WorkingDirectory))
+        if (!TryResolveWorkingDirectory(request.WorkingDirectory, out var workingDirectory, out var error))
         {
-            if (!_options.AllowClientWorkingDirectory)
-            {
-                return new StartResult(null, prepared.Diagnostics, "This server does not allow clients to choose the working directory.");
-            }
-
-            workingDirectory = Path.GetFullPath(request.WorkingDirectory);
-            if (!Directory.Exists(workingDirectory))
-            {
-                return new StartResult(null, prepared.Diagnostics, $"Working directory '{workingDirectory}' does not exist.");
-            }
-        }
-        else
-        {
-            workingDirectory = Path.GetFullPath(_options.WorkingDirectory);
+            return new StartResult(null, prepared.Diagnostics, error);
         }
 
-        var id = Guid.NewGuid().ToString("N")[..12];
-        var logsRoot = Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}-{id}");
-        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun));
+        var studio = request.Studio?.DeepClone().AsObject();
+        if (request.Simulation is not null)
+        {
+            studio ??= [];
+            studio["simulated"] = true;
+        }
+
+        if (StudioTooLarge(studio))
+        {
+            return new StartResult(null, prepared.Diagnostics, $"The studio metadata exceeds {MaxStudioBytes} bytes.");
+        }
+
+        var id = NewRunId();
+        var logsRoot = NewLogsRoot(prepared.Graph.Name, id);
+        try
+        {
+            WriteStudioFile(logsRoot, studio);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new StartResult(null, prepared.Diagnostics, $"Could not create the run directory: {ex.Message}");
+        }
+
+        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun), studio);
         _runs[id] = run;
         run.Execution = ExecuteAsync(run, (options, ct) => Runner.RunAsync(prepared.Graph, options, ct));
+        return new StartResult(run, prepared.Diagnostics, null);
+    }
+
+    /// <summary>
+    /// Starts a new run that continues from a checkpoint (for example a fork of an earlier run from one of its stage
+    /// snapshots): validates the pipeline, creates a run directory with <c>graph.dot</c>, <c>checkpoint.json</c> (with the
+    /// new run id, no final status), <c>manifest.json</c>, and <c>studio.json</c>, then resumes it like
+    /// <see cref="Resume"/>. The run is listed, streamed, cancelled, and answered like any other run.
+    /// </summary>
+    public StartResult StartFromCheckpoint(CheckpointStartRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        PreparedPipeline prepared;
+        try
+        {
+            prepared = Runner.Prepare(DotParser.Parse(request.Dot));
+        }
+        catch (DotParseException ex)
+        {
+            return new StartResult(null, [], ex.Message);
+        }
+
+        if (prepared.HasErrors)
+        {
+            return new StartResult(null, prepared.Diagnostics, "The pipeline has validation errors.");
+        }
+
+        var source = request.Checkpoint;
+        if (source.CurrentNode.Length > 0 && !prepared.Graph.ContainsNode(source.CurrentNode))
+        {
+            return new StartResult(null, prepared.Diagnostics, $"The checkpoint's stage '{source.CurrentNode}' does not exist in the pipeline.");
+        }
+
+        if (!TryResolveWorkingDirectory(request.WorkingDirectory, out var workingDirectory, out var error))
+        {
+            return new StartResult(null, prepared.Diagnostics, error);
+        }
+
+        var studio = request.Studio?.DeepClone().AsObject();
+        if (StudioTooLarge(studio))
+        {
+            return new StartResult(null, prepared.Diagnostics, $"The studio metadata exceeds {MaxStudioBytes} bytes.");
+        }
+
+        var id = NewRunId();
+        var logsRoot = NewLogsRoot(prepared.Graph.Name, id);
+        var checkpoint = Checkpoint.FromJson(source.ToJson());
+        checkpoint.RunId = id;
+        checkpoint.FinalStatus = null;
+        checkpoint.ContextValues["internal.run_id"] = id;
+        try
+        {
+            Directory.CreateDirectory(logsRoot);
+            File.WriteAllText(Path.Combine(logsRoot, "graph.dot"), request.Dot);
+            checkpoint.Save(Path.Combine(logsRoot, Checkpoint.FileName));
+            WriteJsonFile(Path.Combine(logsRoot, "manifest.json"), new System.Text.Json.Nodes.JsonObject
+            {
+                ["name"] = prepared.Graph.Name,
+                ["label"] = prepared.Graph.Label,
+                ["goal"] = prepared.Graph.Goal,
+                ["run_id"] = id,
+                ["started_at"] = DateTimeOffset.UtcNow.ToString("O"),
+                ["logs_root"] = logsRoot,
+                ["working_directory"] = workingDirectory,
+                ["node_count"] = prepared.Graph.Nodes.Count,
+                ["edge_count"] = prepared.Graph.Edges.Count,
+                ["loop_restarts"] = checkpoint.LoopRestarts,
+                ["reactor_version"] = PipelineRunner.Version,
+                ["resumed_from"] = source.CurrentNode,
+            });
+            WriteStudioFile(logsRoot, studio);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new StartResult(null, prepared.Diagnostics, $"Could not create the run directory: {ex.Message}");
+        }
+
+        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, null, Math.Max(100, _options.MaxEventsPerRun), studio);
+        _runs[id] = run;
+        run.Execution = ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options, ct));
         return new StartResult(run, prepared.Diagnostics, null);
     }
 
@@ -549,6 +723,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
                 InitialContext = run.InitialContext,
                 OnEvent = run.Record,
                 MaxSteps = Math.Max(0, _options.MaxStepsPerRun),
+                KeepCheckpointHistory = true,
             };
             var result = await body(options, token).ConfigureAwait(false);
             run.Finish(StatusOf(result), result, result.Cancelled ? null : FailureOf(result));
@@ -583,6 +758,59 @@ public sealed class PipelineRunManager : IAsyncDisposable
 
     private static string ResolveBase(ReactorServerOptions options) =>
         Path.GetFullPath(Path.IsPathRooted(options.LogsBaseDirectory) ? options.LogsBaseDirectory : Path.Combine(options.WorkingDirectory, options.LogsBaseDirectory));
+
+    private static string NewRunId() => Guid.NewGuid().ToString("N")[..12];
+
+    private string NewLogsRoot(string graphName, string id) =>
+        Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(graphName)}-{id}");
+
+    private bool TryResolveWorkingDirectory(string? requested, out string workingDirectory, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(requested))
+        {
+            workingDirectory = Path.GetFullPath(_options.WorkingDirectory);
+            return true;
+        }
+
+        workingDirectory = "";
+        if (!_options.AllowClientWorkingDirectory)
+        {
+            error = "This server does not allow clients to choose the working directory.";
+            return false;
+        }
+
+        workingDirectory = Path.GetFullPath(requested);
+        if (!Directory.Exists(workingDirectory))
+        {
+            error = $"Working directory '{workingDirectory}' does not exist.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool StudioTooLarge(System.Text.Json.Nodes.JsonObject? studio) =>
+        studio is not null && System.Text.Encoding.UTF8.GetByteCount(studio.ToJsonString()) > MaxStudioBytes;
+
+    /// <summary>Creates the run directory and writes <c>studio.json</c> into it (nothing when there is no metadata).</summary>
+    private static void WriteStudioFile(string logsRoot, System.Text.Json.Nodes.JsonObject? studio)
+    {
+        if (studio is null)
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(logsRoot);
+        WriteJsonFile(Path.Combine(logsRoot, StudioFileName), studio);
+    }
+
+    private static void WriteJsonFile(string path, System.Text.Json.Nodes.JsonNode json)
+    {
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, json.ToJsonString(IndentedJson));
+        File.Move(temp, path, overwrite: true);
+    }
 
     private static string Sanitize(string name)
     {

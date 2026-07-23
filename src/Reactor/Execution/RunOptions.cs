@@ -42,6 +42,14 @@ public sealed record RunOptions
 
     /// <summary>Additional event sinks (e.g. a server's per-run event stream).</summary>
     public IReadOnlyList<IPipelineEventSink>? EventSinks { get; init; }
+
+    /// <summary>
+    /// Also keep a copy of the checkpoint saved after each top-level stage, as
+    /// <c>{logs_root}/checkpoints/{index:D4}-{node}.json</c> (<c>index</c> is the stage's execution index, as in
+    /// <see cref="StageStarted.Index"/>), so the run can later be forked from any stage. Off by default. Skipped for
+    /// graphs with a node named <c>checkpoints</c>, whose stage directory would collide with the snapshots.
+    /// </summary>
+    public bool KeepCheckpointHistory { get; init; }
 }
 
 /// <summary>Runner-wide configuration.</summary>

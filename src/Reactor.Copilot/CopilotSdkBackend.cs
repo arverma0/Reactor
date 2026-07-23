@@ -39,6 +39,12 @@ public sealed record CopilotSdkBackendOptions
     /// runtime may silently substitute a different (possibly more expensive) model for an unavailable one.
     /// </summary>
     public bool VerifyModels { get; init; } = true;
+
+    /// <summary>
+    /// How often a running stage looks for <c>steering.md</c> in its stage directory (written by a supervisor or the
+    /// server's steer endpoint); its text is sent to the Copilot turn in progress.
+    /// </summary>
+    public TimeSpan SteeringPollInterval { get; init; } = TimeSpan.FromSeconds(1);
 }
 
 /// <summary>A Copilot stage failed. <see cref="Retryable"/> tells the engine whether a retry may help.</summary>
@@ -51,7 +57,8 @@ public sealed class CopilotStageException(string message, bool retryable, Except
 /// Runs codergen stages through the GitHub Copilot SDK: one Copilot runtime per backend, one Copilot session per stage
 /// (or per <c>full</c>-fidelity thread, continuing the conversation). Tool permissions are approved automatically,
 /// <c>tool_hooks</c> run through the SDK's pre/post tool hooks, and the
-/// agent may write <c>status.json</c>. Activity goes to the stage log and <c>{stage}/copilot-events.jsonl</c>.
+/// agent may write <c>status.json</c>. A <c>steering.md</c> written into the stage directory while the stage runs is sent
+/// to the turn in progress. Activity goes to the stage log and <c>{stage}/copilot-events.jsonl</c>.
 /// </summary>
 public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
 {
@@ -134,11 +141,15 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
         string? reply;
         using (var eventLog = new StageEventLog(stage.StageDirectory, "copilot-events.jsonl"))
         using (conversation.Subscribe(activity => OnActivity(activity, stats, eventLog, Log)))
+        using (var steeringCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
         {
             var timeout = stage.Timeout is { } nodeTimeout && nodeTimeout > TimeSpan.Zero ? nodeTimeout + TimeSpan.FromSeconds(30) : _options.MaxStageDuration;
+            var steering = Task.CompletedTask;
             try
             {
-                reply = await conversation.SendAndWaitAsync(prompt, timeout, cancellationToken).ConfigureAwait(false);
+                var turn = conversation.SendAndWaitAsync(prompt, timeout, cancellationToken);
+                steering = WatchSteeringAsync(stage, conversation, turn, eventLog, Log, steeringCts.Token);
+                reply = await turn.ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -159,6 +170,11 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
                 }
 
                 throw new CopilotStageException($"Copilot session failed: {ex.Message}", retryable: true, ex);
+            }
+            finally
+            {
+                await steeringCts.CancelAsync().ConfigureAwait(false);
+                await steering.ConfigureAwait(false);
             }
         }
 
@@ -345,6 +361,36 @@ public sealed class CopilotSdkBackend : ICodergenBackend, IAsyncDisposable
                 break;
         }
     }
+
+    /// <summary>
+    /// Sends steering (<c>steering.md</c> in the stage directory) to the Copilot turn in progress as an immediate message,
+    /// which the runtime folds into the running turn. Nothing is taken once the turn has finished.
+    /// </summary>
+    private Task WatchSteeringAsync(StageSettings stage, ICopilotConversation conversation, Task turn, StageEventLog eventLog, Action<string, string> log, CancellationToken cancellationToken) =>
+        SteeringFile.WatchAsync(
+            stage.StageDirectory,
+            _options.SteeringPollInterval,
+            async text =>
+            {
+                eventLog.Write(new JsonObject { ["type"] = "steering", ["content"] = text, ["sent"] = !turn.IsCompleted });
+                if (turn.IsCompleted)
+                {
+                    log("steering arrived after Copilot finished the stage; it was not sent", "warn");
+                    return;
+                }
+
+                try
+                {
+                    await conversation.SteerAsync(text, cancellationToken).ConfigureAwait(false);
+                    log($"steering sent to Copilot: {LogText.Clip(text)}", "info");
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    log($"copilot-sdk: could not send steering: {ex.Message}", "warn");
+                }
+            },
+            accepting: () => !turn.IsCompleted,
+            cancellationToken);
 
     internal static bool IsRetryable(CopilotActivity.Error error)
     {

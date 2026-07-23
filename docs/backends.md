@@ -59,8 +59,9 @@ installed. `--model` sets the default model for stages without `llm_model`.
 - **Status file**: the prompt tells the agent where `status.json` lives; if the agent stops at a turn limit without
   writing it, the stage fails ("stopped at its turn limit") instead of silently succeeding, so a stuck agent cannot
   run unattended forever.
-- **Steering**: a supervisor (`house` node) writes `steering.md` into the stage directory; the backend polls for it
-  and injects it into the running session.
+- **Steering**: a supervisor (`house` node) or the server (`POST /studio/api/pipelines/{id}/steer`) writes
+  `steering.md` into the stage directory; the backend polls for it (every second, `SteeringPollInterval`), renames it
+  to `steering.consumed-N.md`, and injects the text into the running session before its next model request.
 - **Hooks**: `tool_hooks.pre/post` run around every tool call (see [pipelines.md](pipelines.md#tool-hooks)).
 - **Artifacts**: `transcript.md` (the conversation) and `agent-events.jsonl` (every session event).
 - Node attributes: `agent.max_tool_rounds`, `agent.max_turns`, `agent.max_tokens`, `agent.instructions` (appended
@@ -97,6 +98,10 @@ Authentication is the signed-in Copilot user (sign in once with the `copilot` CL
   deny a call. Directories a stage needs outside its working directory (its stage directory) are added to the
   session's allow-list.
 - `SendAndWaitAsync` is bounded by the node `timeout` (plus 30 s) or 4 hours; cancellation aborts the Copilot turn.
+- **Steering**: while the turn runs, a `steering.md` in the stage directory (from a supervisor or the server's steer
+  endpoint) is taken like on the `agent` backend and sent with `SendAsync(new MessageOptions { Mode = "immediate" })`,
+  which the runtime folds into the turn in progress. Nothing is taken once the turn has ended; a message that arrives
+  in the instant the turn ends is logged as not sent.
 - Usage (input/output/cached/reasoning tokens, AI units) is summed per stage into `backend.json`; activity is in
   `copilot-events.jsonl`.
 

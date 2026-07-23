@@ -40,7 +40,7 @@ public sealed record AgentLoopBackendOptions
     /// <summary>Additional interceptors (approval gates, auditing) applied to every session.</summary>
     public IReadOnlyList<IToolInterceptor> Interceptors { get; init; } = [];
 
-    /// <summary>How often to look for a supervisor's <c>steering.md</c> in the stage directory.</summary>
+    /// <summary>How often to look for a <c>steering.md</c> (from a supervisor or the server's steer endpoint) in the stage directory.</summary>
     public TimeSpan SteeringPollInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>Reuse one session per <c>full</c>-fidelity thread (default true).</summary>
@@ -245,48 +245,22 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
         }
     }
 
-    private async Task WatchSteeringAsync(string? stageDirectory, Session session, Action<string, string> log, CancellationToken cancellationToken)
-    {
-        if (stageDirectory is null)
-        {
-            return;
-        }
-
-        var path = Path.Combine(stageDirectory, "steering.md");
-        var consumed = 0;
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
+    private Task WatchSteeringAsync(string? stageDirectory, Session session, Action<string, string> log, CancellationToken cancellationToken) =>
+        SteeringFile.WatchAsync(
+            stageDirectory,
+            _options.SteeringPollInterval,
+            text =>
             {
-                await Task.Delay(_options.SteeringPollInterval, cancellationToken).ConfigureAwait(false);
-                if (!File.Exists(path))
+                if (session.State != SessionState.Closed)
                 {
-                    continue;
+                    session.Steer(text);
+                    log("steering message (steering.md) queued for the agent", "info");
                 }
 
-                string text;
-                try
-                {
-                    text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
-                    consumed++;
-                    File.Move(path, Path.Combine(stageDirectory, $"steering.consumed-{consumed}.md"), overwrite: true);
-                }
-                catch (IOException)
-                {
-                    continue; // Still being written; try again next poll.
-                }
-
-                if (!string.IsNullOrWhiteSpace(text) && session.State != SessionState.Closed)
-                {
-                    session.Steer(text.Trim());
-                    log("supervisor steering queued for the agent", "info");
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-    }
+                return Task.CompletedTask;
+            },
+            accepting: null,
+            cancellationToken);
 
     private static void WriteTranscript(string? stageDirectory, Session session)
     {

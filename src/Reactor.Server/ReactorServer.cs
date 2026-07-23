@@ -51,6 +51,7 @@ public static class ReactorServer
         services.AddSingleton<PipelineRunManager>();
         services.AddSingleton(new Studio.StudioWorkspace(options.WorkingDirectory, options.MaxDotBytes));
         services.AddSingleton<Studio.StudioFeatures>();
+        services.AddSingleton<Studio.RunHistory>();
         services.ConfigureHttpJsonOptions(json =>
         {
             json.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
@@ -81,6 +82,7 @@ public static class ReactorServer
         app.MapGet("/console", () => Asset("index.html", "text/html; charset=utf-8"));
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
         app.MapStudioApi();
+        app.MapFlightsApi();
 
         app.MapPost("/pipelines", StartAsync);
         app.MapPost("/run", StartAsync);
@@ -483,6 +485,7 @@ public static class ReactorServer
             goal = run.Goal,
             status = run.Status,
             current_node = run.CurrentNode,
+            active_nodes = run.ActiveNodes,
             completed_nodes = run.CompletedNodes,
             node_statuses = run.NodeStatuses,
             created_at = run.CreatedAt,
@@ -505,6 +508,7 @@ public static class ReactorServer
                     completed_nodes = result.CompletedNodes,
                 }
                 : null,
+            studio = run.Studio,
             links = Links(run),
         };
     }

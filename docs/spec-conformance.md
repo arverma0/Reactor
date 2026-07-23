@@ -109,6 +109,13 @@ validated against real agents.
   per stage on the `agent` backend (the session-level default stays unlimited, as specified).
 - Copilot model verification against the account's model list (the runtime otherwise substitutes models silently).
 - `reactor doctor`, `reactor render` with status colors, the web console, stage artifact endpoints.
+- Per-stage checkpoint snapshots (`RunOptions.KeepCheckpointHistory`, `checkpoints/{index}-{node}.json`; on for
+  server runs) and forks: a new run that resumes from any snapshot, optionally with an edited pipeline
+  (`POST /studio/api/runs/{id}/fork`). The fork continues after the snapshot's stage; the working directory is not
+  rewound.
+- A disk-backed run history (server and CLI runs, loop restarts folded in), event replay, telemetry aggregated per
+  stage across runs, and user steering of a running agent stage (`agent` and `copilot` backends) — the Studio
+  "flights" API in [http-api.md](http-api.md).
 
 ## Live validation
 
