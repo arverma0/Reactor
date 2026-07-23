@@ -85,7 +85,7 @@ const SAMPLE = `digraph Example {
 const TERMINAL = ["success", "partial_success", "fail", "cancelled", "error"];
 const EVENT_TYPES = ["PipelineStarted", "PipelineCompleted", "PipelineFailed", "StageStarted", "StageCompleted", "StageFailed", "StageRetrying", "StageLog",
   "EdgeSelected", "GoalGateUnsatisfied", "LoopRestarted", "ParallelStarted", "ParallelBranchStarted", "ParallelBranchCompleted", "ParallelCompleted",
-  "InterviewStarted", "InterviewCompleted", "InterviewTimeout", "CheckpointSaved"];
+  "InterviewStarted", "InterviewCompleted", "InterviewTimeout", "CheckpointSaved", "ArtifactProduced"];
 const state = { runs: [], selected: null, detail: null, tab: "graph", source: null, events: [], stage: null, refreshTimer: null };
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, attrs = {}, ...children) => {

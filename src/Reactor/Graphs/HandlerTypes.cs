@@ -108,6 +108,12 @@ public static class AttrKeys
     public const string HumanDefaultChoice = "human.default_choice";
     public const string HumanTimeout = "human.timeout";
 
+    /// <summary>Reactor extension: comma-separated artifact names the stage consumes (see <see cref="ArtifactPins"/>).</summary>
+    public const string Inputs = "inputs";
+
+    /// <summary>Reactor extension: comma-separated <c>name</c> or <c>name:path</c> artifacts the stage produces.</summary>
+    public const string Outputs = "outputs";
+
     // Edge
     public const string Condition = "condition";
     public const string Weight = "weight";

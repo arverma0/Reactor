@@ -98,6 +98,12 @@ internal sealed class ConsoleReporter
             case CheckpointSaved checkpoint when _verbosity == Verbosity.Verbose:
                 Write(Paint($"  ⛁ checkpoint after {checkpoint.NodeId}", Dim));
                 break;
+            case ArtifactProduced artifact when _verbosity != Verbosity.Quiet:
+                var version = artifact.Version.ToString(CultureInfo.InvariantCulture);
+                Write(Paint(artifact.Path is null
+                    ? $"  ⇢ {artifact.Name} v{version} (text, {Size(artifact.Bytes)})"
+                    : $"  ⇢ {artifact.Name} v{version} → {artifact.Path} ({Size(artifact.Bytes)})", Cyan));
+                break;
         }
     }
 
@@ -177,6 +183,13 @@ internal sealed class ConsoleReporter
     private string Paint(string text, string code) => _color && code.Length > 0 ? code + text + Reset : text;
 
     private static string Seconds(TimeSpan duration) => duration.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture) + "s";
+
+    private static string Size(long bytes) => bytes switch
+    {
+        < 1024 => bytes.ToString(CultureInfo.InvariantCulture) + " B",
+        < 1024 * 1024 => (bytes / 1024.0).ToString("0.#", CultureInfo.InvariantCulture) + " KB",
+        _ => (bytes / (1024.0 * 1024)).ToString("0.#", CultureInfo.InvariantCulture) + " MB",
+    };
 
     private static string Clip(string text, int max)
     {

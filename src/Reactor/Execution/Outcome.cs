@@ -93,6 +93,14 @@ public sealed record Outcome
     /// </summary>
     public string? JumpTo { get; init; }
 
+    /// <summary>
+    /// Reactor extension: the artifacts this outcome records (set by <see cref="StageArtifacts"/>; the records themselves are
+    /// in <see cref="ContextUpdates"/> as <c>artifacts.&lt;name&gt;</c>). When the engine records the outcome it emits an
+    /// <see cref="Events.ArtifactProduced"/> event for each, so attempts that are retried announce nothing. Not part of
+    /// the status file.
+    /// </summary>
+    public IReadOnlyList<ArtifactRecord> Artifacts { get; init; } = [];
+
     public bool IsSuccessful => Status.IsSuccessful();
 
     public static Outcome Success(string notes = "", IReadOnlyDictionary<string, object?>? contextUpdates = null) =>

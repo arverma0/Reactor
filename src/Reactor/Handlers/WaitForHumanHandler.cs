@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using Reactor.Events;
 using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Human;
@@ -37,7 +35,7 @@ public sealed class WaitForHumanHandler : ISelfTimedHandler
                 Stage = node.Id,
                 TimeoutSeconds = timeout?.TotalSeconds,
             };
-            var freeAnswer = await AskAsync(interviewer, freeform, events, cancellationToken).ConfigureAwait(false);
+            var freeAnswer = await interviewer.AskAndReportAsync(freeform, events, cancellationToken).ConfigureAwait(false);
             if (freeAnswer.IsSkipped)
             {
                 return Outcome.Fail("human skipped interaction");
@@ -79,7 +77,7 @@ public sealed class WaitForHumanHandler : ISelfTimedHandler
             TimeoutSeconds = timeout?.TotalSeconds,
         };
 
-        var answer = await AskAsync(interviewer, question, events, cancellationToken).ConfigureAwait(false);
+        var answer = await interviewer.AskAndReportAsync(question, events, cancellationToken).ConfigureAwait(false);
         Choice? selected;
         if (answer.IsTimeout)
         {
@@ -116,41 +114,6 @@ public sealed class WaitForHumanHandler : ISelfTimedHandler
                 ["human.gate.target"] = selected.To,
             },
         };
-    }
-
-    private static async Task<Answer> AskAsync(IInterviewer interviewer, Question question, IPipelineEventSink? events, CancellationToken cancellationToken)
-    {
-        events?.Emit(new InterviewStarted(question.Id, question.Text, question.Stage, question.Options, question.Type.ToString()));
-        var stopwatch = Stopwatch.StartNew();
-        Answer answer;
-        if (question.TimeoutSeconds is { } seconds && seconds > 0)
-        {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(seconds));
-            try
-            {
-                answer = await interviewer.AskAsync(question, timeoutCts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                answer = question.Default ?? Answer.Timeout();
-            }
-        }
-        else
-        {
-            answer = await interviewer.AskAsync(question, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (answer.IsTimeout)
-        {
-            events?.Emit(new InterviewTimeout(question.Id, question.Text, question.Stage, stopwatch.Elapsed));
-        }
-        else
-        {
-            events?.Emit(new InterviewCompleted(question.Id, question.Text, answer.ToString(), stopwatch.Elapsed));
-        }
-
-        return answer;
     }
 
     private static Choice? Match(string value, List<Choice> choices)

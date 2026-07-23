@@ -42,6 +42,14 @@ public sealed record RunOptions
 
     /// <summary>Additional event sinks (e.g. a server's per-run event stream).</summary>
     public IReadOnlyList<IPipelineEventSink>? EventSinks { get; init; }
+
+    /// <summary>
+    /// Also keep a copy of the checkpoint saved after each top-level stage, as
+    /// <c>{logs_root}/checkpoints/{index:D4}-{node}.json</c> (<c>index</c> is the stage's execution index, as in
+    /// <see cref="StageStarted.Index"/>), so the run can later be forked from any stage. Off by default. Skipped for
+    /// graphs with a node named <c>checkpoints</c>, whose stage directory would collide with the snapshots.
+    /// </summary>
+    public bool KeepCheckpointHistory { get; init; }
 }
 
 /// <summary>Runner-wide configuration.</summary>
@@ -58,6 +66,16 @@ public sealed record PipelineRunnerOptions
 
     /// <summary>Append every event to <c>{logs_root}/events.jsonl</c>.</summary>
     public bool WriteEventLog { get; init; } = true;
+
+    /// <summary>
+    /// Write the run directory (default true): <c>graph.dot</c>, <c>manifest.json</c>, a directory with <c>status.json</c> per
+    /// stage, <c>checkpoint.json</c> after every stage, and <c>result.json</c>. When false the engine keeps the run in memory
+    /// and does no file I/O of its own: it writes none of these files, emits no <see cref="Events.CheckpointSaved"/> events
+    /// (so the run cannot be resumed), and a <c>status.json</c> written by a handler that returns no outcome is read and then
+    /// removed. Handlers may still write their own files, and <see cref="WriteEventLog"/> still applies. Meant for throwaway
+    /// runs such as simulation samples.
+    /// </summary>
+    public bool PersistRunState { get; init; } = true;
 
     /// <summary>Default branch concurrency for parallel nodes without <c>max_parallel</c>.</summary>
     public int DefaultMaxParallel { get; init; } = 4;

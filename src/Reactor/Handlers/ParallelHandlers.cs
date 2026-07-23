@@ -10,12 +10,30 @@ namespace Reactor.Handlers;
 /// <summary>
 /// Parallel fan-out (spec 4.8): runs every outgoing branch concurrently (bounded by <c>max_parallel</c>, default 4), each
 /// on an isolated clone of the context, until each branch reaches a join point (fan-in node, exit, or dead end).
-/// Results are stored in <c>parallel.results</c>; branch context changes are not merged back. The engine then continues at
-/// the branches' common join node. Join policies: <c>wait_all</c> (default; SUCCESS when no branch failed, else
-/// PARTIAL_SUCCESS) and <c>first_success</c> (SUCCESS as soon as one branch succeeds; the rest are cancelled).
+/// Results are stored in <c>parallel.results</c>; branch context changes are not merged back, except artifact records
+/// (<c>artifacts.*</c>, a Reactor extension; see <see cref="StageArtifacts.MergeBranchRecords"/>), which are merged in branch
+/// declaration order from every branch that ran, failed ones included. The engine then continues at the branches' common
+/// join node. Join policies: <c>wait_all</c> (default; SUCCESS when no branch failed, else PARTIAL_SUCCESS) and
+/// <c>first_success</c> (SUCCESS as soon as one branch succeeds; the rest are cancelled and contribute no artifacts).
 /// </summary>
 public sealed class ParallelHandler : INodeHandler
 {
+    private readonly bool _sequential;
+
+    public ParallelHandler()
+    {
+    }
+
+    /// <summary>
+    /// With <paramref name="sequential"/>, branches run one at a time in edge order instead of concurrently, which makes the
+    /// result independent of thread scheduling (used by simulations): with <c>first_success</c>, the first branch in edge
+    /// order that succeeds wins and later branches are not started.
+    /// </summary>
+    internal ParallelHandler(bool sequential)
+    {
+        _sequential = sequential;
+    }
+
     public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(node);
@@ -36,6 +54,7 @@ public sealed class ParallelHandler : INodeHandler
         }
 
         var maxParallel = Math.Max(1, AttributeValues.ParseInt(node[AttrKeys.MaxParallel]) ?? run.RunnerOptions.DefaultMaxParallel);
+        var forkValues = context.Snapshot();
         var stopwatch = Stopwatch.StartNew();
         run.Events.Emit(new ParallelStarted(node.Id, branches.Count));
 
@@ -43,7 +62,7 @@ public sealed class ParallelHandler : INodeHandler
         using var firstSuccessCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var results = new BranchResult[branches.Count];
 
-        var tasks = branches.Select((edge, index) => Task.Run(async () =>
+        async Task RunBranchAsync(Edge edge, int index)
         {
             await gate.WaitAsync(firstSuccessCts.Token).ConfigureAwait(false);
             try
@@ -74,15 +93,28 @@ public sealed class ParallelHandler : INodeHandler
             {
                 gate.Release();
             }
-        }, CancellationToken.None)).ToList();
-
-        try
-        {
-            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (firstSuccessCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+
+        if (_sequential)
         {
-            // Branches still waiting for a slot were cancelled by first_success.
+            for (var i = 0; i < branches.Count && !firstSuccessCts.IsCancellationRequested; i++)
+            {
+                await RunBranchAsync(branches[i], i).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        else
+        {
+            var tasks = branches.Select((edge, index) => Task.Run(() => RunBranchAsync(edge, index), CancellationToken.None)).ToList();
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (firstSuccessCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // Branches still waiting for a slot were cancelled by first_success.
+            }
         }
 
         for (var i = 0; i < results.Length; i++)
@@ -105,6 +137,12 @@ public sealed class ParallelHandler : INodeHandler
             ["parallel.join_node"] = join ?? "",
             ["parallel.source_node"] = node.Id,
         };
+
+        // Reactor extension: artifact records are the one part of branch contexts merged back (in branch declaration order).
+        foreach (var (key, value) in StageArtifacts.MergeBranchRecords(forkValues, results.Select(r => r.Context)))
+        {
+            updates[key] = value;
+        }
 
         var summary = Summarize(results);
         Outcome outcome = joinPolicy switch

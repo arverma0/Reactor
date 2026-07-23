@@ -24,6 +24,18 @@ public sealed class Graph
     /// <summary>The file the graph was loaded from, when available (relative child pipeline paths may resolve against it).</summary>
     public string? SourcePath { get; set; }
 
+    /// <summary>
+    /// Top-level <c>node [...]</c> defaults as declared in the source (already merged into each node's attributes; kept so
+    /// editors can write them back).
+    /// </summary>
+    public Dictionary<string, string> NodeDefaults { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Top-level <c>edge [...]</c> defaults as declared in the source (already merged into each edge's attributes).</summary>
+    public Dictionary<string, string> EdgeDefaults { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Subgraph blocks recorded by the parser (structure only; the engine works on the flattened graph).</summary>
+    public List<SubgraphInfo> Subgraphs { get; } = [];
+
     public IReadOnlyDictionary<string, Node> Nodes => _nodes;
 
     public IReadOnlyList<Edge> Edges => _edges;
@@ -167,6 +179,17 @@ public sealed class Graph
             clone.AddEdge(edge.Clone());
         }
 
+        foreach (var (key, value) in NodeDefaults)
+        {
+            clone.NodeDefaults[key] = value;
+        }
+
+        foreach (var (key, value) in EdgeDefaults)
+        {
+            clone.EdgeDefaults[key] = value;
+        }
+
+        clone.Subgraphs.AddRange(Subgraphs.Select(s => s.Clone()));
         return clone;
     }
 

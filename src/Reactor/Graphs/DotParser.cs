@@ -332,11 +332,12 @@ public static class DotParser
 
     private sealed class Scope
     {
-        public Scope(Dictionary<string, string> attributes, Scope? parent, string? name)
+        public Scope(Dictionary<string, string> attributes, Scope? parent, string? name, SubgraphInfo? info = null)
         {
             Attributes = attributes;
             Parent = parent;
             Name = name;
+            Info = info;
             NodeDefaults = parent is null ? new(StringComparer.Ordinal) : new(parent.NodeDefaults, StringComparer.Ordinal);
             EdgeDefaults = parent is null ? new(StringComparer.Ordinal) : new(parent.EdgeDefaults, StringComparer.Ordinal);
         }
@@ -347,17 +348,26 @@ public static class DotParser
 
         public string? Name { get; }
 
+        /// <summary>The structural record of this subgraph (null for the root scope).</summary>
+        public SubgraphInfo? Info { get; }
+
         public bool IsRoot => Parent is null;
 
         public Dictionary<string, string> NodeDefaults { get; }
 
         public Dictionary<string, string> EdgeDefaults { get; }
 
+        /// <summary>Defaults declared in this scope itself (excluding inherited ones).</summary>
+        public Dictionary<string, string> DeclaredNodeDefaults { get; } = new(StringComparer.Ordinal);
+
+        public Dictionary<string, string> DeclaredEdgeDefaults { get; } = new(StringComparer.Ordinal);
+
         public List<Node> Members { get; } = [];
     }
 
     private sealed class Parser(List<Token> tokens)
     {
+        private readonly Dictionary<string, Scope> _innermostScope = new(StringComparer.Ordinal);
         private int _position;
         private Graph _graph = null!;
 
@@ -401,6 +411,15 @@ public static class DotParser
             var root = new Scope(_graph.Attributes, parent: null, name: null);
             ParseStatements(root);
             Expect(TokenKind.RBrace, "'}' to close the graph body");
+            foreach (var (key, value) in root.DeclaredNodeDefaults)
+            {
+                _graph.NodeDefaults[key] = value;
+            }
+
+            foreach (var (key, value) in root.DeclaredEdgeDefaults)
+            {
+                _graph.EdgeDefaults[key] = value;
+            }
 
             var trailing = Peek();
             if (trailing.Kind != TokenKind.End)
@@ -458,11 +477,15 @@ public static class DotParser
                         return;
                     case "node":
                         Next();
-                        Merge(scope.NodeDefaults, ParseAttributeBlocks(required: true));
+                        var nodeDefaults = ParseAttributeBlocks(required: true);
+                        Merge(scope.NodeDefaults, nodeDefaults);
+                        Merge(scope.DeclaredNodeDefaults, nodeDefaults);
                         return;
                     case "edge":
                         Next();
-                        Merge(scope.EdgeDefaults, ParseAttributeBlocks(required: true));
+                        var edgeDefaults = ParseAttributeBlocks(required: true);
+                        Merge(scope.EdgeDefaults, edgeDefaults);
+                        Merge(scope.DeclaredEdgeDefaults, edgeDefaults);
                         return;
                     case "subgraph":
                         Next();
@@ -555,9 +578,27 @@ public static class DotParser
         private void ParseSubgraphBody(Scope parent, string? name)
         {
             Expect(TokenKind.LBrace, "'{' to open the subgraph");
-            var scope = new Scope(new Dictionary<string, string>(StringComparer.Ordinal), parent, name);
+            var info = new SubgraphInfo(name, parent.Info?.Name, _graph.Subgraphs.Count) { ParentIndex = parent.Info?.Index ?? -1 };
+            _graph.Subgraphs.Add(info);
+            var scope = new Scope(new Dictionary<string, string>(StringComparer.Ordinal), parent, name, info);
             ParseStatements(scope);
             Expect(TokenKind.RBrace, "'}' to close the subgraph");
+
+            foreach (var (key, value) in scope.Attributes)
+            {
+                info.Attributes[key] = value;
+            }
+
+            Merge(info.NodeDefaults, scope.DeclaredNodeDefaults);
+            Merge(info.EdgeDefaults, scope.DeclaredEdgeDefaults);
+            foreach (var node in scope.Members)
+            {
+                // Inner subgraphs close first, so the first scope to claim a node is its innermost one.
+                if (_innermostScope.TryAdd(node.Id, scope))
+                {
+                    info.NodeIds.Add(node.Id);
+                }
+            }
 
             var label = scope.Attributes.GetValueOrDefault(AttrKeys.Label);
             var derived = string.IsNullOrWhiteSpace(label) ? null : DeriveClassName(label);

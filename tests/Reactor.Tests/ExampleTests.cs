@@ -1,3 +1,4 @@
+using Reactor.Events;
 using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Human;
@@ -28,6 +29,7 @@ public sealed class ExampleTests
     [InlineData("stylesheet.dot")]
     [InlineData("child-worker.dot")]
     [InlineData("supervisor.dot")]
+    [InlineData("artifacts.dot")]
     public async Task Example_completes_in_simulation_mode(string name)
     {
         using var dir = new TempDir();
@@ -69,6 +71,73 @@ public sealed class ExampleTests
         Assert.Contains("plan", checkpoint.CompletedNodes);
         Assert.Contains("implement", checkpoint.CompletedNodes);
         Assert.Contains("review", checkpoint.CompletedNodes);
+    }
+
+    [Fact]
+    public async Task Artifacts_example_is_lint_clean_and_records_every_artifact_in_simulation()
+    {
+        var graph = DotParser.ParseFile(Path.Combine(ExamplesDirectory(), "artifacts.dot"));
+        var runner = TestPipelines.Runner();
+        Assert.Empty(runner.Prepare(graph).Diagnostics);
+
+        using var dir = new TempDir();
+        var events = new List<PipelineEvent>();
+        var result = await runner.RunAsync(graph, TestPipelines.Options(dir) with { OnEvent = events.Add }, TestContext.Current.CancellationToken);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Equal(["start", "spec", "architect", "implement", "test", "review", "exit"], result.CompletedNodes);
+        Assert.Equal(["spec", "design", "changes", "test_report", "verdict"], events.OfType<ArtifactProduced>().Select(e => e.Name));
+        var report = Assert.IsType<Dictionary<string, object?>>(result.Context["artifacts.test_report"]);
+        Assert.StartsWith("No tests were run", (string)report["text"]!, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(Path.Combine(dir.Path, "docs")), "simulated stages do not write files");
+
+        var implement = File.ReadAllText(Path.Combine(result.LogsRoot, "implement", "prompt.md"));
+        Assert.Contains("- `design` — file `docs/DESIGN.md` (written by stage `architect`). Read it.", implement, StringComparison.Ordinal);
+        Assert.Contains("- `test_report` — not produced yet in this run.", implement, StringComparison.Ordinal);
+        Assert.Contains("- `verdict` — not produced yet in this run.", implement, StringComparison.Ordinal);
+        Assert.Contains("- `changes` → your final response is recorded as this artifact", implement, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Artifacts_example_loops_review_feedback_back_to_the_implementer()
+    {
+        using var dir = new TempDir();
+        var reviews = 0;
+        string WriteDoc(Node node, PipelineContext context, string path)
+        {
+            var full = Path.Combine(context.Run!.WorkingDirectory, path);
+            Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+            File.WriteAllText(full, $"# {node.Label}\n");
+            return $"wrote {path}";
+        }
+
+        var backend = new ScriptedBackend { SupportsStatusFile = true }
+            .On("spec", (node, _, context) => WriteDoc(node, context, "docs/SPEC.md"))
+            .On("architect", (node, _, context) => WriteDoc(node, context, "docs/DESIGN.md"))
+            .On("review", (node, prompt, context) =>
+            {
+                Assert.Contains("- `test_report` — text from stage `test`", prompt, StringComparison.Ordinal);
+                if (++reviews == 1)
+                {
+                    File.WriteAllText(Path.Combine(context.Run!.StageDirectory(node.Id), "status.json"), """{"outcome":"success","preferred_label":"Revise"}""");
+                    return "Handle empty strings.";
+                }
+
+                Assert.Contains("- `test_report` — text from stage `test` (version 2):", prompt, StringComparison.Ordinal);
+                return "Ready to merge.";
+            });
+
+        var result = await TestPipelines.Runner(backend).RunAsync(DotParser.ParseFile(Path.Combine(ExamplesDirectory(), "artifacts.dot")), TestPipelines.Options(dir), TestContext.Current.CancellationToken);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        Assert.Equal(StageStatus.Success, result.NodeOutcomes["review"].Status);
+        Assert.Equal(2, backend.CallCount("implement"));
+        var second = backend.Calls.Where(c => c.NodeId == "implement").Last().Prompt;
+        Assert.Contains("- `verdict` — text from stage `review`:\n  > Handle empty strings.", second, StringComparison.Ordinal);
+        var verdict = Assert.IsType<Dictionary<string, object?>>(result.Context["artifacts.verdict"]);
+        Assert.Equal(2L, verdict["version"]);
+        Assert.Equal("Ready to merge.", verdict["text"]);
+        Assert.Equal(64, ((string)Assert.IsType<Dictionary<string, object?>>(result.Context["artifacts.design"])["sha256"]!).Length);
     }
 
     internal static string ExamplesDirectory()

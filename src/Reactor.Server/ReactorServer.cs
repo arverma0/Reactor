@@ -14,6 +14,7 @@ using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Human;
 using Reactor.Rendering;
+using Reactor.Server.Studio;
 using Reactor.Validation;
 
 namespace Reactor.Server;
@@ -48,6 +49,9 @@ public static class ReactorServer
         ArgumentNullException.ThrowIfNull(options);
         services.AddSingleton(options);
         services.AddSingleton<PipelineRunManager>();
+        services.AddSingleton(new Studio.StudioWorkspace(options.WorkingDirectory, options.MaxDotBytes));
+        services.AddSingleton<Studio.StudioFeatures>();
+        services.AddSingleton<Studio.RunHistory>();
         services.ConfigureHttpJsonOptions(json =>
         {
             json.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
@@ -74,8 +78,13 @@ public static class ReactorServer
             await next(http).ConfigureAwait(false);
         });
 
-        app.MapGet("/", () => Asset("index.html", "text/html; charset=utf-8"));
+        app.MapStudioAssets();
+        app.MapGet("/console", () => Asset("index.html", "text/html; charset=utf-8"));
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+        app.MapStudioApi();
+        app.MapFlightsApi();
+        app.MapSimulationApi();
+        app.MapArchitectApi();
 
         app.MapPost("/pipelines", StartAsync);
         app.MapPost("/run", StartAsync);
@@ -159,6 +168,9 @@ public static class ReactorServer
             status = run.Status,
             name = run.Name,
             logs_root = run.LogsRoot,
+            simulated = run.Simulation is null ? (bool?)null : true,
+            simulation_mode = run.Simulation?.ModeName,
+            simulation_seed = run.Simulation?.Seed,
             diagnostics = result.Diagnostics.Select(DiagnosticDto.From),
             links = Links(run),
         });
@@ -440,7 +452,36 @@ public static class ReactorServer
         }
 
         var workingDirectory = json["working_directory"] is JsonValue wd && wd.TryGetValue<string>(out var dir) ? dir : null;
-        return (new StartRequest { Dot = dot, Context = context, WorkingDirectory = workingDirectory }, null);
+
+        // "simulation": {...}; true and "stochastic"/"interactive" are shorthands. Anything else is rejected rather than
+        // ignored, so a malformed simulation request can never start a real run.
+        JsonObject? simulation;
+        switch (json["simulation"])
+        {
+            case null:
+                simulation = null;
+                break;
+            case JsonObject settings:
+                simulation = settings;
+                break;
+            case JsonValue flag when flag.GetValueKind() is JsonValueKind.True or JsonValueKind.False:
+                simulation = flag.GetValueKind() == JsonValueKind.True ? new JsonObject() : null;
+                break;
+            case JsonValue mode when mode.GetValueKind() == JsonValueKind.String:
+                simulation = new JsonObject { ["mode"] = mode.GetValue<string>() };
+                break;
+            default:
+                return (null, "'simulation' must be an object such as {\"mode\": \"stochastic\", \"scenario\": {...}}.");
+        }
+
+        return (new StartRequest
+        {
+            Dot = dot,
+            Context = context,
+            WorkingDirectory = workingDirectory,
+            Simulation = simulation,
+            Studio = json["studio"] as JsonObject,
+        }, null);
     }
 
     private static IResult WithRun(PipelineRunManager manager, string id, Func<ManagedRun, IResult> action) =>
@@ -459,6 +500,8 @@ public static class ReactorServer
         started_at = run.StartedAt,
         finished_at = run.FinishedAt,
         pending_questions = run.Interviewer.Pending.Count,
+        simulated = run.Simulation is null ? (bool?)null : true,
+        simulation_mode = run.Simulation?.ModeName,
     };
 
     private static object Detail(ManagedRun run)
@@ -471,6 +514,7 @@ public static class ReactorServer
             goal = run.Goal,
             status = run.Status,
             current_node = run.CurrentNode,
+            active_nodes = run.ActiveNodes,
             completed_nodes = run.CompletedNodes,
             node_statuses = run.NodeStatuses,
             created_at = run.CreatedAt,
@@ -493,6 +537,10 @@ public static class ReactorServer
                     completed_nodes = result.CompletedNodes,
                 }
                 : null,
+            studio = run.Studio,
+            simulated = run.Simulation is null ? (bool?)null : true,
+            simulation_mode = run.Simulation?.ModeName,
+            simulation_seed = run.Simulation?.Seed,
             links = Links(run),
         };
     }
@@ -509,7 +557,7 @@ public static class ReactorServer
     };
 
     private static bool RequiresAuth(PathString path) =>
-        !(path == "/" || path == "/healthz" || path.StartsWithSegments("/assets", StringComparison.Ordinal));
+        !(path == "/console" || path == "/healthz" || StudioAssets.IsPublicPath(path));
 
     private static bool Authorized(HttpContext http, string? token)
     {

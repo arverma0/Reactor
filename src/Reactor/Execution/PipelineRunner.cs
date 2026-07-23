@@ -182,6 +182,8 @@ public sealed class PipelineRunner
 
         private ICodergenBackend? Backend => _options.Backend ?? _runner.Options.Backend;
 
+        private bool Persist => _runner.Options.PersistRunState;
+
         public async Task<PipelineResult> RunAsync(CancellationToken cancellationToken)
         {
             InitializeRunDirectory(fresh: true);
@@ -406,7 +408,7 @@ public sealed class PipelineRunner
             _lastFidelity = fidelity;
             _lastThreadId = threadId;
             _previousNodeId = node.Id;
-            SaveCheckpoint(node.Id, finalStatus: null);
+            SaveCheckpoint(node.Id, finalStatus: null, snapshotIndex: index);
             return outcome;
         }
 
@@ -463,7 +465,10 @@ public sealed class PipelineRunner
             {
                 SetRetryCount(node.Id, attempt - 1, context);
                 Emit(new StageStarted(node.Id, node.Label, index, handlerType, attempt));
-                DeleteFile(Path.Combine(stageDir, "status.json"));
+                if (Persist)
+                {
+                    DeleteFile(Path.Combine(stageDir, "status.json"));
+                }
 
                 var stopwatch = Stopwatch.StartNew();
                 Outcome? outcome = null;
@@ -580,6 +585,14 @@ public sealed class PipelineRunner
                 {
                     return Outcome.Fail($"Invalid status.json written for stage '{node.Id}': {ex.Message}");
                 }
+                finally
+                {
+                    // In-memory runs skip the per-attempt cleanup, so consume the file: a later attempt must not read it again.
+                    if (!Persist)
+                    {
+                        TryDeleteFile(path);
+                    }
+                }
             }
 
             return node.AutoStatus
@@ -607,6 +620,12 @@ public sealed class PipelineRunner
 
             context.ApplyUpdates(outcome.ContextUpdates);
             context.Set("outcome", outcome.Status.ToWire());
+
+            // Artifact records are announced only once they are part of the context (never for retried attempts).
+            foreach (var artifact in outcome.Artifacts)
+            {
+                Emit(new ArtifactProduced(node.Id, artifact.Name, artifact.Kind, artifact.Path, artifact.Bytes, artifact.Version, artifact.Sha256));
+            }
 
             // Always refresh (clearing stale values) so pass-through routing nodes see the latest stage's routing data.
             context.Set("preferred_label", outcome.PreferredLabel);
@@ -795,16 +814,19 @@ public sealed class PipelineRunner
 
         private void InitializeRunDirectory(bool fresh)
         {
-            Directory.CreateDirectory(_logsRoot);
-            var graphPath = Path.Combine(_logsRoot, GraphFileName);
-            if (fresh || !File.Exists(graphPath))
+            if (Persist)
             {
-                File.WriteAllText(graphPath, _graph.Source ?? DotWriter.Write(_graph));
-            }
+                Directory.CreateDirectory(_logsRoot);
+                var graphPath = Path.Combine(_logsRoot, GraphFileName);
+                if (fresh || !File.Exists(graphPath))
+                {
+                    File.WriteAllText(graphPath, _graph.Source ?? DotWriter.Write(_graph));
+                }
 
-            if (fresh)
-            {
-                WriteManifest();
+                if (fresh)
+                {
+                    WriteManifest();
+                }
             }
 
             OpenEventLog();
@@ -902,9 +924,13 @@ public sealed class PipelineRunner
             _lastFidelity = null;
             _lastThreadId = null;
             _previousNodeId = null;
-            Directory.CreateDirectory(_logsRoot);
-            File.WriteAllText(Path.Combine(_logsRoot, GraphFileName), _graph.Source ?? DotWriter.Write(_graph));
-            WriteManifest();
+            if (Persist)
+            {
+                Directory.CreateDirectory(_logsRoot);
+                File.WriteAllText(Path.Combine(_logsRoot, GraphFileName), _graph.Source ?? DotWriter.Write(_graph));
+                WriteManifest();
+            }
+
             OpenEventLog();
             InitializeContext();
             _context.Set("internal.loop_restart_count", _loopRestarts);
@@ -918,6 +944,11 @@ public sealed class PipelineRunner
             {
                 visit = _visits.GetValueOrDefault(nodeId) + 1;
                 _visits[nodeId] = visit;
+            }
+
+            if (!Persist)
+            {
+                return;
             }
 
             Directory.CreateDirectory(stageDir);
@@ -951,8 +982,13 @@ public sealed class PipelineRunner
             context.Set($"internal.retry_count.{nodeId}", count);
         }
 
-        private static void EnsureStatusFile(string stageDir, Outcome outcome, bool overwrite = false)
+        private void EnsureStatusFile(string stageDir, Outcome outcome, bool overwrite = false)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             var path = Path.Combine(stageDir, "status.json");
             if (overwrite || !File.Exists(path))
             {
@@ -961,8 +997,17 @@ public sealed class PipelineRunner
             }
         }
 
-        private void SaveCheckpoint(string nodeId, string? finalStatus, bool emitEvent = true)
+        /// <summary>
+        /// Saves <c>checkpoint.json</c>; with <paramref name="snapshotIndex"/> (top-level stages only) and
+        /// <see cref="RunOptions.KeepCheckpointHistory"/>, also keeps a copy under <c>checkpoints/</c>.
+        /// </summary>
+        private void SaveCheckpoint(string nodeId, string? finalStatus, bool emitEvent = true, int? snapshotIndex = null)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             Checkpoint checkpoint;
             lock (_stateLock)
             {
@@ -985,6 +1030,19 @@ public sealed class PipelineRunner
 
             var path = Path.Combine(_logsRoot, Checkpoint.FileName);
             checkpoint.Save(path);
+            if (snapshotIndex is { } index && _options.KeepCheckpointHistory && !_graph.ContainsNode(Checkpoint.SnapshotDirectoryName))
+            {
+                try
+                {
+                    checkpoint.Save(Path.Combine(_logsRoot, Checkpoint.SnapshotDirectoryName, Checkpoint.SnapshotName(index, nodeId) + ".json"));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Snapshots only enable forking; the run itself does not depend on them.
+                    Emit(new StageLog(nodeId, $"Could not save the checkpoint snapshot: {ex.Message}", "warn"));
+                }
+            }
+
             if (emitEvent)
             {
                 Emit(new CheckpointSaved(nodeId, path));
@@ -1041,6 +1099,11 @@ public sealed class PipelineRunner
 
         private void WriteResultFile(PipelineResult result)
         {
+            if (!Persist)
+            {
+                return;
+            }
+
             try
             {
                 var json = new JsonObject
@@ -1098,6 +1161,18 @@ public sealed class PipelineRunner
             if (File.Exists(path))
             {
                 File.Delete(path);
+            }
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best effort: the handler may still hold the file open.
             }
         }
 

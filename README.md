@@ -14,7 +14,8 @@ It implements all three Attractor specs:
 | [Unified LLM Client](https://github.com/strongdm/attractor/blob/main/unified-llm-spec.md) | `Reactor.Llm` | One client for OpenAI (Responses API), Anthropic, Gemini, and OpenAI-compatible endpoints |
 
 On top of that it adds stage **backends** for the GitHub Copilot SDK, the GitHub Copilot CLI, and Claude Code, an
-**HTTP server** with a web console, and the `reactor` command-line tool.
+**HTTP server**, **Reactor Studio** — a visual workbench to design, simulate, fly, and measure pipelines — and the
+`reactor` command-line tool.
 
 ```dot
 digraph test_pipeline {
@@ -90,6 +91,27 @@ To use a local model, point `OPENAI_COMPATIBLE_BASE_URL` at an OpenAI-compatible
 full, which takes a long time when a small model starts repeating itself. Small local models handle simple stages but
 are far less reliable than frontier models at multi-step coding work.
 
+## Reactor Studio
+
+```powershell
+reactor studio --backend copilot      # serves the current directory and opens http://127.0.0.1:5180/
+```
+
+Reactor Studio is a visual workbench for agent factories, built on the real engine:
+
+- **Design** pipelines on a canvas where every route is a port (`✓ on success`, `✕ on fail`, gate options, labels),
+  with groups, artifact wires, a model stylesheet editor, a two-way DOT editor, and an exact prompt preview.
+- **Wind tunnel**: fly the design hundreds of times with simulated stage outcomes — zero tokens — to find loops that
+  never converge, dead ends, and unreachable goal gates; calibrate it to your real flights to forecast what a change
+  will do to the success rate and cost.
+- **Flights**: launch runs, answer human gates on the canvas, steer running agents, replay any run (from this server
+  or `reactor run`) on a timeline, re-fly a run from just before any stage with an edited pipeline, and read each
+  pipeline's flight record (success, time, cost, where it breaks).
+- **Architect**: describe a factory, or ask for a revision or a critique backed by the flight record; every draft is
+  checked by the parser, the validator, and the wind tunnel before you see it, and comes with a forecast.
+
+See [docs/studio.md](docs/studio.md).
+
 ## Writing pipelines
 
 A pipeline is a `digraph`. Node **shape** selects the handler:
@@ -110,6 +132,11 @@ Edges route on `condition="outcome=success"`, `condition="context.tests_passed=t
 `label` matching the stage's preferred label, `weight`, and finally lexical order. Agents report non-default
 outcomes by writing `status.json` in their stage directory (the prompt tells them how).
 
+Stages can also declare the artifacts they read and produce (`inputs="spec, design"`,
+`outputs="design:docs/DESIGN.md, verdict"`): prompts list them, a stage that does not write a declared file fails
+(and can be retried), and each produced artifact is recorded in the context and announced as an `ArtifactProduced`
+event — see [artifacts](docs/pipelines.md#artifacts-reactor-extension).
+
 Full reference: [docs/pipelines.md](docs/pipelines.md). Examples in [examples/](examples):
 
 | Example | Shows |
@@ -121,6 +148,7 @@ Full reference: [docs/pipelines.md](docs/pipelines.md). Examples in [examples/](
 | [stylesheet.dot](examples/stylesheet.dot) | per-node models via a CSS-like `model_stylesheet` |
 | [supervisor.dot](examples/supervisor.dot) | a manager loop observing and steering a child pipeline |
 | [factory.dot](examples/factory.dot) | a 15-node build/test/review/sign-off pipeline |
+| [artifacts.dot](examples/artifacts.dot) | artifact pins: stages declare `inputs`/`outputs` (spec → design → code → test report → verdict) |
 
 ## Command line
 
@@ -129,7 +157,8 @@ reactor run <file.dot>        Run a pipeline        (--backend, --model, -C <wor
 reactor resume <run-dir>      Resume from the last checkpoint
 reactor validate <file.dot>   Parse and lint
 reactor render <file.dot>     Render to SVG/PNG/PDF (--run <run-dir> colors stages by status)
-reactor serve                 HTTP API + web console (--urls, --token, --max-concurrent)
+reactor serve                 HTTP API + Reactor Studio + console (--urls, --token, --max-concurrent)
+reactor studio                Same server, and opens the Studio in a browser
 reactor agent [prompt]        Talk to the coding agent loop directly
 reactor models                List catalog models (--provider copilot: models your Copilot account can use)
 reactor doctor                Check backends, credentials, and tools
@@ -142,8 +171,8 @@ Runs are written to `<workdir>/.reactor/runs/<timestamp>-<name>/`: `checkpoint.j
 
 ## HTTP server
 
-`reactor serve` exposes the spec's HTTP mode (section 9.5) plus a web console at `/` for watching runs live and
-answering human gates:
+`reactor serve` exposes the spec's HTTP mode (section 9.5), Reactor Studio at `/`, and the classic web console at
+`/console` for watching runs live and answering human gates:
 
 ```powershell
 reactor serve --backend copilot --token $env:REACTOR_SERVER_TOKEN
@@ -153,7 +182,10 @@ curl -H "Authorization: Bearer $token" -H "Content-Type: text/vnd.graphviz" --da
 Endpoints: `POST /pipelines`, `GET /pipelines/{id}`, `GET /pipelines/{id}/events` (SSE with replay),
 `POST /pipelines/{id}/cancel`, `/resume`, `GET /pipelines/{id}/graph`, `/questions`,
 `POST /pipelines/{id}/questions/{qid}/answer`, `/checkpoint`, `/context`, plus `POST /run`, `GET /status`,
-`POST /answer`. See [docs/http-api.md](docs/http-api.md).
+`POST /answer`. The Studio API (`/studio/api/...`) adds parsing with editor metadata, prompt previews, workspace
+files, a run history read from disk (including CLI runs), event replay, per-stage telemetry across runs, forking a run
+from any stage, steering a running agent, Monte Carlo simulation, and the Architect. See
+[docs/http-api.md](docs/http-api.md).
 
 ## Using the libraries
 
@@ -184,20 +216,23 @@ src/Reactor.Llm      Unified LLM client, provider adapters, high-level generate/
 src/Reactor.Agent    Coding agent loop: sessions, tools, execution environments, provider profiles, subagents
 src/Reactor.Backends Codergen backends: agent loop, direct LLM, Copilot CLI, Claude Code, router, tool hooks
 src/Reactor.Copilot  GitHub Copilot SDK backend
-src/Reactor.Server   HTTP API, server-sent events, web console
+src/Reactor.Server   HTTP API, server-sent events, Studio API and hosting, web console
+src/Reactor.Studio   Reactor Studio web app (React, TypeScript, React Flow), embedded into Reactor.Server
 src/Reactor.Cli      the `reactor` command
 tests/               xUnit v3 test projects (one per library)
 examples/            example pipelines
-docs/                architecture, pipeline reference, backends, HTTP API, spec conformance
+docs/                architecture, pipeline reference, backends, Studio, HTTP API, spec conformance
 ```
 
 ## Development
 
 ```powershell
-dotnet build                     # warnings are errors
-dotnet test                      # ~900 tests across six projects
+dotnet build                     # warnings are errors; builds and embeds the Studio when Node.js 20.19+ is installed
+dotnet test                      # ~1,100 tests across six projects
+cd src/Reactor.Studio; npm test  # Studio unit tests (Vitest)
 ```
 
+Skip the Studio build with `-p:SkipStudio=true` (or `REACTOR_SKIP_STUDIO=1`); see [docs/studio.md](docs/studio.md#building-the-studio).
 Test projects are executables (xUnit v3), so a single suite can also run directly, e.g.
 `tests/Reactor.Tests/bin/Debug/net10.0/Reactor.Tests.exe -class "Reactor.Tests.Engine.EngineTests"`.
 

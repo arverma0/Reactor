@@ -1,0 +1,24 @@
+// The Studio Architect, as a Reactor pipeline: draft a pipeline, check it with the real parser, validator, and wind
+// tunnel, and repair it until it passes. The server provides the brief and the current pipeline in the context
+// (architect.*), composes the full prompt for the design stage (see architect.md), and gives up after three drafts.
+// Copy this file to .reactor/studio/architect.dot in your workspace to customize it.
+digraph architect {
+    graph [goal="Design a Reactor pipeline", label="Studio Architect"]
+
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+
+    design [
+        label="Design",
+        type="studio.architect",
+        fidelity="truncate",
+        prompt="Design the pipeline described below."
+    ]
+    check [label="Check in the wind tunnel", type="studio.check"]
+
+    start -> design
+    // A design stage that fails (the backend's error) ends the run with its reason; only answers are checked.
+    design -> check [condition="outcome=success"]
+    check -> exit   [condition="outcome=success"]
+    check -> design [condition="outcome=fail && context.architect.give_up!=true", label="Repair"]
+}

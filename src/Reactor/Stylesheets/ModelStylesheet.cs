@@ -110,10 +110,14 @@ public sealed partial class ModelStylesheet
     }
 
     /// <summary>The winning value for each property that any rule sets for <paramref name="node"/>.</summary>
-    public IReadOnlyDictionary<string, string> Resolve(Node node)
+    public IReadOnlyDictionary<string, string> Resolve(Node node) =>
+        ResolveWithRules(node).ToDictionary(kv => kv.Key, kv => kv.Value.Value, StringComparer.Ordinal);
+
+    /// <summary>Like <see cref="Resolve"/>, but also reports the rule that supplied each winning value.</summary>
+    public IReadOnlyDictionary<string, (string Value, StyleRule Rule)> ResolveWithRules(Node node)
     {
         ArgumentNullException.ThrowIfNull(node);
-        var winners = new Dictionary<string, (int Specificity, int Order, string Value)>(StringComparer.Ordinal);
+        var winners = new Dictionary<string, (string Value, StyleRule Rule)>(StringComparer.Ordinal);
         foreach (var rule in Rules)
         {
             if (!rule.Selector.Matches(node))
@@ -123,17 +127,16 @@ public sealed partial class ModelStylesheet
 
             foreach (var declaration in rule.Declarations)
             {
-                var candidate = (rule.Selector.Specificity, rule.Order, declaration.Value);
                 if (!winners.TryGetValue(declaration.Property, out var current) ||
-                    candidate.Specificity > current.Specificity ||
-                    (candidate.Specificity == current.Specificity && candidate.Order >= current.Order))
+                    rule.Selector.Specificity > current.Rule.Selector.Specificity ||
+                    (rule.Selector.Specificity == current.Rule.Selector.Specificity && rule.Order >= current.Rule.Order))
                 {
-                    winners[declaration.Property] = candidate;
+                    winners[declaration.Property] = (declaration.Value, rule);
                 }
             }
         }
 
-        return winners.ToDictionary(kv => kv.Key, kv => kv.Value.Value, StringComparer.Ordinal);
+        return winners;
     }
 
     private static string StripComments(string text)
