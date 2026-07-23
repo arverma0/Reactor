@@ -1,12 +1,7 @@
-import { Canvas } from "../canvas/Canvas";
-import type { Mode } from "../state/store";
 import { FlightsMode } from "./flights/FlightsMode";
+import { TunnelMode } from "./tunnel/TunnelMode";
+import type { Mode } from "../state/store";
 
 export function ModeStage({ mode }: { mode: Exclude<Mode, "design"> }) {
-  if (mode === "flights") return <FlightsMode />;
-  return (
-    <div className="rs-mode-stage">
-      <Canvas overlay={{ kind: "sim", nodes: {}, edges: {} }} readOnly />
-    </div>
-  );
+  return mode === "flights" ? <FlightsMode /> : <TunnelMode />;
 }
