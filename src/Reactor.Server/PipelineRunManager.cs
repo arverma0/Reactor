@@ -439,6 +439,12 @@ public sealed record StartRequest
 
     public string? WorkingDirectory { get; init; }
 
+    /// <summary>
+    /// A working directory chosen by the server itself (the Architect's scratch directory), created if needed and exempt
+    /// from <see cref="ReactorServerOptions.AllowClientWorkingDirectory"/>; takes precedence over <see cref="WorkingDirectory"/>.
+    /// </summary>
+    internal string? ServerWorkingDirectory { get; init; }
+
     /// <summary>Optional simulation settings (<c>"simulation"</c> in the JSON body): run with simulated stages instead of the backend.</summary>
     public System.Text.Json.Nodes.JsonObject? Simulation { get; init; }
 
@@ -534,7 +540,20 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, simulationErrors, "The simulation settings are invalid.");
         }
 
-        if (!TryResolveWorkingDirectory(request.WorkingDirectory, out var workingDirectory, out var error))
+        string workingDirectory;
+        if (request.ServerWorkingDirectory is { } serverDirectory)
+        {
+            workingDirectory = Path.GetFullPath(serverDirectory);
+            try
+            {
+                Directory.CreateDirectory(workingDirectory);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return new StartResult(null, prepared.Diagnostics, $"Could not create the working directory: {ex.Message}");
+            }
+        }
+        else if (!TryResolveWorkingDirectory(request.WorkingDirectory, out workingDirectory, out var error))
         {
             return new StartResult(null, prepared.Diagnostics, error);
         }

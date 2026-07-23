@@ -45,6 +45,27 @@ public class CheckpointHistoryTests
     }
 
     [Fact]
+    public async Task Saving_waits_out_a_reader_that_briefly_holds_the_checkpoint_open()
+    {
+        using var dir = new TempDir();
+        var path = dir.Combine(Checkpoint.FileName);
+        new Checkpoint { RunId = "first" }.Save(path);
+
+        // A reader without delete sharing (a plain File.ReadAllText) blocks the replace on Windows until it closes.
+        var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var release = Task.Run(async () =>
+        {
+            await Task.Delay(60, TestContext.Current.CancellationToken);
+            await reader.DisposeAsync();
+        }, TestContext.Current.CancellationToken);
+        new Checkpoint { RunId = "second" }.Save(path);
+        await release;
+
+        Assert.Equal("second", Checkpoint.Load(path).RunId);
+        Assert.False(File.Exists(path + ".tmp"));
+    }
+
+    [Fact]
     public async Task No_snapshots_are_kept_by_default()
     {
         using var dir = new TempDir();

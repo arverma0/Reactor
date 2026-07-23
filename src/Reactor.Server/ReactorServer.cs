@@ -84,6 +84,7 @@ public static class ReactorServer
         app.MapStudioApi();
         app.MapFlightsApi();
         app.MapSimulationApi();
+        app.MapArchitectApi();
 
         app.MapPost("/pipelines", StartAsync);
         app.MapPost("/run", StartAsync);

@@ -18,6 +18,10 @@ import { newDocument, openFile } from "./state/files";
 import { loadInfo, startSession } from "./state/session";
 import { dismissToast, emptySelection, redo, requestFit, requestLayout, select, setBottomPanel, setLeftPanel, setMode, undo, useStudio, type LeftPanel, type Mode } from "./state/store";
 import { loadTelemetry, telemetryOverlay, useTelemetry } from "./state/telemetry";
+import { ArchitectPanel } from "./modes/architect/ArchitectPanel";
+import { proposalOverlay } from "./modes/architect/evidence";
+import { acceptProposal, togglePreview, useArchitect } from "./modes/architect/store";
+import type { StudioDoc } from "./model/types";
 import { ModeStage } from "./modes/ModeStage";
 import { RunDialog } from "./modes/RunDialog";
 
@@ -120,6 +124,7 @@ function TopBar() {
   const analysis = useStudio((s) => s.analysis);
   const connected = useStudio((s) => s.connected);
   const info = useStudio((s) => s.info);
+  const architectOpen = useStudio((s) => s.architectOpen);
   const errors = analysis.diagnostics.filter((d) => d.severity === "error").length + (analysis.parseError ? 1 : 0);
   const warnings = analysis.diagnostics.filter((d) => d.severity === "warning").length;
   const dir = file.path?.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
@@ -150,7 +155,7 @@ function TopBar() {
           {!connected ? "offline" : analysis.parseError ? "syntax error" : errors ? `${errors} error${errors > 1 ? "s" : ""}` : warnings ? `${warnings} warning${warnings > 1 ? "s" : ""}` : "valid"}
         </button>
         <Button variant="ghost" icon="search" title="Command palette (Ctrl K)" onClick={() => useStudio.setState({ paletteOpen: true })} />
-        <Button variant="quiet" icon="architect" onClick={() => useStudio.setState({ architectOpen: true })}>
+        <Button variant="quiet" icon="architect" active={architectOpen && mode === "design"} onClick={() => (mode !== "design" ? (setMode("design"), useStudio.setState({ architectOpen: true })) : useStudio.setState({ architectOpen: !architectOpen }))}>
           Architect
         </Button>
         <Button variant="primary" icon="play" onClick={() => useStudio.setState({ runOpen: true })} disabled={!connected}>
@@ -315,11 +320,53 @@ function DesignCanvas() {
   const info = useStudio((s) => s.info);
   const lens = useTelemetry((s) => s.designLens);
   const record = useTelemetry((s) => s.byName[doc.name]);
+  const preview = useArchitect((s) => (s.preview ? s.proposalDoc : null));
+  const diff = useArchitect((s) => s.diff);
   useEffect(() => {
     if (info) void loadTelemetry(doc.name, 60000);
   }, [doc.name, info]);
   const overlay = useMemo(() => (lens && record ? telemetryOverlay(doc, record, { dimUnvisited: false }) : null), [lens, record, doc]);
+  const previewOverlay = useMemo(() => (preview ? proposalOverlay(diff) : null), [preview, diff]);
+  if (preview) {
+    return (
+      <div className="rs-preview">
+        <Canvas doc={preview} overlay={previewOverlay} />
+        <PreviewBanner proposal={preview} />
+      </div>
+    );
+  }
   return <Canvas overlay={overlay} />;
+}
+
+function PreviewBanner({ proposal }: { proposal: StudioDoc }) {
+  const diff = useArchitect((s) => s.diff);
+  const mode = useArchitect((s) => s.job?.mode);
+  return (
+    <div className="rs-preview__banner">
+      <Glyph name="architect" size={14} />
+      <span className="rs-preview__title">{mode === "draft" ? "The Architect's draft" : "The Architect's proposal"}</span>
+      <span className="rs-preview__stats num">
+        {diff ? (
+          <>
+            {diff.added.length > 0 ? <span className="is-added">+{diff.added.length} new</span> : null}
+            {diff.changed.length > 0 ? <span className="is-changed">{diff.changed.length} changed</span> : null}
+            {diff.removed.length > 0 ? <span className="is-removed">−{diff.removed.length} removed</span> : null}
+            {diff.total === 0 ? <span>no changes</span> : null}
+          </>
+        ) : (
+          <span>
+            {proposal.nodes.length} stages · {proposal.edges.length} routes
+          </span>
+        )}
+      </span>
+      <Button size="sm" variant="primary" icon="check" onClick={acceptProposal}>
+        {mode === "draft" ? "Open it" : "Apply"}
+      </Button>
+      <Button size="sm" variant="quiet" onClick={() => togglePreview(false)}>
+        Back to design
+      </Button>
+    </div>
+  );
 }
 
 function ViewCenterBridge() {
@@ -339,6 +386,7 @@ function ViewCenterBridge() {
 export function App() {
   const mode = useStudio((s) => s.mode);
   const inspectorOpen = useStudio((s) => s.inspectorOpen);
+  const architectOpen = useStudio((s) => s.architectOpen);
   const saveAsOpen = useStudio((s) => s.saveAsOpen);
   useKeyboard();
   useEffect(() => {
@@ -372,7 +420,11 @@ export function App() {
             <div className="rs-stage">{mode === "design" ? <DesignCanvas /> : <ModeStage mode={mode} />}</div>
             {mode === "design" ? <BottomDrawer /> : null}
           </main>
-          {mode === "design" && inspectorOpen ? (
+          {mode === "design" && architectOpen ? (
+            <aside className="rs-right rs-right--architect">
+              <ArchitectPanel />
+            </aside>
+          ) : mode === "design" && inspectorOpen ? (
             <aside className="rs-right">
               <Inspector />
             </aside>

@@ -11,6 +11,8 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="wwwroot\**\*" LogicalName="Reactor.Server.wwwroot.%(RecursiveDir)%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Studio\architect.dot" LogicalName="Reactor.Server.studio-architect.dot" />
+    <EmbeddedResource Include="Studio\architect.md" LogicalName="Reactor.Server.studio-architect.md" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Server.Tests" />

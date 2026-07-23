@@ -156,19 +156,41 @@ public sealed class Checkpoint
         return checkpoint;
     }
 
-    /// <summary>Writes the checkpoint atomically (temp file + move).</summary>
+    /// <summary>
+    /// Writes the checkpoint atomically (temp file + move). Readers may hold the file open at that instant (a server
+    /// polling a live run, a supervisor watching its child, an editor), so the replace is retried briefly.
+    /// </summary>
     public void Save(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         var temp = path + ".tmp";
         File.WriteAllText(temp, ToJson().ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-        File.Move(temp, path, overwrite: true);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.Move(temp, path, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 8)
+            {
+                Thread.Sleep(10 * attempt);
+            }
+        }
     }
 
+    /// <summary>Loads a checkpoint, opening it with full sharing so the read never denies a concurrent writer access.</summary>
     public static Checkpoint Load(string path)
     {
-        var json = JsonNode.Parse(File.ReadAllText(path)) ?? throw new InvalidDataException($"Checkpoint '{path}' is empty.");
+        string text;
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (var reader = new StreamReader(stream))
+        {
+            text = reader.ReadToEnd();
+        }
+
+        var json = JsonNode.Parse(text) ?? throw new InvalidDataException($"Checkpoint '{path}' is empty.");
         return FromJson(json);
     }
 
