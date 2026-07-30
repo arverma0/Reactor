@@ -48,8 +48,8 @@ public sealed class ManagerLoopHandler : INodeHandler
                 return Outcome.Fail("No child pipeline configured (stack.child_dotfile).");
             }
 
-            var workdir = node[AttrKeys.StackChildWorkdir] ?? graph[AttrKeys.StackChildWorkdir] ?? run?.WorkingDirectory ?? Directory.GetCurrentDirectory();
-            workdir = Path.GetFullPath(workdir, run?.WorkingDirectory ?? Directory.GetCurrentDirectory());
+            var workdir = node[AttrKeys.StackChildWorkdir] ?? graph[AttrKeys.StackChildWorkdir] ?? context.WorkingDirectory;
+            workdir = Path.GetFullPath(workdir, context.WorkingDirectory);
             var dotPath = Path.GetFullPath(dotFile, workdir);
             if (!File.Exists(dotPath) && !Path.IsPathRooted(dotFile) && Path.GetDirectoryName(graph.SourcePath) is { Length: > 0 } parentDirectory)
             {

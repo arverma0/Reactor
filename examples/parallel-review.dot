@@ -1,12 +1,13 @@
 // Fan-out / fan-in: three independent reviews run concurrently in isolated contexts, then a
-// fan-in node gathers the results (parallel.results) for a final summary.
+// fan-in node gathers the results (parallel.results) for a final summary. The reviewers only read, so they share
+// the working directory (branch_workdir="worktree" or "copy" would give each branch its own).
 digraph parallel_review {
-    graph [goal="Review the code in this repository"]
+    graph [goal="Review the code in this repository", default_on_fail="stop"]
 
     start [shape=Mdiamond]
     exit  [shape=Msquare]
 
-    reviews   [shape=component, label="Parallel reviews", join_policy="wait_all", max_parallel=3]
+    reviews   [shape=component, label="Parallel reviews", join_policy="wait_all", max_parallel=3, branch_workdir="shared"]
     security  [prompt="Review this repository for security problems. List concrete findings with file names."]
     perf      [prompt="Review this repository for performance problems. List concrete findings with file names."]
     style     [prompt="Review this repository for readability and maintainability problems."]

@@ -157,6 +157,59 @@ public interface ICodergenBackend
 
     /// <summary>Per-node variant of <see cref="SupportsStatusFile"/> (routing backends answer for the backend a node uses).</summary>
     bool SupportsStatusFileFor(Node node) => SupportsStatusFile;
+
+    /// <summary>
+    /// True when the backend delivers steering to a running stage: it watches the stage directory for <c>steering.md</c>
+    /// (written by a supervisor, the server's steer endpoint, or the engine's soft-deadline reminder) and passes the text to
+    /// the agent while the stage runs.
+    /// </summary>
+    bool SupportsSteering => false;
+
+    /// <summary>Per-node variant of <see cref="SupportsSteering"/> (routing backends answer for the backend a node uses).</summary>
+    bool SupportsSteeringFor(Node node) => SupportsSteering;
+}
+
+/// <summary>
+/// Carries backend metadata (model, tokens, cost, session id, last assistant text, ...) on an exception, so a stage that
+/// fails, times out, or is cancelled still records what it spent: a backend that throws attaches the usage accumulated so
+/// far with <see cref="Attach"/>, and the codergen handler writes it to the stage's <c>backend.json</c> (with
+/// <c>outcome</c> set to <c>timeout</c>, <c>cancelled</c>, or <c>error</c>) before the engine handles the exception.
+/// </summary>
+public static class BackendMetadata
+{
+    private const string DataKey = "Reactor.BackendMetadata";
+
+    /// <summary>
+    /// Metadata key for the agent's last assistant message before the stage ended (used to hand off to a retry); written
+    /// to <c>response.md</c> when a stage ends without a response.
+    /// </summary>
+    public const string LastAssistantText = "last_assistant_text";
+
+    /// <summary>Attaches <paramref name="metadata"/> to <paramref name="exception"/> (replacing earlier metadata) and returns the exception.</summary>
+    public static TException Attach<TException>(TException exception, IReadOnlyDictionary<string, object?> metadata)
+        where TException : Exception
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        ArgumentNullException.ThrowIfNull(metadata);
+        exception.Data[DataKey] = new Dictionary<string, object?>(metadata, StringComparer.Ordinal);
+        return exception;
+    }
+
+    /// <summary>The metadata attached to <paramref name="exception"/> or, failing that, to an inner exception.</summary>
+    public static bool TryGet(Exception? exception, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IReadOnlyDictionary<string, object?>? metadata)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current.Data[DataKey] is IReadOnlyDictionary<string, object?> attached)
+            {
+                metadata = attached;
+                return true;
+            }
+        }
+
+        metadata = null;
+        return false;
+    }
 }
 
 /// <summary>A backend result: response text or an explicit outcome, plus optional metadata recorded with the stage.</summary>

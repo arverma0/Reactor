@@ -51,15 +51,19 @@ public class CheckpointHistoryTests
         var path = dir.Combine(Checkpoint.FileName);
         new Checkpoint { RunId = "first" }.Save(path);
 
-        // A reader without delete sharing (a plain File.ReadAllText) blocks the replace on Windows until it closes.
+        // A reader without delete sharing (a plain File.ReadAllText) blocks the replace on Windows until it closes. It is
+        // released from a dedicated thread so a busy thread pool (the rest of the suite runs in parallel) cannot delay it.
         var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var release = Task.Run(async () =>
+        var released = new TaskCompletionSource();
+        var release = new Thread(() =>
         {
-            await Task.Delay(60, TestContext.Current.CancellationToken);
-            await reader.DisposeAsync();
-        }, TestContext.Current.CancellationToken);
+            Thread.Sleep(60);
+            reader.Dispose();
+            released.SetResult();
+        }) { IsBackground = true };
+        release.Start();
         new Checkpoint { RunId = "second" }.Save(path);
-        await release;
+        await released.Task;
 
         Assert.Equal("second", Checkpoint.Load(path).RunId);
         Assert.False(File.Exists(path + ".tmp"));

@@ -142,6 +142,124 @@ public sealed class SimulationScenarioTests
     }
 
     [Fact]
+    public void Parses_metrics_cost_and_duration_priors_and_round_trips_them()
+    {
+        var scenario = Sim.Scenario("""
+            {"duration_priors": {"codergen": "10m", "tool": 60000},
+             "nodes": {"review": {"cost": "$0.25", "metrics": {
+                "score": {"values": {"5": 0.3, "3": 0.2, "4": 0.5}},
+                "findings": {"min": 0, "max": 3},
+                "coverage": {"min": 0.5, "max": 1},
+                "ratio": {"min": 0, "max": 1, "integer": false},
+                "bugs": 2,
+                "passed": true,
+                "levels": {"values": [1, 2, 2]},
+                "qa_failed": {"success": 0, "*": {"min": 1, "max": 5}}}}}}
+            """);
+
+        Assert.Equal(600_000, scenario.DurationPriors["codergen"]);
+        Assert.Equal(60_000, scenario.DurationPriors["tool"]);
+        var review = scenario.Nodes["review"];
+        Assert.Equal(0.25, review.CostUsd);
+        var metrics = review.Metrics!;
+        var score = Assert.IsType<SimulationMetric.Weighted>(metrics["score"]);
+        Assert.Equal([3.0, 4.0, 5.0], score.Values.Select(v => v.Key));
+        Assert.Equal(new SimulationMetric.Uniform(0, 3, Integer: true), metrics["findings"]);
+        Assert.Equal(new SimulationMetric.Uniform(0.5, 1, Integer: false), metrics["coverage"]);
+        Assert.Equal(new SimulationMetric.Uniform(0, 1, Integer: false), metrics["ratio"]);
+        Assert.Equal(new SimulationMetric.Constant(2), metrics["bugs"]);
+        Assert.Equal(new SimulationMetric.Constant(1), metrics["passed"]);
+        Assert.Equal([KeyValuePair.Create(1.0, 1.0), KeyValuePair.Create(2.0, 2.0)], Assert.IsType<SimulationMetric.Weighted>(metrics["levels"]).Values);
+        var qa = Assert.IsType<SimulationMetric.PerStatus>(metrics["qa_failed"]);
+        Assert.Equal(new SimulationMetric.Constant(0), qa.ByStatus["success"]);
+        Assert.Equal(new SimulationMetric.Uniform(1, 5, Integer: true), qa.ByStatus["*"]);
+
+        var json = scenario.ToJson();
+        Assert.Equal(json.ToJsonString(), SimulationScenario.FromJson(json).ToJson().ToJsonString());
+        Assert.False(json["nodes"]!["review"]!["metrics"]!["ratio"]!["integer"]!.GetValue<bool>());
+        Assert.Null(json["nodes"]!["review"]!["metrics"]!["coverage"]!["integer"]);
+        Assert.Equal(0.25, json["nodes"]!["review"]!["cost"]!.GetValue<double>());
+        Assert.Equal(600_000, json["duration_priors"]!["codergen"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void Metric_draws_stay_within_their_distribution()
+    {
+        var dice = new SimulationMetric.Uniform(1, 6, Integer: true);
+        var range = new SimulationMetric.Uniform(0.5, 1.5, Integer: false);
+        var weighted = new SimulationMetric.Weighted([KeyValuePair.Create(3.0, 1.0), KeyValuePair.Create(5.0, 3.0)]);
+        var perStatus = new SimulationMetric.PerStatus(new Dictionary<string, SimulationMetric> { ["fail"] = new SimulationMetric.Constant(7) });
+
+        Assert.Equal(1, dice.Draw(StageStatus.Success, 0));
+        Assert.Equal(6, dice.Draw(StageStatus.Success, 0.9999999));
+        Assert.Equal(4, dice.Draw(StageStatus.Success, 0.5));
+        Assert.Equal(1.0, range.Draw(StageStatus.Success, 0.5));
+        Assert.Equal(3, weighted.Draw(StageStatus.Success, 0.2));
+        Assert.Equal(5, weighted.Draw(StageStatus.Success, 0.3));
+        Assert.Equal(7, perStatus.Draw(StageStatus.Fail, 0.1));
+        Assert.Null(perStatus.Draw(StageStatus.Success, 0.1));
+    }
+
+    [Fact]
+    public void Invalid_metrics_costs_and_priors_report_errors_with_their_paths()
+    {
+        var ok = SimulationScenario.TryFromJson(JsonNode.Parse("""
+            {"duration_priors": {"codergen": "25h", "tool": "soon"},
+             "nodes": {"a": {"cost": -1,
+                             "metrics": {"1bad": 1, "x": {"min": 5, "max": 1}, "y": {"values": {"high": 1}}, "z": {"min": 0.5, "max": 2, "integer": true},
+                                         "w": {"success": {"fail": 1}}, "v": "lots", "u": {"min": 1, "values": [1]}, "t": {"sucess": 1}}},
+                       "b": {"cost": 20000, "metrics": []}}}
+            """)!.AsObject(), out _, out var errors);
+
+        Assert.False(ok);
+        var messages = errors.Select(e => e.ToString()).ToList();
+        Assert.Contains(messages, m => m.StartsWith("duration_priors.codergen: must be a duration", StringComparison.Ordinal) && m.Contains("24h", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("duration_priors.tool: must be a duration", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.cost: must be a cost in USD", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.b.cost: must be a cost in USD", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.1bad: is not a metric name", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.x: \"min\" must not be greater than \"max\"", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.y.values.high: the key must be a number", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.z: a whole-number range needs whole-number bounds", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.w.success: per-status entries must be", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.v: must be a number,", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.u: \"values\" cannot be combined", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.a.metrics.t.sucess: unknown status 'sucess'", StringComparison.Ordinal));
+        Assert.Contains(messages, m => m.StartsWith("nodes.b.metrics: must be an object of metric names", StringComparison.Ordinal));
+        Assert.All(errors.Where(e => e.Path.StartsWith("nodes.a", StringComparison.Ordinal)), e => Assert.Equal("a", e.NodeId));
+    }
+
+    [Fact]
+    public void Check_warns_about_durations_beyond_timeouts_metrics_on_gates_and_unknown_priors()
+    {
+        var graph = Sim.Prepare("""
+            digraph T {
+                start [shape=Mdiamond] exit [shape=Msquare]
+                build [prompt="build", timeout="1h"]
+                plan [prompt="plan", timeout="2h"]
+                gate [shape=hexagon, label="Ship?"]
+                start -> plan -> build -> gate
+                gate -> exit [label="[S] Ship"]
+            }
+            """);
+        var scenario = Sim.Scenario("""
+            {"duration_priors": {"codergen": "3h", "codegen": "1m", "exit": "1m"},
+             "defaults": {"codergen": {"duration_ms": "3h"}, "wait.human": {"metrics": {"x": 1}}},
+             "nodes": {"build": {"duration_ms": "2h"}, "gate": {"metrics": {"y": 1}}}}
+            """);
+
+        var warnings = scenario.Check(graph);
+
+        Assert.Contains("nodes.build.duration_ms: 2h exceeds the timeout of 'build' (1h), so every execution of 'build' times out.", warnings);
+        Assert.Contains("defaults.codergen.duration_ms: 3h exceeds the timeout of 'plan' (2h), so every execution of 'plan' times out.", warnings);
+        Assert.Contains(warnings, w => w.StartsWith("duration_priors.codegen: unknown handler type", StringComparison.Ordinal));
+        Assert.Contains(warnings, w => w.StartsWith("duration_priors.exit:", StringComparison.Ordinal) && w.Contains("no effect", StringComparison.Ordinal));
+        Assert.Contains(warnings, w => w.StartsWith("defaults.wait.human.metrics: human gates report no metrics", StringComparison.Ordinal));
+        Assert.Contains(warnings, w => w.StartsWith("nodes.gate.metrics: human gates report no metrics", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, w => w.StartsWith("duration_priors.codergen", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Draws_are_a_pure_function_of_their_inputs_and_roughly_uniform()
     {
         var first = SimulationSample.Draw(123, 4, "test", 2, "outcome");

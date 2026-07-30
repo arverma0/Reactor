@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Reactor.Events;
 using Reactor.Execution;
 using Reactor.Graphs;
+using Reactor.Workspaces;
 
 namespace Reactor.Server.Studio;
 
@@ -24,8 +25,21 @@ public sealed record ForkRequest
     /// <summary>Context values to set before continuing.</summary>
     public JsonObject? Context { get; init; }
 
-    /// <summary>Working directory for the fork (only with <see cref="ReactorServerOptions.AllowClientWorkingDirectory"/>).</summary>
+    /// <summary>
+    /// Working directory for the fork instead of the source run's (relative paths resolve against the server's working
+    /// directory). Other than the server's own directories it needs <see cref="ReactorServerOptions.AllowClientWorkingDirectory"/>.
+    /// </summary>
     public string? WorkingDirectory { get; init; }
+
+    /// <summary>Confirms forking into a directory other than the source run's, which may not have the files the run worked on.</summary>
+    public bool? ConfirmWorkingDirectory { get; init; }
+
+    /// <summary>
+    /// Rewinds the fork's working directory to how it was right after the checkpoint's stage (the git snapshot recorded
+    /// with the checkpoint) before the fork starts. The directory's current state is snapshotted first (the undo commit in
+    /// the response). Git work trees only; default false.
+    /// </summary>
+    public bool? RestoreWorkspace { get; init; }
 }
 
 /// <summary>Body of <c>POST /studio/api/pipelines/{id}/steer</c>.</summary>
@@ -54,6 +68,9 @@ public static partial class FlightsEndpoints
     /// <summary>Largest steering message.</summary>
     public const int MaxSteeringBytes = 16 * 1024;
 
+    /// <summary>The run's workspace record (snapshot mode, repository, refs) in its first run directory.</summary>
+    private const string WorkspaceRecordFile = "workspace.json";
+
     /// <summary>Stage types that never consume steering (only agent stages do).</summary>
     private static readonly HashSet<string> Unsteerable = new(StringComparer.Ordinal)
     {
@@ -70,8 +87,9 @@ public static partial class FlightsEndpoints
         api.MapGet("/runs", ListRuns);
         api.MapGet("/runs/{id}", RunDetail);
         api.MapGet("/runs/{id}/events", RunEvents);
+        api.MapGet("/runs/{id}/stages/{node}/visits", StageVisits);
         api.MapGet("/runs/{id}/stages/{node}/files/{name}", StageFile);
-        api.MapPost("/runs/{id}/fork", Fork);
+        api.MapPost("/runs/{id}/fork", ForkAsync);
         api.MapGet("/telemetry", Telemetry);
         api.MapPost("/pipelines/{id}/steer", SteerAsync);
         return app;
@@ -98,6 +116,7 @@ public static partial class FlightsEndpoints
         var first = record.Segments[0].Path;
         var last = record.Segments[^1].Path;
         var graph = Path.Combine(first, RunHistory.GraphFile);
+        var snapshots = Snapshots(record);
         return Results.Ok(new JsonObject
         {
             ["summary"] = Summary(record),
@@ -107,8 +126,39 @@ public static partial class FlightsEndpoints
             ["graph_dot"] = File.Exists(graph) ? ReadTextOrNull(graph) : null,
             ["studio"] = RunHistory.ReadJsonObject(Path.Combine(first, PipelineRunManager.StudioFileName)),
             ["stages"] = Stages(record),
-            ["checkpoints"] = new JsonArray(Snapshots(record).Select(s => (JsonNode?)s.Name).ToArray()),
+            ["checkpoints"] = new JsonArray(snapshots.Select(s => (JsonNode?)s.Name).ToArray()),
+            ["workspace"] = RunHistory.ReadJsonObject(Path.Combine(first, WorkspaceRecordFile)),
+            ["workspace_checkpoints"] = new JsonArray(WorkspaceCheckpoints(snapshots).Select(s => (JsonNode?)s).ToArray()),
         });
+    }
+
+    /// <summary>The snapshots saved with a workspace snapshot (<c>checkpoints/&lt;name&gt;.workspace.json</c>), in order.</summary>
+    private static IEnumerable<string> WorkspaceCheckpoints(IReadOnlyList<(string Name, RunSegment Segment)> snapshots)
+    {
+        var recorded = new Dictionary<string, HashSet<string>>(RunHistory.PathComparer);
+        foreach (var (name, segment) in snapshots)
+        {
+            if (!recorded.TryGetValue(segment.Path, out var names))
+            {
+                names = new HashSet<string>(StringComparer.Ordinal);
+                try
+                {
+                    var directory = Path.Combine(segment.Path, Checkpoint.SnapshotDirectoryName);
+                    names.UnionWith(Directory.EnumerateFiles(directory, "*" + CheckpointWorkspace.FileSuffix)
+                        .Select(f => Path.GetFileName(f)[..^CheckpointWorkspace.FileSuffix.Length]));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                }
+
+                recorded[segment.Path] = names;
+            }
+
+            if (names.Contains(BaseName(name)))
+            {
+                yield return name;
+            }
+        }
     }
 
     private static IResult RunEvents(string id, long? since, int? limit, RunHistory history)
@@ -122,7 +172,67 @@ public static partial class FlightsEndpoints
         return Results.Ok(new { events = page.Events, next = page.Next, done = page.Done });
     }
 
-    private static IResult StageFile(string id, string node, string name, int? visit, RunHistory history)
+    /// <summary>
+    /// The files of every visit of a stage in run directory <paramref name="id"/> (<c>history/visit-N</c>, then the stage
+    /// directory itself as the latest visit), each with its retried attempts (<c>attempts/attempt-N</c>): how each attempt
+    /// ended and what it cost, from its <c>backend.json</c> and <c>status.json</c>.
+    /// </summary>
+    private static IResult StageVisits(string id, string node, RunHistory history)
+    {
+        var directory = history.ResolveDirectory(id);
+        var stageDirectory = directory is null || !RunHistory.NodeIdPattern().IsMatch(node) ? null : Path.Combine(directory, node);
+        if (stageDirectory is null || !Directory.Exists(stageDirectory))
+        {
+            return Results.NotFound(new { error = "Not found." });
+        }
+
+        var visits = new JsonArray();
+        var archived = StageFiles.HistoryVisits(stageDirectory);
+        foreach (var (number, path) in archived)
+        {
+            visits.Add(VisitArchive(number, path, latest: false));
+        }
+
+        visits.Add(VisitArchive(archived.Count + 1, stageDirectory, latest: true));
+        return Results.Ok(new JsonObject { ["node"] = node, ["run"] = Path.GetFileName(directory), ["visits"] = visits });
+    }
+
+    private static JsonObject VisitArchive(int visit, string directory, bool latest)
+    {
+        var attempts = new JsonArray();
+        foreach (var (number, path) in StageFiles.Attempts(directory))
+        {
+            var attempt = AttemptSummary(path);
+            attempt["attempt"] = number;
+            attempts.Add(attempt);
+        }
+
+        var json = AttemptSummary(directory);
+        json["visit"] = visit;
+        json["latest"] = latest;
+        json["attempts"] = attempts;
+        return json;
+    }
+
+    /// <summary>
+    /// What a directory of stage files says about how its attempt ended: <c>outcome</c> (<c>timeout</c>, <c>cancelled</c>,
+    /// or <c>error</c> from <c>backend.json</c>; else the <c>status.json</c> outcome), <c>error</c>, the attempt's
+    /// <c>backend.json</c>, and its files.
+    /// </summary>
+    private static JsonObject AttemptSummary(string directory)
+    {
+        var backend = RunHistory.ReadJsonObject(Path.Combine(directory, "backend.json"));
+        var status = RunHistory.ReadJsonObject(Path.Combine(directory, "status.json"));
+        return new JsonObject
+        {
+            ["outcome"] = HistoryJson.NonEmpty(HistoryJson.Str(backend?["outcome"])) ?? HistoryJson.NonEmpty(HistoryJson.Str(status?["outcome"])),
+            ["error"] = HistoryJson.NonEmpty(HistoryJson.Str(backend?["error"])) ?? HistoryJson.NonEmpty(HistoryJson.Str(status?["failure_reason"])),
+            ["files"] = new JsonArray(StageFiles.Names(directory).Select(f => (JsonNode?)f).ToArray()),
+            ["backend"] = backend,
+        };
+    }
+
+    private static IResult StageFile(string id, string node, string name, int? visit, int? attempt, RunHistory history)
     {
         var directory = history.ResolveDirectory(id);
         if (directory is null || !RunHistory.NodeIdPattern().IsMatch(node) || !RunHistory.IsPlainName(name))
@@ -142,6 +252,16 @@ public static partial class FlightsEndpoints
             else if (number < 1 || number != StageFiles.HistoryVisits(stageDirectory).Count + 1)
             {
                 // The latest visit is the stage directory itself; other numbers name history/visit-N.
+                return Results.NotFound(new { error = "Not found." });
+            }
+        }
+
+        if (attempt is { } attemptNumber)
+        {
+            // An attempt the engine retried, archived in the visit's attempts/attempt-N.
+            folder = Path.Combine(folder, StageAttemptArchive.DirectoryName, $"attempt-{attemptNumber}");
+            if (attemptNumber < 1 || !Directory.Exists(folder))
+            {
                 return Results.NotFound(new { error = "Not found." });
             }
         }
@@ -177,7 +297,7 @@ public static partial class FlightsEndpoints
         return Results.Ok(RunTelemetry.Compute(name, runs));
     }
 
-    private static IResult Fork(string id, ForkRequest? body, RunHistory history, PipelineRunManager manager)
+    private static async Task<IResult> ForkAsync(string id, ForkRequest? body, RunHistory history, PipelineRunManager manager)
     {
         var directory = history.ResolveDirectory(id);
         if (directory is null || history.Load(id) is not { OnDisk: true } record)
@@ -253,36 +373,84 @@ public static partial class FlightsEndpoints
         {
             foreach (var (key, value) in source)
             {
-                if (key is not ("forked_from" or "simulated" or "simulation"))
+                if (key is not ("forked_from" or "simulated" or "simulation" or "workspace_restore"))
                 {
                     studio[key] = value?.DeepClone();
                 }
             }
         }
 
-        var started = manager.StartFromCheckpoint(new CheckpointStartRequest
+        CheckpointWorkspace? restore = null;
+        if (body.RestoreWorkspace == true)
+        {
+            restore = CheckpointWorkspace.Load(CheckpointWorkspace.PathFor(Path.Combine(segment.Path, Checkpoint.SnapshotDirectoryName), snapshot));
+            if (restore is null)
+            {
+                var walk = RunHistory.ReadJsonObject(Path.Combine(record.Segments[0].Path, WorkspaceRecordFile)) is { } workspace &&
+                           string.Equals(HistoryJson.Str(workspace["mode"]), "walk", StringComparison.Ordinal);
+                return Refusal(
+                    walk ? WorkspaceRestoreErrors.Unavailable : WorkspaceRestoreErrors.SnapshotMissing,
+                    walk
+                        ? "Rewind is unavailable: the run's working directory is not in a git work tree, so its workspace was recorded with a file walk, which keeps no file contents."
+                        : $"No workspace snapshot was recorded with checkpoint '{body.Checkpoint}' (workspace tracking was off, the directory is not in a git work tree, or the run predates workspace snapshots).",
+                    record.WorkingDirectory);
+            }
+        }
+
+        var request = new CheckpointStartRequest
         {
             Dot = dot,
             Checkpoint = checkpoint,
             Studio = studio,
             WorkingDirectory = body.WorkingDirectory,
-        });
+            SourceWorkingDirectory = record.WorkingDirectory,
+            ConfirmWorkingDirectory = body.ConfirmWorkingDirectory == true,
+            RestoreWorkspace = restore,
+            SourceRunDirectory = record.Segments[0].Path,
+        };
+
+        // A rewind must not stop half-way because the client went away, so it does not observe the request's abort.
+        var started = await manager.StartFromCheckpointAsync(request, CancellationToken.None).ConfigureAwait(false);
         if (!started.Succeeded)
         {
+            if (started.ErrorCode is { } code)
+            {
+                return Refusal(code, started.Error, started.WorkingDirectory);
+            }
+
             return Results.BadRequest(new { error = started.Error, diagnostics = started.Diagnostics.Select(DiagnosticDto.From) });
         }
 
         var run = started.Run!;
+        var origin = !string.IsNullOrWhiteSpace(body.WorkingDirectory) ? "request" : record.WorkingDirectory is null ? "server" : "source_run";
         return Results.Created($"/pipelines/{run.Id}", new
         {
             id = run.Id,
             status = run.Status,
             name = run.Name,
             logs_root = run.LogsRoot,
+            working_directory = run.WorkingDirectory,
+            working_directory_source = origin,
+            source_working_directory = record.WorkingDirectory,
+            working_directory_note = record.WorkingDirectory is null
+                ? $"The source run did not record its working directory, so the fork runs in {(origin == "server" ? "the server's working directory, " : "")}'{run.WorkingDirectory}'. Check that it has the files the run worked on."
+                : null,
             forked_from = forkedFrom,
+            workspace_restore = started.Restored?.ToJson(),
             diagnostics = started.Diagnostics.Select(DiagnosticDto.From),
             links = new { self = $"/pipelines/{run.Id}", events = $"/pipelines/{run.Id}/events", history = $"/studio/api/runs/{Path.GetFileName(run.LogsRoot)}" },
         });
+
+        IResult Refusal(string code, string? error, string? workingDirectory) => Results.Json(
+            new
+            {
+                error,
+                code,
+                working_directory = HistoryJson.NonEmpty(workingDirectory),
+                source_working_directory = record.WorkingDirectory,
+                server_working_directory = Path.GetFullPath(manager.Options.WorkingDirectory),
+            },
+            statusCode: code == WorkingDirectoryErrors.NotAllowed ? StatusCodes.Status403Forbidden : StatusCodes.Status409Conflict);
     }
 
     private static async Task<IResult> SteerAsync(string id, SteerRequest? body, PipelineRunManager manager, CancellationToken cancellationToken)
@@ -393,10 +561,36 @@ public static partial class FlightsEndpoints
         ["live_id"] = run.Live?.Id,
         ["restarts"] = new JsonArray(run.Segments.Skip(1).Select(s => (JsonNode?)s.Name).ToArray()),
         ["source_path"] = run.SourcePath,
+        ["working_directory"] = run.WorkingDirectory,
         ["simulated"] = run.Simulated,
         ["forked_from"] = run.ForkedFrom,
         ["cost"] = run.Cost.ToJson(),
+        ["metrics"] = Numbers(run.Metrics),
+        ["failures_continued"] = run.FailuresContinued,
+        ["failed_stages"] = new JsonArray(run.FailedStages.Select(s => (JsonNode?)s).ToArray()),
+        ["visit_limits"] = run.Nodes.Values.Sum(n => n.VisitLimits),
+        ["budget"] = run.Budget is { } budget
+            ? new JsonObject
+            {
+                ["spent_usd"] = CostTotals.Number(budget.SpentUsd),
+                ["limit_usd"] = CostTotals.Number(budget.LimitUsd),
+                ["next_node"] = budget.NextNode,
+                ["at"] = HistoryJson.Iso(budget.At),
+            }
+            : null,
     };
+
+    /// <summary>A name → number object (numbers as <see cref="CostTotals.Number"/> writes them).</summary>
+    internal static JsonObject Numbers(IEnumerable<KeyValuePair<string, double>> values)
+    {
+        var json = new JsonObject();
+        foreach (var (name, value) in values)
+        {
+            json[name] = CostTotals.Number(value);
+        }
+
+        return json;
+    }
 
     private static JsonArray Stages(RunRecord record)
     {
@@ -440,7 +634,14 @@ public static partial class FlightsEndpoints
         var segment = record.Segments.LastOrDefault(s => Directory.Exists(Path.Combine(s.Path, node)));
         var directory = segment is null ? null : Path.Combine(segment.Path, node);
         var files = directory is null ? [] : StageFiles.Names(directory);
-        var historyVisits = directory is null ? 0 : StageFiles.HistoryVisits(directory).Count;
+        var visitDirectories = directory is null ? [] : StageFiles.HistoryVisits(directory);
+        var historyVisits = visitDirectories.Count;
+        var archivedAttempts = directory is null ? 0 : visitDirectories.Sum(v => StageFiles.Attempts(v.Path).Count) + StageFiles.Attempts(directory).Count;
+        var cost = new CostTotals();
+        foreach (var usage in stats?.Usage ?? [])
+        {
+            cost.Add(usage.Values);
+        }
         string? status;
         if (stats is { Open: true })
         {
@@ -462,9 +663,40 @@ public static partial class FlightsEndpoints
             ["status"] = status,
             ["duration_ms"] = stats is { DurationsMs.Count: > 0 } ? (long)Math.Round(stats.DurationsMs.Sum()) : null,
             ["backend"] = directory is null ? null : RunHistory.ReadJsonObject(Path.Combine(directory, "backend.json")),
+            ["changes"] = directory is null ? null : ChangesSummary(RunHistory.ReadJsonObject(Path.Combine(directory, "changes.json"))),
             ["files"] = new JsonArray(files.Select(f => (JsonNode?)f).ToArray()),
             ["history_visits"] = historyVisits,
             ["segment"] = segment?.Name,
+            ["attempts"] = archivedAttempts,
+            ["cost"] = cost.ToJson(),
+            ["metrics"] = new JsonArray((stats?.Metrics ?? []).Select(m => (JsonNode?)new JsonObject { ["visit"] = m.Visit, ["metrics"] = Numbers(m.Values) }).ToArray()),
+            ["failures_continued"] = stats?.FailuresContinued ?? 0,
+            ["visit_limits"] = stats?.VisitLimits ?? 0,
+        };
+    }
+
+    /// <summary>
+    /// The counts of a stage's latest <c>changes.json</c> (what the visit changed in its working directory): added,
+    /// modified, deleted, out_of_scope, plus mode, concurrent, and truncated. Null without one.
+    /// </summary>
+    internal static JsonObject? ChangesSummary(JsonObject? changes)
+    {
+        if (changes is null)
+        {
+            return null;
+        }
+
+        static int Count(JsonNode? node) => node is JsonValue value && value.TryGetValue<int>(out var count) ? count : 0;
+        var summary = changes["summary"];
+        return new JsonObject
+        {
+            ["added"] = Count(summary?["added"]),
+            ["modified"] = Count(summary?["modified"]),
+            ["deleted"] = Count(summary?["deleted"]),
+            ["out_of_scope"] = changes["write_scope"]?["violations"] is JsonArray violations ? violations.Count : 0,
+            ["mode"] = HistoryJson.Str(changes["mode"]),
+            ["concurrent"] = changes["concurrent"]?.GetValueKind() == System.Text.Json.JsonValueKind.True,
+            ["truncated"] = changes["truncated"]?.GetValueKind() == System.Text.Json.JsonValueKind.True,
         };
     }
 
@@ -536,6 +768,9 @@ public static partial class FlightsEndpoints
     }
 
     private static IResult UnknownRun(string id) => Results.NotFound(new { error = $"Unknown run '{id}'." });
+
+    /// <summary>A snapshot name without its <c>restart-N/</c> prefix.</summary>
+    private static string BaseName(string snapshot) => snapshot[(snapshot.LastIndexOf('/') + 1)..];
 
     private static string Clip(string text)
     {

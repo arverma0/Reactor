@@ -15,5 +15,6 @@
     <Project Path="tests/Reactor.Backends.Tests/Reactor.Backends.Tests.csproj" />
     <Project Path="tests/Reactor.Server.Tests/Reactor.Server.Tests.csproj" />
     <Project Path="tests/Reactor.Copilot.Tests/Reactor.Copilot.Tests.csproj" />
+    <Project Path="tests/Reactor.Cli.Tests/Reactor.Cli.Tests.csproj" />
   </Folder>
 </Solution>

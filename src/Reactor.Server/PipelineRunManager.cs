@@ -6,6 +6,7 @@ using Reactor.Execution;
 using Reactor.Graphs;
 using Reactor.Handlers;
 using Reactor.Validation;
+using Reactor.Workspaces;
 
 namespace Reactor.Server;
 
@@ -41,6 +42,13 @@ public sealed record ReactorServerOptions
 
     /// <summary>Stage executions allowed per run before it fails (guards against runaway loops; 0 = unlimited).</summary>
     public int MaxStepsPerRun { get; init; } = 1000;
+
+    /// <summary>
+    /// Default cost budget per run in US dollars (<see cref="RunOptions.MaxCostUsd"/>): a run stops, resumably, before its
+    /// next stage once its recorded cost reaches it. Null = the pipeline's own <c>max_cost</c>; a start or resume request
+    /// may set its own (<c>max_cost</c>).
+    /// </summary>
+    public double? MaxCostPerRunUsd { get; init; }
 
     /// <summary>Maximum DOT source size accepted (default 1 MiB).</summary>
     public int MaxDotBytes { get; init; } = 1024 * 1024;
@@ -81,6 +89,24 @@ public sealed record ModelDescriptor
 
     /// <summary>Copilot billing multiplier, when known.</summary>
     public double? BillingMultiplier { get; init; }
+
+    /// <summary>USD per 1M uncached input tokens, when known (Copilot: the built-in price table; API models: the catalog).</summary>
+    public double? InputCostPerMillion { get; init; }
+
+    /// <summary>USD per 1M input tokens read from the prompt cache, when known.</summary>
+    public double? CachedInputCostPerMillion { get; init; }
+
+    /// <summary>USD per 1M input tokens written to the prompt cache, when the model charges for cache writes.</summary>
+    public double? CacheWriteCostPerMillion { get; init; }
+
+    /// <summary>USD per 1M output tokens, when known.</summary>
+    public double? OutputCostPerMillion { get; init; }
+
+    /// <summary>
+    /// Where the token prices come from: <c>price_table</c> (Reactor's Copilot price table, see <c>REACTOR_PRICES</c>) or
+    /// <c>catalog</c> (the model catalog); null when no price is known.
+    /// </summary>
+    public string? PriceSource { get; init; }
 
     /// <summary>Copilot policy state (<c>enabled</c>, <c>disabled</c>, ...), when known.</summary>
     public string? PolicyState { get; init; }
@@ -160,6 +186,9 @@ public sealed class ManagedRun
     public string WorkingDirectory { get; }
 
     public IReadOnlyDictionary<string, object?>? InitialContext { get; }
+
+    /// <summary>The run's cost budget in US dollars (from the start or resume request), or null for the server default.</summary>
+    public double? MaxCostUsd { get; internal set; }
 
     /// <summary>
     /// Studio metadata saved with the run as <c>studio.json</c> (the <c>"studio"</c> object of the start request, plus
@@ -428,6 +457,56 @@ public sealed class ManagedRun
 public sealed record StartResult(ManagedRun? Run, IReadOnlyList<Diagnostic> Diagnostics, string? Error)
 {
     public bool Succeeded => Run is not null;
+
+    /// <summary>
+    /// Why the run's working directory was refused (one of <see cref="WorkingDirectoryErrors"/>), or null when the run
+    /// started or failed for another reason.
+    /// </summary>
+    public string? ErrorCode { get; init; }
+
+    /// <summary>The working directory that was refused, with <see cref="ErrorCode"/>.</summary>
+    public string? WorkingDirectory { get; init; }
+
+    /// <summary>What was restored in the working directory before the run started (<see cref="CheckpointStartRequest.RestoreWorkspace"/>).</summary>
+    public WorkspaceRestore? Restored { get; init; }
+}
+
+/// <summary>
+/// Reasons a run that continues from a checkpoint could not rewind its working directory (<see cref="StartResult.ErrorCode"/>);
+/// see also <see cref="WorkspaceRewind"/>'s codes.
+/// </summary>
+public static class WorkspaceRestoreErrors
+{
+    /// <summary>The run recorded no git snapshots (a file-walk workspace, or git is not available).</summary>
+    public const string Unavailable = WorkspaceRewind.Unavailable;
+
+    /// <summary>No workspace snapshot was recorded with the checkpoint, or it is no longer in the repository.</summary>
+    public const string SnapshotMissing = WorkspaceRewind.SnapshotMissing;
+
+    /// <summary>The working directory is not the source run's repository and subdirectory.</summary>
+    public const string Mismatch = WorkspaceRewind.Mismatch;
+
+    /// <summary>The working directory's state could not be recorded or the files could not be written.</summary>
+    public const string Failed = WorkspaceRewind.Failed;
+
+    /// <summary>Another run of this server is still active in (or above, or below) the working directory.</summary>
+    public const string Busy = "workspace_busy";
+}
+
+/// <summary>Reasons a run that continues from a checkpoint could not get its working directory (<see cref="StartResult.ErrorCode"/>).</summary>
+public static class WorkingDirectoryErrors
+{
+    /// <summary>
+    /// The directory is neither the server's working directory nor one the server manages, and the server does not let
+    /// clients choose (<see cref="ReactorServerOptions.AllowClientWorkingDirectory"/>).
+    /// </summary>
+    public const string NotAllowed = "working_directory_not_allowed";
+
+    /// <summary>The directory does not exist (for example the source run's directory was deleted).</summary>
+    public const string Missing = "working_directory_missing";
+
+    /// <summary>The directory differs from the source run's, which the request did not confirm.</summary>
+    public const string ConfirmationRequired = "working_directory_confirmation_required";
 }
 
 /// <summary>A request to start a pipeline.</summary>
@@ -438,6 +517,9 @@ public sealed record StartRequest
     public IReadOnlyDictionary<string, object?>? Context { get; init; }
 
     public string? WorkingDirectory { get; init; }
+
+    /// <summary>Cost budget for this run in US dollars (<c>"max_cost"</c>); null = the server default or the pipeline's <c>max_cost</c>.</summary>
+    public double? MaxCostUsd { get; init; }
 
     /// <summary>
     /// A working directory chosen by the server itself (the Architect's scratch directory), created if needed and exempt
@@ -467,10 +549,41 @@ public sealed record CheckpointStartRequest
     /// </summary>
     public required Checkpoint Checkpoint { get; init; }
 
+    /// <summary>
+    /// The working directory to use instead of <see cref="SourceWorkingDirectory"/>. Unless the server allows clients to
+    /// choose (<see cref="ReactorServerOptions.AllowClientWorkingDirectory"/>), only the server's own directories qualify:
+    /// its working directory and the directories under its <c>.reactor</c> directory.
+    /// </summary>
     public string? WorkingDirectory { get; init; }
+
+    /// <summary>
+    /// The working directory of the run the checkpoint comes from (its <c>manifest.json</c> <c>working_directory</c>), or
+    /// null when that run did not record one. It is the default working directory (the server's working directory is
+    /// used only when it is null), it is subject to the same policy as <see cref="WorkingDirectory"/>, and it must still
+    /// exist.
+    /// </summary>
+    public string? SourceWorkingDirectory { get; init; }
+
+    /// <summary>
+    /// Confirms running in a directory other than <see cref="SourceWorkingDirectory"/>, which may not contain the files the
+    /// source run worked on; without it such a request fails with <see cref="WorkingDirectoryErrors.ConfirmationRequired"/>.
+    /// </summary>
+    public bool ConfirmWorkingDirectory { get; init; }
 
     /// <summary>Studio metadata saved with the run as <c>studio.json</c> (for forks, <c>forked_from</c> and the source run's fields).</summary>
     public System.Text.Json.Nodes.JsonObject? Studio { get; init; }
+
+    /// <summary>
+    /// The workspace snapshot recorded with the checkpoint (<c>checkpoints/&lt;NNNN-node&gt;.workspace.json</c>) to restore
+    /// in the working directory before the run starts (git work trees only; see
+    /// <see cref="PipelineRunManager.StartFromCheckpointAsync"/>), or null to leave the directory as it is.
+    /// </summary>
+    public CheckpointWorkspace? RestoreWorkspace { get; init; }
+
+    /// <summary>
+    /// The source run's directory: its private snapshot index makes the snapshot taken before a rewind incremental.
+    /// </summary>
+    public string? SourceRunDirectory { get; init; }
 }
 
 /// <summary>Starts, tracks, cancels, and resumes pipeline runs for the HTTP server.</summary>
@@ -483,9 +596,15 @@ public sealed class PipelineRunManager : IAsyncDisposable
     public const string StudioFileName = "studio.json";
 
     private static readonly System.Text.Json.JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
+
+    /// <summary>Paths compare case-insensitively on Windows, like its file systems.</summary>
+    private static readonly StringComparer PathComparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
     private readonly ReactorServerOptions _options;
     private readonly ConcurrentDictionary<string, ManagedRun> _runs = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _slots;
+
+    /// <summary>One workspace rewind (busy check, restore, and start of the run) at a time.</summary>
+    private readonly SemaphoreSlim _rewinds = new(1, 1);
     private int _disposed;
 
     public PipelineRunManager(ReactorServerOptions options)
@@ -496,6 +615,9 @@ public sealed class PipelineRunManager : IAsyncDisposable
         {
             Backend = options.Backend,
             LogsBaseDirectory = ResolveBase(options),
+
+            // Tool stages change files for real even without a codergen backend; simulated runs get their own runner.
+            RealWorkspace = true,
         });
         options.ConfigureRunner?.Invoke(Runner);
     }
@@ -573,7 +695,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
         var id = NewRunId();
         var logsRoot = simulation is null
             ? NewLogsRoot(prepared.Graph.Name, id)
-            : Path.Combine(SimulationsDirectory, $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}-{id}");
+            : Path.Combine(SimulationsDirectory, $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture)}-{Sanitize(prepared.Graph.Name)}-{id}");
         try
         {
             WriteStudioFile(logsRoot, studio);
@@ -586,6 +708,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
         var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, request.Context, Math.Max(100, _options.MaxEventsPerRun), studio)
         {
             Simulation = simulation,
+            MaxCostUsd = request.MaxCostUsd,
         };
         _runs[id] = run;
         run.Execution = simulation is { } simulated
@@ -596,13 +719,105 @@ public sealed class PipelineRunManager : IAsyncDisposable
 
     /// <summary>
     /// Starts a new run that continues from a checkpoint (for example a fork of an earlier run from one of its stage
-    /// snapshots): validates the pipeline, creates a run directory with <c>graph.dot</c>, <c>checkpoint.json</c> (with the
-    /// new run id, no final status), <c>manifest.json</c>, and <c>studio.json</c>, then resumes it like
-    /// <see cref="Resume"/>. The run is listed, streamed, cancelled, and answered like any other run.
+    /// snapshots): validates the pipeline, resolves the working directory (see <see cref="CheckpointStartRequest"/>:
+    /// the requested one, else the source run's, never silently the server's in place of the source run's), creates a run
+    /// directory with <c>graph.dot</c>, <c>checkpoint.json</c> (with the new run id, no final status),
+    /// <c>manifest.json</c>, and <c>studio.json</c>, then resumes it like <see cref="Resume"/>. The run is listed, streamed,
+    /// cancelled, and answered like any other run. A refused working directory sets <see cref="StartResult.ErrorCode"/>.
     /// </summary>
     public StartResult StartFromCheckpoint(CheckpointStartRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.RestoreWorkspace is not null)
+        {
+            throw new ArgumentException($"Restoring the workspace needs {nameof(StartFromCheckpointAsync)}.", nameof(request));
+        }
+
+        return PrepareFromCheckpoint(request, out var launch) ?? Launch(launch!, null);
+    }
+
+    /// <summary>
+    /// <see cref="StartFromCheckpoint"/>, optionally rewinding the working directory first: with
+    /// <see cref="CheckpointStartRequest.RestoreWorkspace"/> the directory's current state is snapshotted (the undo commit),
+    /// then its files are made to match the snapshot recorded with the checkpoint (git work trees only; ignored files and
+    /// run directories are left alone; the user's index, <c>HEAD</c>, and branches are never touched). What was restored is
+    /// in <see cref="StartResult.Restored"/>, the fork's <c>manifest.json</c>, and its <c>studio.json</c>
+    /// (<c>workspace_restore</c>). A refused or failed rewind sets <see cref="StartResult.ErrorCode"/> (one of
+    /// <see cref="WorkspaceRestoreErrors"/>) and starts nothing.
+    /// </summary>
+    public async Task<StartResult> StartFromCheckpointAsync(CheckpointStartRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (PrepareFromCheckpoint(request, out var launch) is { } refused)
+        {
+            return refused;
+        }
+
+        if (request.RestoreWorkspace is not { } target)
+        {
+            return Launch(launch!, null);
+        }
+
+        var workingDirectory = launch!.WorkingDirectory;
+        await _rewinds.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await RestoreAndLaunchAsync(request, launch, target, workingDirectory, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _rewinds.Release();
+        }
+    }
+
+    private async Task<StartResult> RestoreAndLaunchAsync(
+        CheckpointStartRequest request,
+        CheckpointLaunch launch,
+        CheckpointWorkspace target,
+        string workingDirectory,
+        CancellationToken cancellationToken)
+    {
+        if (ActiveRunIn(workingDirectory) is { } busy)
+        {
+            return new StartResult(null, launch.Prepared.Diagnostics,
+                $"Run '{busy.Id}' is still active in '{busy.WorkingDirectory}'; let it finish (or cancel it) before rewinding the working directory.")
+            {
+                ErrorCode = WorkspaceRestoreErrors.Busy,
+                WorkingDirectory = workingDirectory,
+            };
+        }
+
+        WorkspaceRestore restored;
+        try
+        {
+            restored = await WorkspaceRewind.RestoreAsync(
+                workingDirectory,
+                target,
+                launch.Id,
+                launch.LogsRoot,
+                [RunsDirectory, SimulationsDirectory],
+                request.SourceRunDirectory is { } source ? WorkspaceRewind.MainIndexOf(source) : null,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (WorkspaceRewindException ex)
+        {
+            TryDeleteDirectory(launch.LogsRoot);
+            return new StartResult(null, launch.Prepared.Diagnostics, ex.Message) { ErrorCode = ex.Code, WorkingDirectory = workingDirectory };
+        }
+
+        var started = Launch(launch, restored);
+        return started.Succeeded
+            ? started with { Restored = restored }
+            : started with { Error = $"{started.Error} The working directory was already rewound; undo with: {restored.UndoCommand}", Restored = restored };
+    }
+
+    /// <summary>A validated fork-style start, ready to launch.</summary>
+    private sealed record CheckpointLaunch(PreparedPipeline Prepared, string Dot, Checkpoint Checkpoint, string ResumedFrom, string WorkingDirectory, System.Text.Json.Nodes.JsonObject? Studio, string Id, string LogsRoot);
+
+    /// <summary>Validates a checkpoint start; returns the refusal, or null with <paramref name="launch"/> set.</summary>
+    private StartResult? PrepareFromCheckpoint(CheckpointStartRequest request, out CheckpointLaunch? launch)
+    {
+        launch = null;
         PreparedPipeline prepared;
         try
         {
@@ -624,9 +839,9 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, prepared.Diagnostics, $"The checkpoint's stage '{source.CurrentNode}' does not exist in the pipeline.");
         }
 
-        if (!TryResolveWorkingDirectory(request.WorkingDirectory, out var workingDirectory, out var error))
+        if (!TryResolveCheckpointWorkingDirectory(request, out var workingDirectory, out var error, out var errorCode))
         {
-            return new StartResult(null, prepared.Diagnostics, error);
+            return new StartResult(null, prepared.Diagnostics, error) { ErrorCode = errorCode, WorkingDirectory = workingDirectory };
         }
 
         var studio = request.Studio?.DeepClone().AsObject();
@@ -636,17 +851,30 @@ public sealed class PipelineRunManager : IAsyncDisposable
         }
 
         var id = NewRunId();
-        var logsRoot = NewLogsRoot(prepared.Graph.Name, id);
         var checkpoint = Checkpoint.FromJson(source.ToJson());
         checkpoint.RunId = id;
         checkpoint.FinalStatus = null;
         checkpoint.ContextValues["internal.run_id"] = id;
+        launch = new CheckpointLaunch(prepared, request.Dot, checkpoint, source.CurrentNode, workingDirectory, studio, id, NewLogsRoot(prepared.Graph.Name, id));
+        return null;
+    }
+
+    /// <summary>Creates the run directory of a prepared checkpoint start and starts the run.</summary>
+    private StartResult Launch(CheckpointLaunch launch, WorkspaceRestore? restored)
+    {
+        var (prepared, logsRoot, id, studio) = (launch.Prepared, launch.LogsRoot, launch.Id, launch.Studio);
+        if (restored is not null)
+        {
+            studio ??= [];
+            studio["workspace_restore"] = restored.ToJson();
+        }
+
         try
         {
             Directory.CreateDirectory(logsRoot);
-            File.WriteAllText(Path.Combine(logsRoot, "graph.dot"), request.Dot);
-            checkpoint.Save(Path.Combine(logsRoot, Checkpoint.FileName));
-            WriteJsonFile(Path.Combine(logsRoot, "manifest.json"), new System.Text.Json.Nodes.JsonObject
+            File.WriteAllText(Path.Combine(logsRoot, "graph.dot"), launch.Dot);
+            launch.Checkpoint.Save(Path.Combine(logsRoot, Checkpoint.FileName));
+            var manifest = new System.Text.Json.Nodes.JsonObject
             {
                 ["name"] = prepared.Graph.Name,
                 ["label"] = prepared.Graph.Label,
@@ -654,13 +882,19 @@ public sealed class PipelineRunManager : IAsyncDisposable
                 ["run_id"] = id,
                 ["started_at"] = DateTimeOffset.UtcNow.ToString("O"),
                 ["logs_root"] = logsRoot,
-                ["working_directory"] = workingDirectory,
+                ["working_directory"] = launch.WorkingDirectory,
                 ["node_count"] = prepared.Graph.Nodes.Count,
                 ["edge_count"] = prepared.Graph.Edges.Count,
-                ["loop_restarts"] = checkpoint.LoopRestarts,
+                ["loop_restarts"] = launch.Checkpoint.LoopRestarts,
                 ["reactor_version"] = PipelineRunner.Version,
-                ["resumed_from"] = source.CurrentNode,
-            });
+                ["resumed_from"] = launch.ResumedFrom,
+            };
+            if (restored is not null)
+            {
+                manifest["workspace_restore"] = restored.ToJson();
+            }
+
+            WriteJsonFile(Path.Combine(logsRoot, "manifest.json"), manifest);
             WriteStudioFile(logsRoot, studio);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -668,10 +902,39 @@ public sealed class PipelineRunManager : IAsyncDisposable
             return new StartResult(null, prepared.Diagnostics, $"Could not create the run directory: {ex.Message}");
         }
 
-        var run = new ManagedRun(id, prepared.Graph, request.Dot, logsRoot, workingDirectory, null, Math.Max(100, _options.MaxEventsPerRun), studio);
+        var run = new ManagedRun(id, prepared.Graph, launch.Dot, logsRoot, launch.WorkingDirectory, null, Math.Max(100, _options.MaxEventsPerRun), studio);
         _runs[id] = run;
         run.Execution = ExecuteAsync(run, (options, ct) => Runner.ResumeAsync(logsRoot, options, ct));
         return new StartResult(run, prepared.Diagnostics, null);
+    }
+
+    /// <summary>An active (not finished) real run of this server whose working directory contains, or is inside, <paramref name="directory"/>.</summary>
+    private ManagedRun? ActiveRunIn(string directory)
+    {
+        var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+        return _runs.Values.FirstOrDefault(r =>
+            r.Simulation is null && !RunStatus.IsTerminal(r.Status) &&
+            (IsSameOrUnder(target, r.WorkingDirectory) || IsSameOrUnder(r.WorkingDirectory, target)));
+
+        static bool IsSameOrUnder(string path, string directory)
+        {
+            var relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
+            return relative == "." || (!relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative));
+        }
+    }
+
+    private static void TryDeleteDirectory(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
     }
 
     /// <summary>Requests cancellation; false when the run is unknown or already finished.</summary>
@@ -686,8 +949,11 @@ public sealed class PipelineRunManager : IAsyncDisposable
         return true;
     }
 
-    /// <summary>Resumes a finished, unsuccessful run from its last checkpoint.</summary>
-    public StartResult Resume(string id)
+    /// <summary>
+    /// Resumes a finished, unsuccessful run from its last checkpoint; <paramref name="maxCostUsd"/> replaces the run's cost
+    /// budget (e.g. to continue a run that stopped at its budget).
+    /// </summary>
+    public StartResult Resume(string id, double? maxCostUsd = null)
     {
         if (!_runs.TryGetValue(id, out var run))
         {
@@ -702,6 +968,11 @@ public sealed class PipelineRunManager : IAsyncDisposable
         if (!run.TryBeginResume(new CancellationTokenSource(), out var error))
         {
             return new StartResult(null, [], error);
+        }
+
+        if (maxCostUsd is not null)
+        {
+            run.MaxCostUsd = maxCostUsd;
         }
 
         var logsRoot = run.CurrentLogsRoot;
@@ -768,6 +1039,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
                 OnEvent = run.Record,
                 MaxSteps = Math.Max(0, _options.MaxStepsPerRun),
                 KeepCheckpointHistory = true,
+                MaxCostUsd = run.MaxCostUsd ?? _options.MaxCostPerRunUsd,
             };
             var result = await body(options, token).ConfigureAwait(false);
             run.Finish(StatusOf(result), result, result.Cancelled ? null : FailureOf(result));
@@ -826,7 +1098,7 @@ public sealed class PipelineRunManager : IAsyncDisposable
     private static string NewRunId() => Guid.NewGuid().ToString("N")[..12];
 
     private string NewLogsRoot(string graphName, string id) =>
-        Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Sanitize(graphName)}-{id}");
+        Path.Combine(ResolveBase(_options), $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture)}-{Sanitize(graphName)}-{id}");
 
     private bool TryResolveWorkingDirectory(string? requested, out string workingDirectory, out string? error)
     {
@@ -852,6 +1124,92 @@ public sealed class PipelineRunManager : IAsyncDisposable
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Chooses the working directory of a run that continues from a checkpoint (see <see cref="CheckpointStartRequest"/>):
+    /// the requested directory, else the source run's, else (a source run that did not record one) the server's. On
+    /// failure <paramref name="workingDirectory"/> is the directory that was refused.
+    /// </summary>
+    private bool TryResolveCheckpointWorkingDirectory(CheckpointStartRequest request, out string workingDirectory, out string? error, out string? errorCode)
+    {
+        var server = NormalizePath(_options.WorkingDirectory, Directory.GetCurrentDirectory());
+        string? requested;
+        string? source;
+        try
+        {
+            requested = string.IsNullOrWhiteSpace(request.WorkingDirectory) ? null : NormalizePath(request.WorkingDirectory, server);
+            source = string.IsNullOrWhiteSpace(request.SourceWorkingDirectory) ? null : NormalizePath(request.SourceWorkingDirectory, server);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            workingDirectory = "";
+            error = $"Invalid working directory: {ex.Message}";
+            errorCode = null;
+            return false;
+        }
+
+        workingDirectory = requested ?? source ?? server;
+        errorCode = null;
+        error = null;
+        var permitted = _options.AllowClientWorkingDirectory || IsServerDirectory(workingDirectory, server);
+
+        // A requested directory the server may not use is refused before the disk is touched, so clients can neither probe
+        // it nor make the server reach out to network paths. For the source run's directory (recorded by the server or the
+        // CLI), "it is gone" is the more useful answer when both apply.
+        if (!permitted && requested is not null)
+        {
+            errorCode = WorkingDirectoryErrors.NotAllowed;
+            error = $"This server does not let clients choose the working directory ('{workingDirectory}'); it can only use its own, '{server}'. " +
+                    "Start the server with --allow-client-workdir to use other directories.";
+            return false;
+        }
+
+        var exists = Directory.Exists(workingDirectory);
+        if (!permitted && exists)
+        {
+            errorCode = WorkingDirectoryErrors.NotAllowed;
+            error = $"The source run worked in '{source}', but this server works in '{server}' and does not let clients choose another working directory. " +
+                    $"To continue in '{source}', start the server from that directory or with --allow-client-workdir. " +
+                    $"To continue in the server's directory instead (it may not have the run's files), set working_directory to '{server}' and confirm_working_directory to true.";
+            return false;
+        }
+
+        if (!exists)
+        {
+            errorCode = WorkingDirectoryErrors.Missing;
+            error = requested is not null ? $"Working directory '{workingDirectory}' does not exist."
+                : source is not null
+                    ? $"The source run worked in '{source}', which no longer exists. Restore it, or continue in another directory: " + (_options.AllowClientWorkingDirectory
+                        ? "set working_directory to an existing directory and confirm_working_directory to true."
+                        : $"set working_directory to the server's directory, '{server}', and confirm_working_directory to true.")
+                    : $"The server's working directory '{server}' does not exist.";
+            return false;
+        }
+
+        if (source is not null && !PathComparer.Equals(workingDirectory, source) && !request.ConfirmWorkingDirectory)
+        {
+            errorCode = WorkingDirectoryErrors.ConfirmationRequired;
+            error = $"The source run worked in '{source}'. Continuing in '{workingDirectory}' instead may leave its stages without the files the run " +
+                    "worked on; set confirm_working_directory to true to continue there anyway.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string NormalizePath(string path, string basePath) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path, basePath));
+
+    /// <summary>The server's working directory, or a directory inside its <c>.reactor</c> directory (such as the Architect's scratch directories).</summary>
+    private static bool IsServerDirectory(string directory, string server)
+    {
+        if (PathComparer.Equals(directory, server))
+        {
+            return true;
+        }
+
+        var state = Path.Combine(server, ".reactor") + Path.DirectorySeparatorChar;
+        return directory.StartsWith(state, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
     }
 
     private static bool StudioTooLarge(System.Text.Json.Nodes.JsonObject? studio) =>

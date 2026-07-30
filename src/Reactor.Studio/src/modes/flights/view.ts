@@ -1,4 +1,5 @@
-import type { ForkOrigin, HistoryDetail, HistoryStage, HistorySummary, PendingQuestion, RunCost, RunDetail, RunSummary } from "../../api/types";
+import type { BudgetStopInfo, ForkOrigin, HistoryDetail, HistoryStage, HistorySummary, PendingQuestion, RunCost, RunDetail, RunSummary } from "../../api/types";
+import { stripAnsi } from "../../model/ansi";
 
 /** Everything the Flights panels show about one flight, from the live run (if the server tracks it) and its directory. */
 export interface FlightView {
@@ -19,8 +20,16 @@ export interface FlightView {
   simulationMode?: string;
   forkedFrom: ForkOrigin | null;
   cost: RunCost | null;
+  /** The flight's working directory (its manifest's, else the live run's); null when the flight did not record one. */
+  workingDirectory: string | null;
   checkpoints: string[];
   stages: HistoryStage[];
+  /** The run's latest stop was its cost budget (from the history; the event stream has it too). */
+  budget: BudgetStopInfo | null;
+  /** Stages whose failure flowed onward and never succeeded afterwards. */
+  failedStages: string[];
+  /** Final values of the outcome metrics. */
+  metrics: Record<string, number>;
 }
 
 export function flightView(key: string, flight: Flight | undefined, live: RunDetail | undefined, history: HistoryDetail | undefined): FlightView | null {
@@ -29,7 +38,9 @@ export function flightView(key: string, flight: Flight | undefined, live: RunDet
   const status = live?.status ?? flight?.status ?? summary?.status ?? "unknown";
   const dir = flight?.dir ?? summary?.id ?? null;
   const logs = live?.logs_root?.split(/[\\/]/).filter(Boolean) ?? [];
-  const failure = live?.error || live?.result?.failure_reason || history?.result?.failure_reason || flight?.failure || summary?.failure_reason || null;
+  // Failure reasons quote tool output, which may carry terminal escape sequences.
+  const failure = stripAnsi(live?.error || live?.result?.failure_reason || history?.result?.failure_reason || flight?.failure || summary?.failure_reason) || null;
+  const active = status === "running" || status === "queued";
   return {
     key,
     liveId: flight?.liveId ?? live?.id ?? null,
@@ -37,7 +48,7 @@ export function flightView(key: string, flight: Flight | undefined, live: RunDet
     name: live?.name ?? flight?.name ?? summary?.name ?? "",
     goal: live?.goal || flight?.goal || summary?.goal || "",
     status,
-    active: status === "running" || status === "queued",
+    active,
     startedAt: live?.started_at ?? flight?.startedAt ?? summary?.started_at ?? null,
     durationMs: live?.duration_seconds != null ? live.duration_seconds * 1000 : (summary?.duration_ms ?? flight?.durationMs ?? null),
     currentNode: live?.current_node ?? flight?.currentNode ?? null,
@@ -48,19 +59,28 @@ export function flightView(key: string, flight: Flight | undefined, live: RunDet
     simulationMode: live?.simulation_mode ?? flight?.simulationMode,
     forkedFrom: summary?.forked_from ?? flight?.forkedFrom ?? null,
     cost: summary?.cost && Object.keys(summary.cost).length > 0 ? summary.cost : (flight?.cost ?? null),
+    workingDirectory: summary?.working_directory ?? live?.working_directory ?? flight?.workingDirectory ?? null,
     checkpoints: history?.checkpoints ?? [],
     stages: history?.stages ?? [],
+    budget: active ? null : (summary?.budget ?? flight?.budget ?? null),
+    failedStages: summary?.failed_stages ?? flight?.failedStages ?? NONE,
+    metrics: summary?.metrics ?? flight?.metrics ?? NO_METRICS,
   };
 }
 
-/** Short cost text for lists: AI units, else dollars, else tokens. */
-export function costText(cost: RunCost | null | undefined): string | null {
-  if (!cost) return null;
-  if (cost.ai_units !== undefined) return `${cost.ai_units.toFixed(cost.ai_units < 10 ? 1 : 0)} AIU`;
-  if (cost.cost_usd !== undefined) return `$${cost.cost_usd.toFixed(2)}`;
-  if (cost.premium_requests !== undefined) return `${cost.premium_requests} req`;
-  const tokens = (cost.input_tokens ?? 0) + (cost.output_tokens ?? 0);
-  return tokens > 0 ? `${tokens >= 10000 ? `${Math.round(tokens / 1000)}k` : tokens.toLocaleString()} tok` : null;
+const NONE: string[] = [];
+const NO_METRICS: Record<string, number> = {};
+
+/** Short cost text for lists: dollars (comparable across backends), else AI units, premium requests, or tokens. */
+export { costText } from "../../model/cost";
+
+/**
+ * A budget to suggest when resuming a run that stopped at its budget: twice the old one, or what was spent plus the old
+ * one if that is more — rounded up to whole dollars (to cents under a dollar).
+ */
+export function suggestBudget(spent: number, limit: number): number {
+  const base = Math.max(limit * 2, spent + limit, spent * 1.25, 0.01);
+  return base < 1 ? Math.ceil(Number((base * 100).toFixed(6))) / 100 : Math.ceil(Number(base.toFixed(6)));
 }
 
 /**
@@ -87,7 +107,13 @@ export interface Flight {
   stageExecutions: number | null;
   failure: string | null;
   sourcePath: string | null;
+  workingDirectory: string | null;
   restarts: number;
+  /** The run's latest stop was its cost budget. */
+  budget: BudgetStopInfo | null;
+  /** Stages whose failure flowed onward and never succeeded afterwards (a landing with failed stages behind it). */
+  failedStages: string[];
+  metrics: Record<string, number>;
 }
 
 const sortTime = (f: Flight) => Date.parse(f.startedAt ?? f.createdAt ?? "") || Number.MAX_SAFE_INTEGER;
@@ -119,7 +145,11 @@ export function mergeFlights(live: RunSummary[], history: HistorySummary[]): Fli
       stageExecutions: h.stage_executions ?? null,
       failure: h.failure_reason ?? null,
       sourcePath: h.source_path ?? null,
+      workingDirectory: h.working_directory ?? l?.working_directory ?? null,
       restarts: h.restarts?.length ?? 0,
+      budget: l && (l.status === "running" || l.status === "queued") ? null : (h.budget ?? null),
+      failedStages: h.failed_stages ?? NONE,
+      metrics: h.metrics ?? NO_METRICS,
     });
   }
   for (const l of live) {
@@ -144,7 +174,11 @@ export function mergeFlights(live: RunSummary[], history: HistorySummary[]): Fli
       stageExecutions: null,
       failure: null,
       sourcePath: null,
+      workingDirectory: l.working_directory ?? null,
       restarts: 0,
+      budget: null,
+      failedStages: NONE,
+      metrics: NO_METRICS,
     });
   }
   return flights.sort((a, b) => sortTime(b) - sortTime(a));

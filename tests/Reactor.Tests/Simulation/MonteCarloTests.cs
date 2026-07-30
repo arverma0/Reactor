@@ -8,6 +8,7 @@ using Reactor.Validation;
 
 namespace Reactor.Tests.Simulation;
 
+[Collection(Sim.Collection)]
 public sealed class MonteCarloTests
 {
     private const string FactoryScenario = """{"defaults": {"tool": {"outcomes": {"success": 0.6, "fail": 0.4}}}}""";
@@ -99,7 +100,7 @@ public sealed class MonteCarloTests
         Assert.Equal(20, deadEnd.Outcomes["dead_end"]);
         Assert.StartsWith("No eligible outgoing edge from 'work'", Assert.Single(deadEnd.Failures).Reason, StringComparison.Ordinal);
         Assert.Equal(20, fail.Outcomes["fail"]);
-        Assert.Equal("[Simulated] failure", Assert.Single(fail.Failures).Reason);
+        Assert.Equal("[Simulated] failure at work", Assert.Single(fail.Failures).Reason);
         Assert.Equal("work", fail.Failures[0].LastNode);
         Assert.Equal(0.0, fail.SuccessRate);
     }
@@ -144,8 +145,10 @@ public sealed class MonteCarloTests
         Assert.Equal(failure.Kind, replay.Kind);
         Assert.Equal(failure.FailureReason, replay.FailureReason);
         Assert.Equal(failure.Steps, replay.Steps);
-        var group = report.Failures.Single(f => f.Sample.RunIndex == failure.RunIndex);
-        Assert.Equal(failure.Path[^1], group.LastNode);
+        var group = report.Failures.Single(f => f.Kind == failure.Kind && f.Nodes.ContainsKey(failure.Path[^1]));
+        var groupReplay = await SimulationTrace.RunAsync(graph, Sim.Scenario(scenario), group.Sample.Seed, group.Sample.RunIndex,
+            new MonteCarloOptions { MaxSteps = 30 }, TestContext.Current.CancellationToken);
+        Assert.Equal(group.LastNode, groupReplay.Path[^1]);
     }
 
     [Fact]
@@ -319,7 +322,7 @@ public sealed class MonteCarloTests
         Assert.Equal(report.Longest.Steps, report.Steps.Max);
         Assert.True(report.Longest.Path.Count <= report.Longest.Steps);
         var samples = json["samples"]!.AsObject();
-        Assert.Equal(["first_failure", "longest", "typical"], samples.Select(kv => kv.Key));
+        Assert.Equal(["first_failure", "first_failed_stage_landing", "longest", "typical"], samples.Select(kv => kv.Key));
         Assert.Equal(["min", "mean", "p50", "p90", "p95", "max", "bucket_size", "histogram"], json["steps"]!.AsObject().Select(kv => kv.Key));
         Assert.Equal(2, json["success_ci"]!.AsArray().Count);
         Assert.Equal(0.0, Math.Round(report.SimulatedDuration.Mean, 3));

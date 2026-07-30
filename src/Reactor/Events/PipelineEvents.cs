@@ -153,6 +153,51 @@ public sealed record ArtifactProduced(string NodeId, string Name, string Kind, s
         : $"Artifact {Name} v{Version} produced by {NodeId}: {Path} ({Bytes} bytes)";
 }
 
+/// <summary>
+/// Reactor extension: a stage failed and nothing routed the failure explicitly (no matching condition, preferred label,
+/// suggested id, or retry target), so the engine followed an unconditional edge to <see cref="To"/> as the spec requires —
+/// the run goes on as if the stage had succeeded. Emitted for top-level stages and for stages inside parallel branches.
+/// Set <c>on_fail="stop"</c> on the node (or <c>default_on_fail="stop"</c> on the graph) to end the run instead, or add an
+/// <c>outcome=fail</c> edge to handle the failure.
+/// </summary>
+public sealed record FailedStageContinued(string NodeId, string To, string FailureReason) : PipelineEvent
+{
+    public override string Description => $"Stage {NodeId} failed; continuing to {To} along an unconditional edge (no failure route)";
+}
+
+/// <summary>
+/// Reactor extension: a stage reported outcome metrics (numbers describing the product, e.g. <c>qa_failed</c> or
+/// <c>visual_min_score</c>) through <c>status.json</c> <c>metrics</c> or a metrics file. Emitted when the engine records the
+/// outcome (after <see cref="StageCompleted"/>); the values are also in the context as <c>metrics.&lt;name&gt;</c>.
+/// </summary>
+public sealed record MetricsRecorded(string NodeId, IReadOnlyDictionary<string, double> Metrics) : PipelineEvent
+{
+    public override string Description =>
+        $"Stage {NodeId} reported metrics: " + string.Join(", ", Metrics.Select(kv => kv.Key + "=" + kv.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)));
+}
+
+/// <summary>
+/// Reactor extension: the run was about to visit <see cref="NodeId"/> again, but the node has run <see cref="MaxVisits"/>
+/// times already (<c>max_visits</c>). The engine continues at <see cref="Target"/> (<c>on_max_visits</c>), followed by an
+/// <see cref="EdgeSelected"/> event with reason <c>max_visits</c>, or fails the run when there is no target.
+/// </summary>
+public sealed record VisitLimitReached(string NodeId, int MaxVisits, string? Target) : PipelineEvent
+{
+    public override string Description => Target is null
+        ? $"Stage {NodeId} reached its visit limit ({MaxVisits}); no on_max_visits target"
+        : $"Stage {NodeId} reached its visit limit ({MaxVisits}); continuing at {Target}";
+}
+
+/// <summary>
+/// Reactor extension: the run's recorded cost reached its budget (<c>max_cost</c> / <see cref="Execution.RunOptions.MaxCostUsd"/>),
+/// so it stopped before <see cref="NextNodeId"/>. The checkpoint is left resumable: resume with a higher budget to go on.
+/// </summary>
+public sealed record BudgetExceeded(double SpentUsd, double LimitUsd, string NextNodeId) : PipelineEvent
+{
+    public override string Description =>
+        $"Budget exceeded: {UsageLedger.FormatUsd(SpentUsd)} spent of {UsageLedger.FormatUsd(LimitUsd)}; stopped before {NextNodeId}";
+}
+
 /// <summary>Receives pipeline events.</summary>
 public interface IPipelineEventSink
 {

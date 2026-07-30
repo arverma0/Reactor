@@ -31,11 +31,13 @@ public static class GraphRenderer
     /// <summary>
     /// DOT for display: only visual attributes are kept (prompts are omitted), conditions become edge labels when the
     /// edge has none, and nodes are filled by <paramref name="statuses"/> (node id → status wire name).
-    /// <paramref name="currentNode"/> is highlighted as running.
+    /// <paramref name="runningNodes"/> (several while parallel branches run) are highlighted as running, whatever their
+    /// earlier status.
     /// </summary>
-    public static string ToDisplayDot(Graph graph, IReadOnlyDictionary<string, string>? statuses = null, string? currentNode = null)
+    public static string ToDisplayDot(Graph graph, IReadOnlyDictionary<string, string>? statuses = null, IEnumerable<string>? runningNodes = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
+        var running = new HashSet<string>(runningNodes ?? [], StringComparer.Ordinal);
         var display = graph.Clone();
         foreach (var edge in display.Edges)
         {
@@ -54,7 +56,7 @@ public static class GraphRenderer
             display,
             node =>
             {
-                var status = node.Id == currentNode ? "running" : statuses?.GetValueOrDefault(node.Id);
+                var status = running.Contains(node.Id) ? "running" : statuses?.GetValueOrDefault(node.Id);
                 if (status is null || !StatusColors.TryGetValue(status, out var color))
                 {
                     return null;

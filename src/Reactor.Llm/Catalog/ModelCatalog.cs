@@ -38,6 +38,14 @@ public sealed record ModelInfo
     [JsonPropertyName("output_cost_per_million")]
     public double? OutputCostPerMillion { get; init; }
 
+    /// <summary>USD per million input tokens read from the prompt cache (null: priced at the input rate).</summary>
+    [JsonPropertyName("cached_input_cost_per_million")]
+    public double? CachedInputCostPerMillion { get; init; }
+
+    /// <summary>USD per million input tokens written to the prompt cache (null: priced at the input rate).</summary>
+    [JsonPropertyName("cache_write_cost_per_million")]
+    public double? CacheWriteCostPerMillion { get; init; }
+
     [JsonPropertyName("knowledge_cutoff")]
     public string? KnowledgeCutoff { get; init; }
 

@@ -30,6 +30,22 @@ function RouteRow({ route, nodeId }: { route: Route; nodeId: string }) {
   );
 }
 
+/** The port of a stage's visit limit: where the run goes once `max_visits` is used up. Drag it to a stage to set `on_max_visits`. */
+function RerouteRow({ reroute, nodeId }: { reroute: NonNullable<StageData["reroute"]>; nodeId: string }) {
+  const text = `after ${reroute.max} visit${reroute.max === 1 ? "" : "s"}`;
+  return (
+    <div
+      className={cx("rs-route rs-route--visits", !reroute.target && "is-dead")}
+      title={reroute.target ? `${text}, the run goes to “${reroute.targetLabel ?? reroute.target}” (on_max_visits)` : `${text}, the run fails — drag to the stage that should take over (on_max_visits)`}
+    >
+      <span className="rs-route__glyph">⟲</span>
+      <span className="rs-route__text">{text}</span>
+      {!reroute.target ? <span className="rs-route__count">fail</span> : null}
+      <Handle type="source" position={Position.Right} id="out:max_visits" className="rs-port rs-port--visits" data-node={nodeId} />
+    </div>
+  );
+}
+
 function ModelChip({ data }: { data: StageData }) {
   if (!data.model && !data.backend) {
     return data.kind === "agent" ? <span className="rs-chip rs-chip--model is-unset" title="No model set: the backend's default model is used">default model</span> : null;
@@ -120,8 +136,8 @@ function StageNodeImpl({ data, selected }: NodeProps<Node<StageData>>) {
   const routes = showGhosts ? [...data.routes, ...data.ghosts] : data.routes.length > 0 || data.kind === "exit" ? data.routes : data.ghosts.slice(0, 1).map((g) => ({ ...g, ghost: false }));
   const acceptsArtifact = !!draggingArtifact && meta.pins && !data.inputs.some((p) => p.name === draggingArtifact);
   const handleSignature = useMemo(
-    () => [routes.map((r) => r.key).join("|"), data.inputs.map((p) => p.name).join("|"), data.outputs.map((p) => p.name).join("|"), acceptsArtifact, !!overlay?.question].join("#"),
-    [routes, data.inputs, data.outputs, acceptsArtifact, overlay?.question],
+    () => [routes.map((r) => r.key).join("|"), data.inputs.map((p) => p.name).join("|"), data.outputs.map((p) => p.name).join("|"), acceptsArtifact, !!overlay?.question, !!data.reroute].join("#"),
+    [routes, data.inputs, data.outputs, acceptsArtifact, overlay?.question, data.reroute],
   );
   useEffect(() => updateNodeInternals(data.id), [handleSignature, data.id, updateNodeInternals]);
 
@@ -202,6 +218,14 @@ function StageNodeImpl({ data, selected }: NodeProps<Node<StageData>>) {
               ⏱{data.timeout}
             </span>
           ) : null}
+          {data.maxVisits ? (
+            <span
+              className="rs-chip rs-chip--bound"
+              title={`Loop bound: runs at most ${data.maxVisits} time${data.maxVisits === 1 ? "" : "s"} per run; then ${data.reroute?.targetLabel ? `the run goes to “${data.reroute.targetLabel}”` : "the run fails"} (max_visits)`}
+            >
+              ⟲≤{data.maxVisits}
+            </span>
+          ) : null}
           {data.details.map((d) => (
             <span key={d.label} className="rs-chip" title={`${d.label}: ${d.value}`}>
               <span className="rs-chip__key">{d.label}</span>
@@ -246,11 +270,12 @@ function StageNodeImpl({ data, selected }: NodeProps<Node<StageData>>) {
         </div>
       ) : null}
 
-      {routes.length > 0 ? (
+      {routes.length > 0 || data.reroute ? (
         <div className="rs-node__routes">
           {routes.map((route) => (
             <RouteRow key={route.key + (route.ghost ? "~" : "")} route={route} nodeId={data.id} />
           ))}
+          {data.reroute ? <RerouteRow reroute={data.reroute} nodeId={data.id} /> : null}
         </div>
       ) : null}
 

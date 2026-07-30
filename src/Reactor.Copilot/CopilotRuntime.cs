@@ -15,7 +15,16 @@ internal abstract record CopilotActivity
 
     internal sealed record ToolCompleted(string ToolCallId, bool Success, string? ErrorMessage) : CopilotActivity;
 
-    internal sealed record Usage(string? Model, long InputTokens, long OutputTokens, long CacheReadTokens, long ReasoningTokens) : CopilotActivity;
+    /// <summary>
+    /// One model call's usage. <see cref="InputTokens"/> includes cached tokens (<see cref="CacheReadTokens"/> and
+    /// <see cref="CacheWriteTokens"/>); <see cref="NanoAiu"/> is the call's cost in nano AI units when the runtime reports it.
+    /// </summary>
+    internal sealed record Usage(string? Model, long InputTokens, long OutputTokens, long CacheReadTokens, long ReasoningTokens) : CopilotActivity
+    {
+        public long CacheWriteTokens { get; init; }
+
+        public double? NanoAiu { get; init; }
+    }
 
     internal sealed record Error(string Message, string? ErrorType, int? StatusCode) : CopilotActivity;
 
@@ -41,6 +50,9 @@ internal sealed record CopilotConversationOptions
     public required Func<ToolHookSettings?> Hooks { get; init; }
 
     public IReadOnlyList<string>? ExcludedTools { get; init; }
+
+    /// <summary>Text appended to the runtime's system message (the stage's standing instructions), or null.</summary>
+    public string? SystemMessage { get; init; }
 }
 
 /// <summary>A live Copilot conversation.</summary>

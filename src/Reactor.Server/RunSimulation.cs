@@ -14,7 +14,8 @@ namespace Reactor.Server;
 /// simulated stages (see <see cref="SimulationSample"/>): in <c>stochastic</c> mode outcomes and human gates are drawn from
 /// the scenario and each stage takes <c>step_delay_ms</c> (default <see cref="DefaultStochasticStepDelayMs"/>) so clients
 /// can animate it; in <c>interactive</c> mode every simulated stage asks for its outcome through the run's questions, and
-/// human gates are asked for real.
+/// human gates are asked for real. Explicit <c>duration_ms</c> values are waited out; the scenario's
+/// <c>duration_priors</c> (forecasting guesses) are ignored.
 /// </summary>
 public sealed class RunSimulation
 {
@@ -104,6 +105,12 @@ public sealed class RunSimulation
         if (found.Count > 0)
         {
             return false;
+        }
+
+        // Duration priors are forecasting guesses (minutes per stage); managed runs animate, so they are not waited out.
+        if (scenario.DurationPriors.Count > 0)
+        {
+            scenario = scenario with { DurationPriors = new Dictionary<string, int>(StringComparer.Ordinal) };
         }
 
         simulation = new RunSimulation(mode, scenario, seed ?? scenario.Seed ?? SimulationSample.NewSeed());

@@ -99,9 +99,14 @@ public static class ReactorServer
             manager.Get(id) is null ? NotFound(id)
             : manager.Cancel(id) ? Results.Accepted($"/pipelines/{id}", new { id, status = "cancelling" })
             : Results.Conflict(new { error = "The run has already finished." }));
-        app.MapPost("/pipelines/{id}/resume", (string id, PipelineRunManager manager) =>
+        app.MapPost("/pipelines/{id}/resume", (string id, ResumeRequest? body, PipelineRunManager manager) =>
         {
-            var result = manager.Resume(id);
+            if (body?.MaxCost is { } budget && (budget < 0 || !double.IsFinite(budget)))
+            {
+                return Results.BadRequest(new { error = "'max_cost' must be zero or a positive amount of US dollars." });
+            }
+
+            var result = manager.Resume(id, body?.MaxCost);
             return result.Succeeded ? Results.Accepted($"/pipelines/{id}", Detail(result.Run!)) : manager.Get(id) is null ? NotFound(id) : Results.Conflict(new { error = result.Error });
         });
         app.MapGet("/pipelines/{id}/graph", RenderGraphAsync);
@@ -302,7 +307,7 @@ public static class ReactorServer
             return NotFound(id);
         }
 
-        var dot = GraphRenderer.ToDisplayDot(run.Graph, run.NodeStatuses, run.CurrentNode);
+        var dot = GraphRenderer.ToDisplayDot(run.Graph, run.NodeStatuses, run.ActiveNodes);
         format = string.IsNullOrWhiteSpace(format) ? "svg" : format.ToLowerInvariant();
         if (format == "dot")
         {
@@ -474,11 +479,24 @@ public static class ReactorServer
                 return (null, "'simulation' must be an object such as {\"mode\": \"stochastic\", \"scenario\": {...}}.");
         }
 
+        double? maxCost = null;
+        if (json["max_cost"] is { } budgetNode)
+        {
+            if (budgetNode is not JsonValue budgetValue || budgetValue.GetValueKind() != JsonValueKind.Number ||
+                budgetValue.GetValue<double>() is var budget && (budget < 0 || !double.IsFinite(budget)))
+            {
+                return (null, "'max_cost' must be zero or a positive amount of US dollars.");
+            }
+
+            maxCost = budgetValue.GetValue<double>();
+        }
+
         return (new StartRequest
         {
             Dot = dot,
             Context = context,
             WorkingDirectory = workingDirectory,
+            MaxCostUsd = maxCost,
             Simulation = simulation,
             Studio = json["studio"] as JsonObject,
         }, null);
@@ -500,6 +518,7 @@ public static class ReactorServer
         started_at = run.StartedAt,
         finished_at = run.FinishedAt,
         pending_questions = run.Interviewer.Pending.Count,
+        working_directory = run.WorkingDirectory,
         simulated = run.Simulation is null ? (bool?)null : true,
         simulation_mode = run.Simulation?.ModeName,
     };
@@ -535,8 +554,11 @@ public static class ReactorServer
                     failure_reason = result.FinalOutcome.FailureReason,
                     loop_restarts = result.LoopRestarts,
                     completed_nodes = result.CompletedNodes,
+                    usage = UsageLedger.ToJson(result.Usage),
+                    budget_exceeded = result.BudgetExceeded,
                 }
                 : null,
+            max_cost = run.MaxCostUsd,
             studio = run.Studio,
             simulated = run.Simulation is null ? (bool?)null : true,
             simulation_mode = run.Simulation?.ModeName,
@@ -594,6 +616,14 @@ public static class ReactorServer
 }
 
 /// <summary>Body of answer endpoints.</summary>
+/// <summary>Optional body of <c>POST /pipelines/{id}/resume</c>.</summary>
+public sealed record ResumeRequest
+{
+    /// <summary>A new cost budget for the run in US dollars (<c>"max_cost"</c>), e.g. to continue past a budget stop.</summary>
+    [System.Text.Json.Serialization.JsonPropertyName("max_cost")]
+    public double? MaxCost { get; init; }
+}
+
 public sealed record AnswerRequest
 {
     /// <summary>Option key/label, yes/no, or <c>skip</c>.</summary>

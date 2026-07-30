@@ -161,8 +161,12 @@ internal sealed class FakeConversation(FakeCopilotRuntime runtime, CopilotConver
     public Task AbortAsync()
     {
         Aborts++;
+        OnAbort?.Invoke(this);
         return Task.CompletedTask;
     }
+
+    /// <summary>Runs when the turn is aborted (e.g. to emit the runtime's closing usage checkpoint).</summary>
+    public Action<FakeConversation>? OnAbort { get; set; }
 
     public Task SetModelAsync(string model, string? reasoningEffort, CancellationToken cancellationToken)
     {
@@ -601,4 +605,228 @@ public sealed class CopilotSdkBackendTests
     }
 
     private sealed record ToolHookSnapshot(string? Pre, string? Post, string? NodeId);
+
+    private static JsonNode BackendJson(TempDir dir, string node) => JsonNode.Parse(File.ReadAllText(dir.Combine("run", node, "backend.json")))!;
+
+    [Fact]
+    public async Task Standing_instructions_go_to_the_system_message_and_changed_ones_to_a_continued_sessions_prompt()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime();
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+
+        var result = await Runner(backend).RunAsync("""
+            digraph G {
+              graph [default_fidelity="full", instructions="Use PowerShell syntax."]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan it"]
+              design [prompt="Design it"]
+              build [prompt="Build it", instructions="Write tests first."]
+              start -> plan -> design -> build -> exit
+            }
+            """, Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var conversation = Assert.Single(runtime.Conversations);
+        var system = conversation.Options.SystemMessage!;
+        Assert.StartsWith("## House rules\n- Write large files incrementally", system, StringComparison.Ordinal);
+        Assert.EndsWith("## Pipeline instructions\nUse PowerShell syntax.", system, StringComparison.Ordinal);
+        Assert.Equal(system + "\n", File.ReadAllText(dir.Combine("run", "plan", "instructions.md")));
+
+        // Same instructions on the continued session: nothing added. Changed ones open the prompt.
+        Assert.DoesNotContain("# Instructions", conversation.Prompts[0], StringComparison.Ordinal);
+        Assert.DoesNotContain("# Instructions", conversation.Prompts[1], StringComparison.Ordinal);
+        Assert.StartsWith("# Instructions", conversation.Prompts[2], StringComparison.Ordinal);
+        Assert.Contains("## Stage instructions\nWrite tests first.", conversation.Prompts[2], StringComparison.Ordinal);
+        Assert.Contains("Build it", conversation.Prompts[2], StringComparison.Ordinal);
+        Assert.True(((Handlers.ICodergenBackend)backend).SupportsSteering);
+    }
+
+    [Fact]
+    public async Task House_rules_can_be_turned_off()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime();
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+
+        await Runner(backend).RunAsync(OneStage.Replace("digraph G {", "digraph G {\n  graph [house_rules=false]", StringComparison.Ordinal), Options(dir), Ct);
+
+        Assert.Null(runtime.Created[0].SystemMessage);
+        Assert.False(File.Exists(dir.Combine("run", "implement", "instructions.md")));
+    }
+
+    [Fact]
+    public async Task Output_limit_truncations_are_warned_about_and_counted()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            OnTurn = (c, _, _) =>
+            {
+                c.Emit(new CopilotActivity.ToolStarted("t1", "create", JsonNode.Parse("{}")));
+                c.Emit(new CopilotActivity.ToolCompleted("t1", false, "Tool call arguments truncated by the model output token limit"));
+                return Task.FromResult<string?>("Wrote it in parts.");
+            },
+        };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+        var events = new List<PipelineEvent>();
+
+        await Runner(backend).RunAsync(OneStage, Options(dir, events), Ct);
+
+        Assert.Equal(1, BackendJson(dir, "implement")["output_limit_truncations"]!.GetValue<int>());
+        var warnings = events.OfType<StageLog>().Where(e => e.NodeId == "implement" && e.Level == "warn").Select(e => e.Message).ToList();
+        Assert.Contains(warnings, w => w.StartsWith("output-token limit: the create call", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Cost_is_normalized_from_ai_units_and_estimated_from_tokens_without_them()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            OnTurn = (c, prompt, _) =>
+            {
+                c.Emit(new CopilotActivity.Usage("claude-sonnet-5", 1_000_000, 100_000, 0, 0));
+                if (prompt.Contains("with units", StringComparison.Ordinal))
+                {
+                    c.Emit(new CopilotActivity.UsageCheckpoint(250_000_000_000));
+                }
+
+                return Task.FromResult<string?>("ok");
+            },
+        };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions { UsageSettleTimeout = TimeSpan.Zero }, runtime);
+
+        await Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="Stage with units"]
+              b [prompt="Stage without"]
+              start -> a -> b -> exit
+            }
+            """, Options(dir), Ct);
+
+        var a = BackendJson(dir, "a");
+        Assert.Equal(250, a["ai_units"]!.GetValue<double>());
+        Assert.Equal(2.5, a["cost_usd"]!.GetValue<double>());
+        Assert.Equal("ai_units", a["cost_basis"]!.GetValue<string>());
+        Assert.False(a["cost_estimated"]!.GetValue<bool>());
+
+        // claude-sonnet-5: $2 per 1M input and $10 per 1M output tokens.
+        var b = BackendJson(dir, "b");
+        Assert.Null(b["ai_units"]);
+        Assert.Equal(3.0, b["cost_usd"]!.GetValue<double>(), 9);
+        Assert.Equal("tokens", b["cost_basis"]!.GetValue<string>());
+        Assert.True(b["cost_estimated"]!.GetValue<bool>());
+    }
+
+    private const string ThreadWithTimeout = """
+        digraph G {
+          graph [default_fidelity="full"]
+          start [shape=Mdiamond]
+          exit [shape=Msquare]
+          slow [prompt="Task A", timeout="1s"]
+          next [prompt="Task B"]
+          start -> slow
+          slow -> next [condition="outcome=fail"]
+          slow -> exit [condition="outcome=success"]
+          next -> exit
+        }
+        """;
+
+    private static FakeCopilotRuntime TimedOutThenContinued(bool lateCheckpoint, bool perCallUnits)
+    {
+        return new FakeCopilotRuntime
+        {
+            OnCreated = c => c.OnAbort = lateCheckpoint
+                ? conversation => _ = Task.Delay(200).ContinueWith(_ => conversation.Emit(new CopilotActivity.UsageCheckpoint(5e9)), TaskScheduler.Default)
+                : null,
+            OnTurn = async (c, prompt, ct) =>
+            {
+                if (prompt.Contains("Task A", StringComparison.Ordinal))
+                {
+                    c.Emit(new CopilotActivity.AssistantMessage("Half the modules are done; continuing with the parser.", "gpt-5"));
+                    c.Emit(new CopilotActivity.Usage("gpt-5", 100, 10, 0, 0) { NanoAiu = perCallUnits ? 3e9 : null });
+                    c.Emit(new CopilotActivity.UsageCheckpoint(3e9));
+                    c.Emit(new CopilotActivity.Usage("gpt-5", 100, 10, 0, 0) { NanoAiu = perCallUnits ? 2e9 : null });
+                    await Task.Delay(Timeout.Infinite, ct);
+                }
+
+                // The session's cumulative total now includes the timed-out stage's 5 units.
+                c.Emit(new CopilotActivity.Usage("gpt-5", 100, 10, 0, 0) { NanoAiu = perCallUnits ? 1e9 : null });
+                c.Emit(new CopilotActivity.UsageCheckpoint(6e9));
+                return "done";
+            },
+        };
+    }
+
+    [Fact]
+    public async Task A_timed_out_stage_keeps_its_ai_units_and_the_next_stage_on_the_session_reports_only_its_own()
+    {
+        using var dir = new TempDir();
+        var runtime = TimedOutThenContinued(lateCheckpoint: true, perCallUnits: false);
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions(), runtime);
+
+        var result = await Runner(backend).RunAsync(ThreadWithTimeout, Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Fail, result.NodeOutcomes["slow"].Status);
+        var conversation = Assert.Single(runtime.Conversations);
+        Assert.Equal(1, conversation.Aborts);
+
+        // The closing checkpoint arrived 200 ms after the abort; the stage waited for it.
+        var slow = BackendJson(dir, "slow");
+        Assert.Equal(5, slow["ai_units"]!.GetValue<double>());
+        Assert.Equal(2, slow["model_calls"]!.GetValue<int>());
+        Assert.Equal(200, slow["input_tokens"]!.GetValue<long>());
+        Assert.Equal(0.05, slow["cost_usd"]!.GetValue<double>());
+        Assert.NotNull(slow["outcome"]);
+        Assert.Equal("Half the modules are done; continuing with the parser.\n", File.ReadAllText(dir.Combine("run", "slow", "response.partial.md")));
+
+        var next = BackendJson(dir, "next");
+        Assert.True(next["resumed"]!.GetValue<bool>());
+        Assert.Equal(1, next["ai_units"]!.GetValue<double>());
+        Assert.Equal(1, next["model_calls"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Without_a_closing_checkpoint_per_call_units_settle_the_aborted_stage()
+    {
+        using var dir = new TempDir();
+        var runtime = TimedOutThenContinued(lateCheckpoint: false, perCallUnits: true);
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions { UsageSettleTimeout = TimeSpan.FromMilliseconds(100) }, runtime);
+
+        await Runner(backend).RunAsync(ThreadWithTimeout, Options(dir), Ct);
+
+        // 3 units at the last checkpoint plus 2 from the call after it; the next checkpoint (6) then charges only 1.
+        Assert.Equal(5, BackendJson(dir, "slow")["ai_units"]!.GetValue<double>());
+        Assert.Equal(1, BackendJson(dir, "next")["ai_units"]!.GetValue<double>());
+    }
+
+    [Fact]
+    public async Task Each_attempt_opens_the_transcript_with_a_marker_and_records_carry_timestamps()
+    {
+        using var dir = new TempDir();
+        var runtime = new FakeCopilotRuntime
+        {
+            OnTurn = (c, _, _) =>
+            {
+                c.Emit(new CopilotActivity.Error("Service unavailable", "server", 503));
+                return Task.FromResult<string?>(null);
+            },
+        };
+        await using var backend = new CopilotSdkBackend(new CopilotSdkBackendOptions { UsageSettleTimeout = TimeSpan.Zero }, runtime);
+
+        await Runner(backend).RunAsync(OneStage.Replace("reasoning_effort=\"minimal\"", "reasoning_effort=\"minimal\", max_retries=1", StringComparison.Ordinal), Options(dir), Ct);
+
+        var records = Directory.GetFiles(dir.Combine("run", "implement"), "copilot-events.jsonl", SearchOption.AllDirectories)
+            .SelectMany(File.ReadAllLines)
+            .Select(l => JsonNode.Parse(l)!)
+            .ToList();
+        Assert.Equal([1, 2], records.Where(r => r["type"]!.GetValue<string>() == "reactor.attempt").Select(r => r["attempt"]!.GetValue<int>()).Order());
+        Assert.All(records, r => Assert.True(DateTimeOffset.TryParse(r["ts"]!.GetValue<string>(), out _)));
+        Assert.Equal("error", BackendJson(dir, "implement")["outcome"]!.GetValue<string>());
+        Assert.Equal(2, BackendJson(dir, "implement")["attempt"]!.GetValue<int>());
+    }
 }

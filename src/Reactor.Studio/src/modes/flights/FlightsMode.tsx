@@ -5,12 +5,13 @@ import { Canvas } from "../../canvas/Canvas";
 import { formatDuration } from "../../canvas/Elapsed";
 import { Empty, Segmented, Spinner, cx } from "../../components/controls";
 import { Glyph } from "../../components/Glyph";
+import { formatUsd } from "../../model/cost";
 import type { StudioDoc } from "../../model/types";
 import { toast, useStudio } from "../../state/store";
 import { loadTelemetry, telemetryOverlay, telemetrySupported, useTelemetry } from "../../state/telemetry";
 import { RecordPanel } from "./RecordPanel";
 import { digest, overlayAt } from "./replay";
-import { RunPanel, StatusPill } from "./RunPanel";
+import { RunPanel, StatusPill, budgetOf } from "./RunPanel";
 import { loadDetail, refreshRuns, scrubTo, selectRun, selectStage, setFilter, setLens, setPlaying, setSpeed, startClock, stopClock, useFlights, type Flight } from "./store";
 import { Timeline } from "./Timeline";
 import { costText, flightView } from "./view";
@@ -39,9 +40,10 @@ const LED: Record<string, string> = { running: "running", queued: "waiting", int
 
 function FlightRow({ flight, selected }: { flight: Flight; selected: boolean }) {
   const cost = costText(flight.cost);
+  const dirty = (flight.status === "success" || flight.status === "partial_success") && flight.failedStages.length > 0;
   return (
     <button type="button" className={cx("rs-flight", selected && "is-selected")} onClick={() => selectRun(flight.key)}>
-      <span className={cx("rs-led", `is-${LED[flight.status] ?? flight.status}`)} title={flight.status} />
+      <span className={cx("rs-led", `is-${flight.budget ? "stopped" : (LED[flight.status] ?? flight.status)}`)} title={flight.budget ? "stopped at its budget" : flight.status} />
       <span className="rs-flight__body">
         <span className="rs-flight__name">
           {flight.name}
@@ -49,6 +51,16 @@ function FlightRow({ flight, selected }: { flight: Flight; selected: boolean }) 
           {flight.forkedFrom ? (
             <span className="rs-flight__fork" title={`Re-flown from ${flight.forkedFrom.id} after ${flight.forkedFrom.checkpoint}`}>
               <Glyph name="fork" size={10} />
+            </span>
+          ) : null}
+          {flight.budget ? (
+            <span className="rs-flight__tag is-budget" title={`Stopped at its budget: ${formatUsd(flight.budget.spent_usd)} of ${formatUsd(flight.budget.limit_usd)}${flight.budget.next_node ? `, before ${flight.budget.next_node}` : ""}. Resume it with a higher budget.`}>
+              budget
+            </span>
+          ) : null}
+          {dirty ? (
+            <span className="rs-flight__tag is-dirty" title={`Landed with failed stages behind it: ${flight.failedStages.join(", ")} (a failure flowed on along an unconditional edge)`}>
+              failed stage{flight.failedStages.length === 1 ? "" : "s"}
             </span>
           ) : null}
         </span>
@@ -218,7 +230,7 @@ export function FlightsMode() {
             </>
           ) : view ? (
             <>
-              <StatusPill status={view.status} />
+              <StatusPill status={view.status} budget={!!budgetOf(view, replay)} />
               <span className="rs-flights__title">{view.name}</span>
               {view.currentNode && view.active ? <span className="rs-flights__current">▸ {view.currentNode}</span> : null}
             </>

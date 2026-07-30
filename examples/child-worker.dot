@@ -1,6 +1,6 @@
 // The child pipeline started by supervisor.dot (also runnable on its own).
 digraph child_worker {
-    graph [goal="Add a --version flag to the project's command-line entry point"]
+    graph [goal="Add a --version flag to the project's command-line entry point", default_on_fail="stop"]
 
     start [shape=Mdiamond]
     exit  [shape=Msquare]

@@ -3,6 +3,7 @@ import { api } from "../api/client";
 import type { Telemetry, TelemetryNode } from "../api/types";
 import { edgeKey, type CanvasOverlay, type EdgeOverlay, type NodeOverlay } from "../canvas/build";
 import { formatDuration } from "../canvas/Elapsed";
+import { formatUsd } from "../model/cost";
 import type { StudioDoc } from "../model/types";
 import { useStudio } from "./store";
 
@@ -93,9 +94,11 @@ export function telemetryOverlay(doc: StudioDoc, t: Telemetry, options: { dimUnv
     if (stats.runs < t.runs) readouts.push({ label: "reached", value: pct(stats.runs / t.runs) });
     if (done > 0) readouts.push({ label: "ok", value: pct(1 - rate), tone: rate >= 0.34 ? "fail" : rate > 0 ? "warn" : "ok" });
     if (stats.duration_ms) readouts.push({ label: "p50", value: formatDuration(stats.duration_ms.p50) });
-    if (stats.cost?.ai_units !== undefined) readouts.push({ label: "AIU", value: stats.cost.ai_units.toFixed(stats.cost.ai_units < 10 ? 1 : 0) });
-    else if (stats.cost?.cost_usd !== undefined) readouts.push({ label: "cost", value: `$${stats.cost.cost_usd.toFixed(2)}` });
+    if (stats.cost?.cost_usd !== undefined) readouts.push({ label: "cost", value: formatUsd(stats.cost.cost_usd) });
+    else if (stats.cost?.ai_units !== undefined) readouts.push({ label: "AIU", value: stats.cost.ai_units.toFixed(stats.cost.ai_units < 10 ? 1 : 0) });
     if (stats.retries > 0) readouts.push({ label: "retries", value: String(stats.retries), tone: "warn" });
+    if (stats.failures_continued) readouts.push({ label: "flowed on", value: `${stats.failures_continued}×`, tone: "warn" });
+    for (const [name, m] of Object.entries(stats.metrics ?? {}).slice(0, 2)) readouts.push({ label: name, value: `⌀ ${Number.isInteger(m.mean) ? m.mean : m.mean.toFixed(2)}` });
     nodes[node.id] = {
       state: rate >= 0.34 ? "fail" : rate > 0 ? "partial_success" : "visited",
       badge: stats.mean_visits >= 1.05 ? `×${stats.mean_visits.toFixed(1)}` : undefined,

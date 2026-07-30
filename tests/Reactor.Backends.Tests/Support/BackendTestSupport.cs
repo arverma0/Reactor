@@ -83,11 +83,26 @@ internal sealed class FakeCli
     /// <summary>Path to the script to configure as the backend's executable.</summary>
     public string Executable { get; }
 
-    public static FakeCli Create(string directory, string stdout, int exitCode = 0, string? stderr = null, int sleepSeconds = 0)
+    /// <param name="directory">Where the script and its recordings live.</param>
+    /// <param name="stdout">Canned JSON lines to print.</param>
+    /// <param name="exitCode">Exit code.</param>
+    /// <param name="stderr">Optional stderr text.</param>
+    /// <param name="sleepSeconds">Seconds to sleep (before printing, unless <paramref name="printBeforeSleep"/>).</param>
+    /// <param name="printBeforeSleep">Print the output first, then sleep (a run that is killed mid-way).</param>
+    /// <param name="sessionStateRoot">
+    /// When set, the script copies <paramref name="sessionEvents"/> to <c>&lt;root&gt;/&lt;--session-id value&gt;/events.jsonl</c>,
+    /// like the Copilot CLI's on-disk session state.
+    /// </param>
+    /// <param name="sessionEvents">The session-state events to write.</param>
+    public static FakeCli Create(string directory, string stdout, int exitCode = 0, string? stderr = null, int sleepSeconds = 0, bool printBeforeSleep = false, string? sessionStateRoot = null, string? sessionEvents = null)
     {
         System.IO.Directory.CreateDirectory(directory);
-        File.WriteAllText(Path.Combine(directory, "output.jsonl"), stdout.ReplaceLineEndings(OperatingSystem.IsWindows() ? "\r\n" : "\n"), new UTF8Encoding(false));
+
+        // A real CLI ends each JSON line with a newline; without one, a run killed mid-way would hold back its last line.
+        var lines = stdout.Length == 0 || stdout.EndsWith('\n') ? stdout : stdout + "\n";
+        File.WriteAllText(Path.Combine(directory, "output.jsonl"), lines.ReplaceLineEndings(OperatingSystem.IsWindows() ? "\r\n" : "\n"), new UTF8Encoding(false));
         File.WriteAllText(Path.Combine(directory, "stderr.txt"), stderr ?? "", new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(directory, "session-events.jsonl"), sessionEvents ?? "", new UTF8Encoding(false));
         string script;
         string executable;
         if (OperatingSystem.IsWindows())
@@ -99,15 +114,39 @@ internal sealed class FakeCli
             sb.AppendLine("echo %*>> \"%~dp0args.txt\"");
             sb.AppendLine("more > \"%~dp0stdin.txt\"");
             sb.AppendLine("echo %CD%> \"%~dp0cwd.txt\"");
+            if (sessionStateRoot is not null)
+            {
+                // `shift` also shifts %0, so the script's directory is captured first.
+                sb.AppendLine("set \"HERE=%~dp0\"");
+                sb.AppendLine(":args");
+                sb.AppendLine("if \"%~1\"==\"\" goto argsdone");
+                sb.AppendLine("if \"%~1\"==\"--session-id\" set \"SID=%~2\"");
+                sb.AppendLine("shift");
+                sb.AppendLine("goto args");
+                sb.AppendLine(":argsdone");
+                sb.AppendLine($"mkdir \"{sessionStateRoot}\\%SID%\" 2> nul");
+                sb.AppendLine($"copy /y \"%HERE%session-events.jsonl\" \"{sessionStateRoot}\\%SID%\\events.jsonl\" > nul");
+            }
+
+            var here = sessionStateRoot is null ? "%~dp0" : "%HERE%";
+            if (printBeforeSleep)
+            {
+                sb.AppendLine($"type \"{here}output.jsonl\"");
+            }
+
             if (sleepSeconds > 0)
             {
                 sb.AppendLine($"ping -n {sleepSeconds + 1} 127.0.0.1 > nul");
             }
 
-            sb.AppendLine("type \"%~dp0output.jsonl\"");
+            if (!printBeforeSleep)
+            {
+                sb.AppendLine($"type \"{here}output.jsonl\"");
+            }
+
             if (!string.IsNullOrEmpty(stderr))
             {
-                sb.AppendLine("type \"%~dp0stderr.txt\" 1>&2");
+                sb.AppendLine($"type \"{here}stderr.txt\" 1>&2");
             }
 
             sb.AppendLine($"exit /b {exitCode}");
@@ -122,12 +161,29 @@ internal sealed class FakeCli
             sb.Append("echo \"$@\" >> \"$here/args.txt\"\n");
             sb.Append("cat > \"$here/stdin.txt\"\n");
             sb.Append("pwd > \"$here/cwd.txt\"\n");
+            if (sessionStateRoot is not null)
+            {
+                sb.Append("sid=\"\"\n");
+                sb.Append("while [ $# -gt 0 ]; do if [ \"$1\" = \"--session-id\" ]; then sid=\"$2\"; fi; shift; done\n");
+                sb.Append($"mkdir -p \"{sessionStateRoot}/$sid\"\n");
+                sb.Append($"cp \"$here/session-events.jsonl\" \"{sessionStateRoot}/$sid/events.jsonl\"\n");
+            }
+
+            if (printBeforeSleep)
+            {
+                sb.Append("cat \"$here/output.jsonl\"\n");
+            }
+
             if (sleepSeconds > 0)
             {
                 sb.Append($"sleep {sleepSeconds}\n");
             }
 
-            sb.Append("cat \"$here/output.jsonl\"\n");
+            if (!printBeforeSleep)
+            {
+                sb.Append("cat \"$here/output.jsonl\"\n");
+            }
+
             if (!string.IsNullOrEmpty(stderr))
             {
                 sb.Append("cat \"$here/stderr.txt\" 1>&2\n");

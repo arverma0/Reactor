@@ -1,12 +1,14 @@
 // A small "software factory": spec -> plan -> implement -> build/test loop -> parallel reviews ->
 // human sign-off -> docs. Demonstrates goal gates, retry targets, tool nodes, conditional routing,
-// parallel fan-out/fan-in, a human gate, and thread-shared context (fidelity=full).
+// parallel fan-out/fan-in, a human gate, and thread-shared context (fidelity=full). default_on_fail="stop" ends
+// the run when a stage fails without a failure route, and max_visits hands a fix loop that does not converge to the human.
 digraph factory {
     graph [
         goal="Build a Python library `slugify_plus` with a slugify(text) function (unicode-aware, max_length option) and tests",
         default_fidelity="compact",
         default_max_retries=1,
-        retry_target="implement"
+        retry_target="implement",
+        default_on_fail="stop"
     ]
 
     start [shape=Mdiamond]
@@ -16,7 +18,8 @@ digraph factory {
     plan      [prompt="Read SPEC.md and write PLAN.md with small, ordered implementation steps.", fidelity="full", thread_id="build"]
     implement [prompt="Implement PLAN.md. Write the library and tests.", fidelity="full", thread_id="build", goal_gate=true]
     test      [shape=parallelogram, label="Run tests", tool_command="python -m pytest -q", timeout="10m"]
-    fix       [prompt="Tests failed (see tool.output in context). Fix the code, not the tests, unless a test is wrong.", fidelity="full", thread_id="build"]
+    fix       [prompt="Tests failed (see tool.output in context). Fix the code, not the tests, unless a test is wrong.", fidelity="full", thread_id="build",
+               max_visits=3, on_max_visits="signoff"]
     route     [shape=diamond, label="Tests passing?"]
 
     reviews   [shape=component, label="Reviews", join_policy="wait_all"]

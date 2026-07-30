@@ -30,6 +30,20 @@ public sealed class PipelineContext
     /// <summary>Per-run services (transient; not part of snapshots, shared with clones). Null outside an engine run.</summary>
     public RunServices? Run { get; set; }
 
+    /// <summary>
+    /// Context key holding the working directory of a parallel branch that runs in its own workspace
+    /// (<c>branch_workdir="worktree"</c> or <c>"copy"</c>, a Reactor extension). Set on the branch's context clone only.
+    /// </summary>
+    public const string WorkingDirectoryKey = "internal.working_directory";
+
+    /// <summary>
+    /// The directory the current stage works in: the branch workspace (<see cref="WorkingDirectoryKey"/>) inside an isolated
+    /// parallel branch, else the run's working directory, else the current directory. Tools, agents, artifact files, and
+    /// child pipelines all resolve against it.
+    /// </summary>
+    public string WorkingDirectory =>
+        GetString(WorkingDirectoryKey) is { Length: > 0 } branch ? branch : Run?.WorkingDirectory ?? Directory.GetCurrentDirectory();
+
     public void Set(string key, object? value)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);

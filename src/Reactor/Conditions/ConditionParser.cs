@@ -14,15 +14,34 @@ public enum ConditionOperator
 
     /// <summary>Bare <c>key</c>: true when the resolved value is truthy.</summary>
     Truthy,
+
+    /// <summary>Reactor extension: <c>key&lt;number</c> (numeric; false when the value is not a number).</summary>
+    LessThan,
+
+    /// <summary>Reactor extension: <c>key&lt;=number</c>.</summary>
+    LessOrEqual,
+
+    /// <summary>Reactor extension: <c>key&gt;number</c>.</summary>
+    GreaterThan,
+
+    /// <summary>Reactor extension: <c>key&gt;=number</c>.</summary>
+    GreaterOrEqual,
 }
 
 /// <summary>One clause of a condition: <c>Key Operator Literal</c> (or a bare key).</summary>
 public sealed record ConditionClause(string Key, ConditionOperator Operator, string Value)
 {
+    /// <summary>True for the numeric comparison operators (<c>&lt;</c>, <c>&lt;=</c>, <c>&gt;</c>, <c>&gt;=</c>).</summary>
+    public bool IsNumeric => Operator is ConditionOperator.LessThan or ConditionOperator.LessOrEqual or ConditionOperator.GreaterThan or ConditionOperator.GreaterOrEqual;
+
     public override string ToString() => Operator switch
     {
         ConditionOperator.Equals => $"{Key}={Value}",
         ConditionOperator.NotEquals => $"{Key}!={Value}",
+        ConditionOperator.LessThan => $"{Key}<{Value}",
+        ConditionOperator.LessOrEqual => $"{Key}<={Value}",
+        ConditionOperator.GreaterThan => $"{Key}>{Value}",
+        ConditionOperator.GreaterOrEqual => $"{Key}>={Value}",
         _ => Key,
     };
 }
@@ -41,6 +60,8 @@ public sealed class ConditionSyntaxException(string message) : Exception(message
 /// <summary>
 /// Parser for the edge condition language (spec section 10):
 /// <c>ConditionExpr ::= Clause ('&amp;&amp;' Clause)*</c>, <c>Clause ::= Key ('=' | '!=') Literal</c> or a bare key.
+/// Reactor extension: numeric comparisons <c>Key ('&lt;' | '&lt;=' | '&gt;' | '&gt;=') Number</c>, e.g.
+/// <c>visits.polish&lt;3</c> or <c>metrics.qa_failed&gt;0</c>.
 /// </summary>
 public static partial class ConditionParser
 {
@@ -93,26 +114,9 @@ public static partial class ConditionParser
             throw new ConditionSyntaxException($"'{clause}': OR is not supported; use separate edges or '&&'.");
         }
 
-        var opIndex = IndexOfOutsideQuotes(clause, "!=");
-        var op = ConditionOperator.NotEquals;
-        var opLength = 2;
+        var (opIndex, op, opLength) = FindOperator(clause);
         if (opIndex < 0)
         {
-            opIndex = IndexOfOutsideQuotes(clause, "=");
-            op = ConditionOperator.Equals;
-            opLength = 1;
-        }
-
-        if (opIndex < 0)
-        {
-            foreach (var bad in new[] { ">=", "<=", ">", "<" })
-            {
-                if (IndexOfOutsideQuotes(clause, bad) >= 0)
-                {
-                    throw new ConditionSyntaxException($"'{clause}': comparison operator '{bad}' is not supported; only '=' and '!=' are.");
-                }
-            }
-
             if (clause.StartsWith('!'))
             {
                 throw new ConditionSyntaxException($"'{clause}': negation is not supported; use 'key!=value'.");
@@ -124,13 +128,78 @@ public static partial class ConditionParser
 
         var key = ValidateKey(clause[..opIndex].Trim(), clause);
         var rawValue = clause[(opIndex + opLength)..].Trim();
-        if (rawValue.StartsWith('=') || rawValue.StartsWith('!'))
+        if (rawValue.StartsWith('=') || rawValue.StartsWith('!') || rawValue.StartsWith('<') || rawValue.StartsWith('>'))
         {
-            throw new ConditionSyntaxException($"'{clause}': invalid operator; use '=' or '!=' (not '==').");
+            throw new ConditionSyntaxException($"'{clause}': invalid operator; use '=', '!=', '<', '<=', '>', or '>=' (not '==' or '=>').");
         }
 
         _ = source;
-        return new ConditionClause(key, op, ParseLiteral(rawValue, clause));
+        var value = ParseLiteral(rawValue, clause);
+        var parsed = new ConditionClause(key, op, value);
+        if (parsed.IsNumeric && !TryParseNumber(value, out _))
+        {
+            throw new ConditionSyntaxException($"'{clause}': '{op switch
+            {
+                ConditionOperator.LessThan => "<",
+                ConditionOperator.LessOrEqual => "<=",
+                ConditionOperator.GreaterThan => ">",
+                _ => ">=",
+            }}' compares numbers, but '{value}' is not a number.");
+        }
+
+        return parsed;
+    }
+
+    /// <summary>Parses a numeric literal or value (invariant culture; finite numbers only).</summary>
+    public static bool TryParseNumber(string? text, out double number) =>
+        double.TryParse(text?.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out number) && double.IsFinite(number);
+
+    /// <summary>The first operator outside quotes; two-character operators (<c>!=</c>, <c>&lt;=</c>, <c>&gt;=</c>) win at a position.</summary>
+    private static (int Index, ConditionOperator Operator, int Length) FindOperator(string clause)
+    {
+        char? quote = null;
+        for (var i = 0; i < clause.Length; i++)
+        {
+            var c = clause[i];
+            if (quote is not null)
+            {
+                if (c == '\\')
+                {
+                    i++;
+                }
+                else if (c == quote)
+                {
+                    quote = null;
+                }
+
+                continue;
+            }
+
+            if (c is '"' or '\'')
+            {
+                quote = c;
+                continue;
+            }
+
+            var next = i + 1 < clause.Length ? clause[i + 1] : '\0';
+            switch (c)
+            {
+                case '!' when next == '=':
+                    return (i, ConditionOperator.NotEquals, 2);
+                case '<' when next == '=':
+                    return (i, ConditionOperator.LessOrEqual, 2);
+                case '>' when next == '=':
+                    return (i, ConditionOperator.GreaterOrEqual, 2);
+                case '=':
+                    return (i, ConditionOperator.Equals, 1);
+                case '<':
+                    return (i, ConditionOperator.LessThan, 1);
+                case '>':
+                    return (i, ConditionOperator.GreaterThan, 1);
+            }
+        }
+
+        return (-1, ConditionOperator.Truthy, 0);
     }
 
     private static string ValidateKey(string key, string clause)
@@ -142,7 +211,7 @@ public static partial class ConditionParser
 
         if (!KeyPattern().IsMatch(key))
         {
-            throw new ConditionSyntaxException($"'{clause}': invalid key '{key}'. Use 'outcome', 'preferred_label', or 'context.<path>'.");
+            throw new ConditionSyntaxException($"'{clause}': invalid key '{key}'. Use 'outcome', 'preferred_label', 'context.<path>', 'visits.<node>', or 'metrics.<name>'.");
         }
 
         return key;

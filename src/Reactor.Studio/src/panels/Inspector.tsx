@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import { Button, Dropdown, Field, Section, Segmented, Stepper, TextArea, TextInput, Toggle, cx } from "../components/controls";
+import { Button, ComboInput, Dropdown, Field, Section, Segmented, Stepper, TextArea, TextInput, Toggle, cx } from "../components/controls";
 import { Glyph } from "../components/Glyph";
 import { artifactIndex, formatInputs, formatOutputs, isArtifactName, parseInputs, parseOutputs } from "../model/artifacts";
-import { formatCondition, OUTCOMES, parseCondition, type Clause } from "../model/conditions";
+import { defaultSoftTimeout, defaultTimeoutGrace, isDuration, isSoftTimeout, metricsFileProblem, parseDuration, parsePositiveInt, parseUsd } from "../model/attributes";
+import { clauseProblem, formatCondition, isNumericOp, keySuggestions, metricName, metricsInConditions, OPERATORS, OUTCOMES, parseCondition, visitsNode, type Clause, type KeySuggestion } from "../model/conditions";
 import {
   IDENT,
   edgeAttr,
@@ -32,7 +33,10 @@ import { effectiveModel } from "../model/stylesheet";
 import type { DocEdge, DocNode, StudioDoc } from "../model/types";
 import { deleteSelection, groupSelection } from "../state/editing";
 import { applyDoc, focusNode, select, setBottomPanel, setLeftPanel, toast, useStudio } from "../state/store";
+import { useTelemetry } from "../state/telemetry";
+import { useTunnel } from "../modes/tunnel/store";
 import { modelOptions } from "./Models";
+import { QuickFixes } from "./QuickFixes";
 
 const KNOWN_NODE_KEYS = new Set([
   "shape", "type", "label", "prompt", "max_retries", "retry_policy", "goal_gate", "retry_target", "fallback_retry_target", "timeout",
@@ -41,7 +45,8 @@ const KNOWN_NODE_KEYS = new Set([
   "manager.poll_interval", "manager.max_cycles", "manager.stop_condition", "manager.actions", "manager.steer_cooldown", "manager.steer_prompt",
   "stack.child_dotfile", "stack.child_workdir", "stack.child_autostart", "stack.child_logs_root",
   "agent.max_tool_rounds", "agent.max_turns", "agent.max_tokens", "agent.instructions", "agent.shell_timeout", "inputs", "outputs",
-  "tool_hooks.pre", "tool_hooks.post",
+  "tool_hooks.pre", "tool_hooks.post", "instructions", "house_rules", "branch_workdir", "promote", "write_scope", "write_scope_enforce", "concurrency_group", "track_changes",
+  "max_visits", "on_max_visits", "on_fail", "on_timeout", "soft_timeout", "timeout_grace", "metrics_file", "tool_color",
 ]);
 
 const FIDELITIES = ["full", "compact", "truncate", "summary:low", "summary:medium", "summary:high"];
@@ -155,6 +160,7 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
             <div key={i} className={cx("rs-insp__diag", `is-${d.severity}`)}>
               <span className="mono">{d.rule}</span> {d.message}
               {d.fix ? <div className="rs-insp__fix">{d.fix}</div> : null}
+              <QuickFixes diagnostic={d} />
             </div>
           ))}
         </div>
@@ -184,6 +190,13 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
             <Field label="Command" hint="Runs with cmd.exe /c on Windows and bash -c elsewhere, in the run's working directory. Exit code 0 is success.">
               <TextArea value={attr("tool_command")} onChange={(v) => set("tool_command", v)} placeholder="dotnet test" mono minRows={2} />
             </Field>
+            <Toggle
+              checked={attr("tool_color") === "true"}
+              onChange={(v) => set("tool_color", v ? "true" : undefined, false)}
+              label="Let it print in color"
+              hint="By default the command runs with NO_COLOR=1, FORCE_COLOR=0, and TERM=dumb. Either way, escape sequences are stripped from what is recorded (the raw capture is kept in stdout.raw.txt)."
+            />
+            <div style={{ height: 10 }} />
           </>
         ) : null}
         {kind === "human" ? <HumanFields node={node} doc={doc} set={set} /> : null}
@@ -195,7 +208,31 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
             <Field label="Max concurrent branches" inline>
               <Stepper value={attr("max_parallel") ? Number(attr("max_parallel")) : undefined} onChange={(v) => set("max_parallel", v?.toString())} min={1} max={32} placeholder="4" />
             </Field>
+            <Field
+              label="Branch workspaces"
+              hint={
+                attr("branch_workdir") === "worktree"
+                  ? "Each branch works in its own git worktree of the current files (uncommitted ones included). Needs git; node_modules is not checked out."
+                  : attr("branch_workdir") === "copy"
+                    ? "Each branch works in its own copy of the files (ignored files such as node_modules are not copied)."
+                    : "Branches work in the same directory and can overwrite each other's files."
+              }
+            >
+              <Segmented
+                value={attr("branch_workdir") || "shared"}
+                options={[{ value: "shared", label: "Shared" }, { value: "worktree", label: "Git worktree" }, { value: "copy", label: "Copy" }]}
+                onChange={(v) => set("branch_workdir", v === "shared" ? undefined : v, false)}
+              />
+            </Field>
           </>
+        ) : null}
+        {kind === "join" ? (
+          <Toggle
+            checked={attr("promote") === "best"}
+            onChange={(v) => set("promote", v ? "best" : undefined, false)}
+            label="Promote the winner"
+            hint="Apply the best branch's changes to this working directory (branches need their own workspaces). Fails without changing anything if the same files changed here meanwhile."
+          />
         ) : null}
         {kind === "supervisor" ? <SupervisorFields node={node} doc={doc} set={set} /> : null}
         {kind === "router" ? <p className="rs-insp__note">A router has no work of its own. It passes the previous stage's outcome through and picks a route by the conditions below.</p> : null}
@@ -266,10 +303,11 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
             <Field label="Extra attempts">
               <Stepper value={attr("max_retries") ? Number(attr("max_retries")) : undefined} onChange={(v) => set("max_retries", v?.toString(), false)} max={20} placeholder={doc.graphAttrs.default_max_retries ?? "0"} />
             </Field>
-            <Field label="Timeout">
-              <TextInput value={attr("timeout")} onChange={(v) => set("timeout", v)} placeholder="none" mono />
+            <Field label="Timeout" hint={attr("timeout") && !isDuration(attr("timeout")) ? "A duration: 90s, 45m, 2h." : undefined}>
+              <TextInput value={attr("timeout")} onChange={(v) => set("timeout", v)} placeholder="none" mono invalid={!!attr("timeout") && !isDuration(attr("timeout"))} />
             </Field>
           </div>
+          {kind !== "human" && (attr("timeout") || attr("on_timeout") || attr("soft_timeout") || attr("timeout_grace")) ? <TimeoutFields node={node} doc={doc} set={set} llm={meta.llm} /> : null}
           <Field label="Backoff">
             <Segmented size="sm" value={attr("retry_policy") || "default"} options={["default", "none", "standard", "aggressive", "linear", "patient"].map((p) => ({ value: p, label: p }))} onChange={(v) => set("retry_policy", v === "default" ? undefined : v, false)} />
           </Field>
@@ -281,6 +319,10 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
           <Toggle checked={attr("auto_status") === "true"} onChange={(v) => set("auto_status", v ? "true" : undefined, false)} label="Auto status" hint="Record success when the handler writes no status." />
         </Section>
       ) : null}
+
+      {kind !== "start" && kind !== "exit" ? <FlowFields node={node} doc={doc} set={set} kind={kind} options={otherIds} /> : null}
+
+      {kind === "agent" || kind === "tool" || kind === "custom" || kind === "supervisor" ? <MetricsFields node={node} doc={doc} set={set} kind={kind} /> : null}
 
       {meta.llm ? (
         <Section title="Context" id="insp-context" collapsible>
@@ -300,6 +342,27 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
         </Section>
       ) : null}
 
+      {meta.llm ? (
+        <Section title="Instructions" id="insp-instructions" collapsible defaultOpen={!!node.attrs.instructions} aside={eff.instructions ? <span className="faint mono">{eff.instructions.source === "stylesheet" ? `from ${eff.instructions.selector}` : eff.instructions.source === "node" ? "set here" : "default"}</span> : undefined}>
+          <Field
+            label="Standing instructions"
+            hint={
+              !node.attrs.instructions && eff.instructions
+                ? `Inherits instructions from ${eff.instructions.selector ?? "defaults"}. Text here replaces them for this stage.`
+                : `Every backend gives these to the agent as system-level instructions, after ${doc.graphAttrs.house_rules === "false" ? "" : "the built-in house rules and "}the pipeline's instructions${doc.graphAttrs.instructions ? "" : " (none set)"}.`
+            }
+          >
+            <TextArea value={node.attrs.instructions ?? ""} onChange={(v) => set("instructions", v)} placeholder={eff.instructions && !node.attrs.instructions ? eff.instructions.value : "e.g. Use PowerShell syntax; never download browsers."} minRows={2} />
+          </Field>
+          <Toggle
+            checked={(node.attrs.house_rules ?? doc.graphAttrs.house_rules) !== "false"}
+            onChange={(v) => set("house_rules", v === (doc.graphAttrs.house_rules !== "false") ? undefined : String(v), false)}
+            label="Built-in house rules"
+            hint={node.attrs.house_rules ? "Set on this stage." : "Follows the pipeline setting."}
+          />
+        </Section>
+      ) : null}
+
       {kind === "agent" ? (
         <Section title="Agent limits" id="insp-agent" collapsible defaultOpen={false}>
           <div className="rs-insp__grid">
@@ -316,9 +379,33 @@ function NodeInspector({ node, doc }: { node: DocNode; doc: StudioDoc }) {
               <TextInput value={attr("agent.shell_timeout")} onChange={(v) => set("agent.shell_timeout", v)} placeholder="default" mono />
             </Field>
           </div>
-          <Field label="Extra system instructions" hint="Appended to the agent's system prompt (agent backend).">
+          <Field label="Extra system instructions (agent backend)" hint="Legacy: only the agent backend reads agent.instructions. Prefer Instructions above, which every backend honors.">
             <TextArea value={attr("agent.instructions")} onChange={(v) => set("agent.instructions", v)} minRows={2} />
           </Field>
+        </Section>
+      ) : null}
+
+      {kind === "agent" || kind === "tool" || kind === "supervisor" || kind === "custom" ? (
+        <Section title="Workspace" id="insp-workspace" collapsible defaultOpen={!!(attr("write_scope") || attr("concurrency_group"))}>
+          <Field label="Write scope" hint="Globs (relative to the working directory) this stage may change, e.g. prototypes/proto_a/**. Changes outside are flagged in the flight record.">
+            <TextInput value={attr("write_scope")} onChange={(v) => set("write_scope", v)} placeholder="anywhere" mono />
+          </Field>
+          <Toggle
+            checked={attr("write_scope_enforce") === "true"}
+            onChange={(v) => set("write_scope_enforce", v ? "true" : undefined, false)}
+            label="Fail when it writes outside the scope"
+            hint="The stage fails (without a retry); its files stay as they are."
+          />
+          <div style={{ height: 10 }} />
+          <Field label="Concurrency group" hint="Stages in the same group never run at the same time, e.g. browser-based QA in parallel branches.">
+            <TextInput value={attr("concurrency_group")} onChange={(v) => set("concurrency_group", v)} placeholder="none" mono />
+          </Field>
+          <Toggle
+            checked={attr("track_changes") !== "false"}
+            onChange={(v) => set("track_changes", v ? undefined : "false", false)}
+            label="Record file changes"
+            hint="Snapshot the working directory before and after this stage (changes.json)."
+          />
         </Section>
       ) : null}
 
@@ -349,6 +436,141 @@ function fidelityHint(mode: string) {
       return "Gets the goal, completed stages with outcomes, and key context values.";
   }
 }
+
+type Setter = (k: string, v: string | undefined, c?: boolean) => void;
+
+const ON_TIMEOUT_HINT: Record<string, string> = {
+  retry: "A timeout is retried like other transient errors (extra attempts), and the retry is told what the stopped attempt did and said last.",
+  fail: "A timeout fails the stage; it is never retried.",
+  wrap_up: "At the limit the agent is told time is up and gets the grace period to finish and summarize (agent and copilot backends); then it is stopped.",
+};
+
+/** What a stage does when it reaches its `timeout`: retry, fail, or wrap up — and the soft-deadline reminder before it. */
+function TimeoutFields({ node, doc, set, llm }: { node: DocNode; doc: StudioDoc; set: Setter; llm: boolean }) {
+  const attr = (key: string) => nodeAttr(doc, node, key) ?? "";
+  const timeoutMs = parseDuration(attr("timeout"));
+  const raw = attr("on_timeout").trim().toLowerCase().replace("-", "_");
+  const onTimeout = raw === "wrapup" ? "wrap_up" : raw || "retry";
+  const soft = attr("soft_timeout");
+  const grace = attr("timeout_grace");
+  const options = [
+    { value: "retry", label: "retry", title: ON_TIMEOUT_HINT.retry },
+    { value: "fail", label: "fail", title: ON_TIMEOUT_HINT.fail },
+    ...(llm || onTimeout === "wrap_up" ? [{ value: "wrap_up", label: "wrap up first", title: ON_TIMEOUT_HINT.wrap_up }] : []),
+  ];
+  return (
+    <div className="rs-insp__sub">
+      <Field label="When it times out" hint={ON_TIMEOUT_HINT[onTimeout] ?? `on_timeout="${attr("on_timeout")}" is not retry, fail, or wrap_up.`}>
+        <Segmented size="sm" value={onTimeout} options={options} onChange={(v) => set("on_timeout", v === "retry" ? undefined : v, false)} />
+      </Field>
+      {llm ? (
+        <div className="rs-insp__grid">
+          <Field label="Soft deadline" hint={soft && !isSoftTimeout(soft) ? "A duration (e.g. 70m) or off." : "Reminds the agent to wrap up (agent and copilot backends). off disables it."}>
+            <TextInput value={soft} onChange={(v) => set("soft_timeout", v)} placeholder={defaultSoftTimeout(timeoutMs)} mono invalid={!!soft && !isSoftTimeout(soft)} />
+          </Field>
+          {onTimeout === "wrap_up" || grace ? (
+            <Field label="Wrap-up grace" hint={grace && !isDuration(grace) ? "A duration, e.g. 5m." : "Time to finish after the limit."}>
+              <TextInput value={grace} onChange={(v) => set("timeout_grace", v)} placeholder={defaultTimeoutGrace(timeoutMs)} mono invalid={!!grace && !isDuration(grace)} />
+            </Field>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const WORK_KINDS = new Set<NodeKind>(["agent", "tool", "supervisor", "custom"]);
+
+/** Unrouted failures (`on_fail`) and loop bounds (`max_visits`, `on_max_visits`). */
+function FlowFields({ node, doc, set, kind, options }: { node: DocNode; doc: StudioDoc; set: Setter; kind: NodeKind; options: ReturnType<typeof nodeOption>[] }) {
+  const attr = (key: string) => nodeAttr(doc, node, key) ?? "";
+  const graphDefault = (doc.graphAttrs.default_on_fail ?? "").trim().toLowerCase();
+  const onFail = attr("on_fail").trim().toLowerCase();
+  const maxText = attr("max_visits");
+  const max = parsePositiveInt(maxText);
+  const target = node.attrs.on_max_visits;
+  const targetNode = target ? findNode(doc, target) : undefined;
+  const effective = onFail || graphDefault || "continue";
+  return (
+    <Section title="Flow control" id="insp-flow" collapsible aside={max ? <span className="faint mono">≤{max} visits</span> : undefined}>
+      {WORK_KINDS.has(kind) ? (
+        <Field
+          label="If it fails and no route takes the failure"
+          hint={
+            effective === "stop"
+              ? "The run stops with this stage's failure reason (an outcome=fail edge, a chosen label, or a retry target still route it)."
+              : onFail === "continue"
+                ? "Carrying on is intended: an unconditional edge takes the failure on as if the stage had succeeded."
+                : "Per the spec, an unconditional edge takes the failure on as if the stage had succeeded; the validator warns about it."
+          }
+        >
+          <Segmented
+            size="sm"
+            value={onFail === "stop" || onFail === "continue" ? onFail : "inherit"}
+            options={[
+              { value: "inherit", label: graphDefault === "stop" ? "pipeline · stop" : graphDefault === "continue" ? "pipeline · carry on" : "pipeline default", title: "Follow the pipeline's default_on_fail" },
+              { value: "stop", label: "stop the run", title: 'on_fail="stop"' },
+              { value: "continue", label: "carry on", title: 'on_fail="continue": carrying on is intended' },
+            ]}
+            onChange={(v) => set("on_fail", v === "inherit" ? undefined : v, false)}
+          />
+        </Field>
+      ) : null}
+      <div className="rs-insp__grid">
+        <Field label="Max visits" hint={maxText && !max ? `max_visits="${maxText}" is not a positive whole number.` : undefined}>
+          <Stepper value={max ?? undefined} onChange={(v) => set("max_visits", v?.toString(), false)} min={1} max={99} placeholder="∞" />
+        </Field>
+        <Field label="Then go to">
+          <Dropdown value={target} options={options} onChange={(v) => set("on_max_visits", v, false)} searchable clearLabel="nowhere (fail the run)" placeholder={max ? "fail the run" : "—"} />
+        </Field>
+      </div>
+      <p className="rs-insp__note">
+        {max
+          ? `Runs at most ${max} time${max === 1 ? "" : "s"} per run; a ${ordinal(max + 1)} visit ${targetNode ? `goes to “${nodeLabel(doc, targetNode)}” instead` : target ? `goes to “${target}”, which does not exist, so the run fails` : "fails the run"}.`
+          : target
+            ? "Set max visits for the reroute to take effect."
+            : "Bound a loop: the most times this stage may run in one run, and where the run goes instead (e.g. a person's review)."}
+      </p>
+    </Section>
+  );
+}
+
+const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
+
+/** Outcome metrics: where the stage's numbers come from, and what the flight record has seen. */
+function MetricsFields({ node, doc, set, kind }: { node: DocNode; doc: StudioDoc; set: Setter; kind: NodeKind }) {
+  const file = node.attrs.metrics_file ?? "";
+  const problem = metricsFileProblem(file);
+  const record = useTelemetry((s) => s.byName[doc.name]);
+  const seen = record?.nodes[node.id]?.metrics;
+  const names = seen ? Object.keys(seen) : [];
+  return (
+    <Section title="Outcome metrics" id="insp-metrics" collapsible defaultOpen={!!file || names.length > 0} aside={names.length ? <span className="faint num">{names.length}</span> : undefined}>
+      <Field
+        label="Metrics file"
+        hint={
+          problem ??
+          `A JSON report in the working directory whose numbers are recorded as metrics.<name> (nested objects as dotted names). ${kind === "tool" ? "The command can also write $REACTOR_STAGE_DIR/metrics.json." : "Agents can also report metrics in status.json."}`
+        }
+      >
+        <TextInput value={file} onChange={(v) => set("metrics_file", v)} placeholder="qa/report.json" mono invalid={!!problem} />
+      </Field>
+      {names.length > 0 && seen ? (
+        <div className="rs-insp__metrics">
+          <span className="label">in the flight record</span>
+          {names.map((name) => (
+            <span key={name} className="rs-chip" title={`${seen[name].count ?? 0} values · min ${seen[name].min} · max ${seen[name].max} · last ${seen[name].last}`}>
+              <span className="rs-chip__key">{name}</span> ⌀ {formatMetric(seen[name].mean)}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </Section>
+  );
+}
+
+/** A metric value for readouts: whole numbers as is, others to two decimals. */
+const formatMetric = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
 
 function ThreadField({ node, doc, set }: { node: DocNode; doc: StudioDoc; set: (k: string, v: string | undefined, c?: boolean) => void }) {
   const threads = [...new Set(doc.nodes.map((n) => nodeAttr(doc, n, "thread_id")).filter((t): t is string => !!t))];
@@ -586,7 +808,7 @@ function EdgeInspector({ edge, doc }: { edge: DocEdge; doc: StudioDoc }) {
               else set({ condition: condition && mode === "condition" ? condition : "context.ready=true" });
             }}
           />
-          {mode === "condition" || mode === "success" || mode === "fail" ? <ConditionBuilder value={condition} onChange={(v) => set({ condition: v }, `edge:${edge.uid}:cond`)} /> : null}
+          {mode === "condition" || mode === "success" || mode === "fail" ? <ConditionBuilder value={condition} onChange={(v) => set({ condition: v }, `edge:${edge.uid}:cond`)} doc={doc} from={edge.from} /> : null}
           <Field label="Label" hint={mode === "label" ? "Taken when the stage reports this as its preferred label (status.json), e.g. a reviewer choosing Approve." : "Optional caption. Agents may also pick a route by its label."}>
             <TextInput value={label} onChange={(v) => set({ label: v || undefined }, `edge:${edge.uid}:label`)} placeholder="e.g. Approve" />
           </Field>
@@ -615,56 +837,124 @@ function EdgeInspector({ edge, doc }: { edge: DocEdge; doc: StudioDoc }) {
   );
 }
 
-function ConditionBuilder({ value, onChange }: { value: string; onChange: (value: string | undefined) => void }) {
+/**
+ * Keys the clause editor suggests for a pipeline: `visits.<stage>` for its work stages, `metrics.<name>` for the metrics
+ * its conditions test, its wind tunnel scenario declares, the latest tunnel report saw, or its flight record has, and the
+ * context keys its other conditions use.
+ */
+function useConditionKeys(doc: StudioDoc): KeySuggestion[] {
+  const record = useTelemetry((s) => s.byName[doc.name]);
+  const scenario = useTunnel((s) => s.settings.nodes);
+  const report = useTunnel((s) => s.report);
+  return useMemo(() => {
+    const conditions = doc.edges.map((e) => edgeAttr(doc, e, "condition"));
+    const metrics = metricsInConditions(conditions);
+    const add = (names: Iterable<string>) => {
+      for (const name of names) if (!metrics.includes(name)) metrics.push(name);
+    };
+    for (const behavior of Object.values(scenario ?? {})) add(Object.keys(behavior.metrics ?? {}));
+    for (const stats of Object.values(report?.nodes ?? {})) add(Object.keys(stats.metrics ?? {}));
+    add(Object.keys(report?.landed_metrics ?? {}));
+    add(Object.keys(record?.metrics ?? {}));
+    for (const stats of Object.values(record?.nodes ?? {})) add(Object.keys(stats.metrics ?? {}));
+    const context: string[] = [];
+    for (const condition of conditions) {
+      for (const clause of parseCondition(condition)) {
+        const key = clause.key;
+        // Skip what is still being typed (`context.`, `visits.`) and the keys with their own groups.
+        if (key.endsWith(".") || key === "outcome" || key === "preferred_label" || visitsNode(key) || metricName(key) || context.includes(key)) continue;
+        context.push(key);
+      }
+    }
+    const stages = doc.nodes.filter((n) => !["start", "exit"].includes(handlerOf(doc, n))).map((n) => ({ id: n.id, label: nodeLabel(doc, n) }));
+    return keySuggestions(stages, metrics, context);
+  }, [doc, record, scenario, report]);
+}
+
+function ConditionBuilder({ value, onChange, doc, from }: { value: string; onChange: (value: string | undefined) => void; doc: StudioDoc; from: string }) {
   const clauses = parseCondition(value);
+  const suggestions = useConditionKeys(doc);
+  const options = useMemo(() => suggestions.map((s) => ({ value: s.key, group: s.group, detail: s.detail })), [suggestions]);
   const update = (next: Clause[]) => onChange(formatCondition(next));
+  const patch = (i: number, p: Partial<Clause>) => update(clauses.map((x, j) => (j === i ? { ...x, ...p } : x)));
+  const firstMetric = suggestions.find((s) => s.group === "Metrics")?.key ?? "metrics.score";
   return (
     <div className="rs-cond">
-      {clauses.map((c, i) => (
-        <div key={i} className="rs-cond__row">
-          {i > 0 ? <span className="rs-cond__and mono">and</span> : <span className="rs-cond__and mono">if</span>}
-          <input className="rs-cond__key mono" value={c.key} onChange={(e) => update(clauses.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))} onKeyDown={(e) => e.stopPropagation()} />
-          <select className="rs-cond__op mono" value={c.op} onChange={(e) => update(clauses.map((x, j) => (j === i ? { ...x, op: e.target.value as Clause["op"] } : x)))}>
-            <option value="=">=</option>
-            <option value="!=">≠</option>
-            <option value="truthy">is set</option>
-          </select>
-          {c.op !== "truthy" ? (
-            c.key === "outcome" ? (
-              <select className="rs-cond__value mono" value={c.value} onChange={(e) => update(clauses.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}>
-                {OUTCOMES.map((o) => (
-                  <option key={o} value={o}>
-                    {o}
+      {clauses.map((c, i) => {
+        const problem = clauseProblem(c);
+        return (
+          <div key={i} className="rs-cond__clause">
+            <div className="rs-cond__row">
+              {i > 0 ? <span className="rs-cond__and mono">and</span> : <span className="rs-cond__and mono">if</span>}
+              <ComboInput className="rs-cond__key mono" value={c.key} onChange={(key) => patch(i, { key })} options={options} invalid={!c.key.trim()} placeholder="key" />
+              <select
+                className="rs-cond__op mono"
+                value={c.op}
+                onChange={(e) => {
+                  const op = e.target.value as Clause["op"];
+                  // Numbers need a number: switching to a comparison seeds one; switching away from "is set" seeds a value.
+                  const value = isNumericOp(op) && !isNumericOp(c.op) && !/^\d/.test(c.value) ? "3" : c.op === "truthy" && op !== "truthy" && !c.value ? (c.key === "outcome" ? "success" : "") : c.value;
+                  patch(i, { op, value });
+                }}
+              >
+                {OPERATORS.map((o) => (
+                  <option key={o.op} value={o.op} title={o.title}>
+                    {o.symbol}
                   </option>
                 ))}
               </select>
-            ) : (
-              <input className="rs-cond__value mono" value={c.value} onChange={(e) => update(clauses.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))} onKeyDown={(e) => e.stopPropagation()} />
-            )
-          ) : (
-            <span />
-          )}
-          <button type="button" className="rs-cond__remove" onClick={() => update(clauses.filter((_, j) => j !== i))} aria-label="Remove clause">
-            <Glyph name="close" size={10} />
-          </button>
-        </div>
-      ))}
+              {c.op !== "truthy" ? (
+                c.key === "outcome" && (c.op === "=" || c.op === "!=") ? (
+                  <select className="rs-cond__value mono" value={c.value} onChange={(e) => patch(i, { value: e.target.value })}>
+                    {(OUTCOMES as readonly string[]).includes(c.value) ? null : <option value={c.value}>{c.value || "—"}</option>}
+                    {OUTCOMES.map((o) => (
+                      <option key={o} value={o}>
+                        {o}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className={cx("rs-cond__value mono", problem && c.key.trim() && "is-invalid")}
+                    value={c.value}
+                    inputMode={isNumericOp(c.op) || visitsNode(c.key) || metricName(c.key) ? "decimal" : undefined}
+                    placeholder={isNumericOp(c.op) ? "number" : "value"}
+                    onChange={(e) => patch(i, { value: e.target.value })}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                )
+              ) : (
+                <span />
+              )}
+              <button type="button" className="rs-cond__remove" onClick={() => update(clauses.filter((_, j) => j !== i))} aria-label="Remove clause">
+                <Glyph name="close" size={10} />
+              </button>
+            </div>
+            {problem && c.key.trim() ? <div className="rs-cond__problem">{problem}</div> : null}
+          </div>
+        );
+      })}
       <div className="rs-cond__add">
         <button type="button" className="rs-linkbtn" onClick={() => update([...clauses, { key: "outcome", op: "=", value: "success" }])}>
           + outcome
+        </button>
+        <button type="button" className="rs-linkbtn" title="How many times a stage has run in this run (counts the current visit)" onClick={() => update([...clauses, { key: `visits.${from}`, op: "<", value: "3" }])}>
+          + visits
+        </button>
+        <button type="button" className="rs-linkbtn" title="The latest value of an outcome metric a stage reported" onClick={() => update([...clauses, { key: firstMetric, op: ">=", value: "4" }])}>
+          + metric
         </button>
         <button type="button" className="rs-linkbtn" onClick={() => update([...clauses, { key: "context.", op: "=", value: "true" }])}>
           + context value
         </button>
         <button type="button" className="rs-linkbtn" onClick={() => update([...clauses, { key: "preferred_label", op: "=", value: "" }])}>
-          + preferred label
+          + label
         </button>
       </div>
       <div className="rs-cond__raw mono">{value || "always"}</div>
     </div>
   );
 }
-
 // ---------- multi / group / note / graph ----------
 
 function MultiInspector({ ids }: { ids: string[] }) {
@@ -788,6 +1078,8 @@ function GraphInspector() {
     [doc],
   );
   const errors = analysis.diagnostics.filter((d) => d.severity === "error").length;
+  const defaultOnFail = (doc.graphAttrs.default_on_fail ?? "").trim().toLowerCase();
+  const maxCost = doc.graphAttrs.max_cost ?? "";
   return (
     <div className="rs-insp">
       <InspectorHead icon="design" kicker="Pipeline" title={doc.graphAttrs.label || doc.name}>
@@ -837,11 +1129,55 @@ function GraphInspector() {
           <Dropdown value={doc.graphAttrs.fallback_retry_target} options={ids} onChange={(v) => setG("fallback_retry_target", v, false)} searchable clearLabel="none" placeholder="none" />
         </Field>
       </Section>
+      <Section title="Failures and budget" id="insp-graph-flow" collapsible>
+        <Field
+          label="When a stage fails and no route takes the failure"
+          hint={
+            defaultOnFail === "stop"
+              ? "The run stops with the stage's failure reason. Stages can still say on_fail=continue."
+              : defaultOnFail === "continue"
+                ? "Carrying on is intended everywhere: an unconditional edge takes a failure on as if the stage had succeeded."
+                : "Per the spec, an unconditional edge takes a failure on as if the stage had succeeded — the run can “land” without the stage's work. The validator warns about each such stage."
+          }
+        >
+          <Segmented
+            size="sm"
+            value={defaultOnFail === "stop" || defaultOnFail === "continue" ? defaultOnFail : "inherit"}
+            options={[
+              { value: "inherit", label: "carry on (spec)", title: "No default_on_fail" },
+              { value: "continue", label: "carry on, intended", title: 'default_on_fail="continue"' },
+              { value: "stop", label: "stop the run", title: 'default_on_fail="stop"' },
+            ]}
+            onChange={(v) => setG("default_on_fail", v === "inherit" ? undefined : v, false)}
+          />
+        </Field>
+        <Field
+          label="Budget per run (US dollars)"
+          hint={
+            maxCost && parseUsd(maxCost) === null
+              ? "A non-negative number of US dollars, e.g. 25 or 7.5."
+              : "Once a run's recorded cost reaches it, the run stops before its next stage and can be resumed with a higher budget. Stages whose backend reports no cost are not counted."
+          }
+        >
+          <TextInput value={maxCost} onChange={(v) => setG("max_cost", v)} placeholder="no limit" mono invalid={!!maxCost && parseUsd(maxCost) === null} />
+        </Field>
+      </Section>
       <Section title="Models" id="insp-graph-models" collapsible>
         <p className="rs-insp__note">{doc.graphAttrs.model_stylesheet ? `${doc.graphAttrs.model_stylesheet.split("{").length - 1} stylesheet rules.` : "No stylesheet: stages use the backend's default model."}</p>
         <Button size="sm" icon="models" onClick={() => setLeftPanel("models")}>
           Open model stylesheet
         </Button>
+      </Section>
+      <Section title="Instructions" id="insp-graph-instructions" collapsible defaultOpen={!!doc.graphAttrs.instructions}>
+        <Field label="Pipeline instructions" hint="House rules for every LLM stage, on every backend (stages and stylesheet rules can add their own).">
+          <TextArea value={doc.graphAttrs.instructions ?? ""} onChange={(v) => setG("instructions", v)} placeholder="e.g. Use PowerShell syntax. Keep scratch files under .scratch/." minRows={3} />
+        </Field>
+        <Toggle
+          checked={doc.graphAttrs.house_rules !== "false"}
+          onChange={(v) => setG("house_rules", v ? undefined : "false", false)}
+          label="Built-in house rules"
+          hint="Reactor's defaults for agents with tools: write large files in parts, keep scratch files out of the product, assume rather than ask, stop processes you start, and end with a summary."
+        />
       </Section>
       <Section title="Tool hooks" id="insp-graph-hooks" collapsible defaultOpen={false}>
         <Field label="Before each agent tool call" hint="A non-zero exit blocks the call. Gets REACTOR_TOOL_NAME etc. and JSON on stdin.">

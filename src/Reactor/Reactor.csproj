@@ -7,7 +7,15 @@
     <Description>Reactor pipeline engine: DOT-defined multi-stage AI workflows with handlers, checkpoints, human gates, and parallel branches.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <!--
+      Process-tree containment (Windows job objects, Unix process groups) is shared with Reactor.Agent, which does not
+      reference this assembly: the same internal sources are compiled into both.
+    -->
+    <Compile Include="..\Shared\Processes\*.cs" LinkBase="Shared\Processes" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Tests" />
+    <InternalsVisibleTo Include="Reactor.Backends" />
     <InternalsVisibleTo Include="Reactor.Backends.Tests" />
   </ItemGroup>
 </Project>

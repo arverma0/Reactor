@@ -1,6 +1,7 @@
 // The Studio Architect, as a Reactor pipeline: draft a pipeline, check it with the real parser, validator, and wind
-// tunnel, and repair it until it passes. The server provides the brief and the current pipeline in the context
-// (architect.*), composes the full prompt for the design stage (see architect.md), and gives up after three drafts.
+// tunnel, repair it until it passes, then review it against the brief (and revise if the review asks). The server
+// provides the brief and the current pipeline in the context (architect.*), composes the full prompts for the design
+// and review stages (see architect.md), and gives up after three drafts.
 // Copy this file to .reactor/studio/architect.dot in your workspace to customize it.
 digraph architect {
     graph [goal="Design a Reactor pipeline", label="Studio Architect"]
@@ -15,10 +16,14 @@ digraph architect {
         prompt="Design the pipeline described below."
     ]
     check [label="Check in the wind tunnel", type="studio.check"]
+    review [label="Review against the brief", type="studio.review"]
 
     start -> design
     // A design stage that fails (the backend's error) ends the run with its reason; only answers are checked.
-    design -> check [condition="outcome=success"]
-    check -> exit   [condition="outcome=success"]
-    check -> design [condition="outcome=fail && context.architect.give_up!=true", label="Repair"]
+    design -> check  [condition="outcome=success"]
+    check  -> review [condition="outcome=success"]
+    check  -> design [condition="outcome=fail && context.architect.give_up!=true", label="Repair"]
+    // The self-review sends a draft back only while drafts remain; otherwise it reports and keeps the checked draft.
+    review -> exit   [condition="outcome=success"]
+    review -> design [condition="outcome=fail", label="Revise"]
 }

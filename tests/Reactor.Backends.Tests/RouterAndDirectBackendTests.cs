@@ -11,11 +11,13 @@ public sealed class RouterAndDirectBackendTests
 {
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
-    private sealed class NamedBackend(string name, bool statusFile = false) : ICodergenBackend
+    private sealed class NamedBackend(string name, bool statusFile = false, bool steering = false) : ICodergenBackend
     {
         public List<string> Nodes { get; } = [];
 
         public bool SupportsStatusFile => statusFile;
+
+        public bool SupportsSteering => steering;
 
         public Task<CodergenResult> RunAsync(Node node, string prompt, PipelineContext context, CancellationToken cancellationToken)
         {
@@ -104,5 +106,81 @@ public sealed class RouterAndDirectBackendTests
         Assert.Equal("answer 2", File.ReadAllText(dir.Combine("run", "b", "response.md")));
         Assert.Equal(Role.System, llm.Requests[0].Messages[0].Role);
         Assert.DoesNotContain("Reporting the stage outcome", File.ReadAllText(dir.Combine("run", "a", "prompt.md")));
+    }
+
+    [Fact]
+    public void Router_reports_the_steering_capability_of_the_backend_each_node_uses()
+    {
+        var steerable = new NamedBackend("sdk", steering: true);
+        var router = new BackendRouter(new NamedBackend("cli")).Add("copilot", steerable);
+        ICodergenBackend asBackend = router;
+        var plain = new Node("plain");
+        var steered = new Node("steered") { [BackendRouter.BackendAttribute] = "copilot" };
+        var unknown = new Node("unknown") { [BackendRouter.BackendAttribute] = "nope" };
+
+        Assert.False(asBackend.SupportsSteering);
+        Assert.False(asBackend.SupportsSteeringFor(plain));
+        Assert.True(asBackend.SupportsSteeringFor(steered));
+        Assert.False(asBackend.SupportsSteeringFor(unknown));
+        Assert.True(((ICodergenBackend)new BackendRouter(steerable)).SupportsSteering);
+    }
+
+    [Fact]
+    public async Task Direct_backend_sends_stage_instructions_without_house_rules_and_prices_tokens()
+    {
+        using var dir = new TempDir();
+        var llm = new FakeLlm("test");
+        llm.Responder = _ => FakeLlm.Text("ok") with { Model = "gpt-5" };
+        var client = new Client(new Dictionary<string, IProviderAdapter> { ["test"] = llm }, "test");
+        var direct = new DirectLlmBackend(new DirectLlmBackendOptions { Client = client, DefaultProvider = "test" });
+
+        var result = await Pipelines.Runner(direct).RunAsync("""
+            digraph G {
+              graph [instructions="Answer in English."]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="Question", llm_provider="test", llm_model="gpt-5", instructions="Be brief."]
+              start -> a -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var system = llm.Requests[0].Messages[0].Text;
+        Assert.StartsWith("You are one stage of an automated software pipeline.", system, StringComparison.Ordinal);
+        Assert.Contains("## Pipeline instructions\nAnswer in English.", system, StringComparison.Ordinal);
+        Assert.Contains("## Stage instructions\nBe brief.", system, StringComparison.Ordinal);
+        Assert.DoesNotContain("House rules", system, StringComparison.Ordinal);
+        Assert.True(File.Exists(dir.Combine("run", "a", StageInstructions.FileName)));
+
+        // gpt-5 costs $1.25 / $10 per 1M tokens in the catalog; FakeLlm reports 10 input and 5 output tokens.
+        var metadata = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(dir.Combine("run", "a", "backend.json")))!;
+        Assert.Equal(Math.Round(((10 * 1.25) + (5 * 10.0)) / 1e6, 6), metadata["cost_usd"]!.GetValue<double>());
+        Assert.Equal("tokens", metadata["cost_basis"]!.GetValue<string>());
+        Assert.True(metadata["cost_estimated"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task A_failed_direct_call_still_records_the_model()
+    {
+        using var dir = new TempDir();
+        var llm = new FakeLlm("test");
+        llm.Responder = _ => throw new AuthenticationError("bad key", "test", 401);
+        var client = new Client(new Dictionary<string, IProviderAdapter> { ["test"] = llm }, "test");
+        var direct = new DirectLlmBackend(new DirectLlmBackendOptions { Client = client, DefaultModel = "test-model", RetryPolicy = new RetryPolicy { MaxRetries = 0 } });
+
+        await Pipelines.Runner(direct).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              a [prompt="Question"]
+              start -> a -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        var metadata = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(dir.Combine("run", "a", "backend.json")))!;
+        Assert.Equal("direct", metadata["backend"]!.GetValue<string>());
+        Assert.Equal("test-model", metadata["model"]!.GetValue<string>());
+        Assert.Equal("error", metadata["outcome"]!.GetValue<string>());
+        Assert.Contains("bad key", metadata["error"]!.GetValue<string>(), StringComparison.Ordinal);
     }
 }

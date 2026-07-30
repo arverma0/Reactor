@@ -213,21 +213,33 @@ export function moveEdge(doc: StudioDoc, uid: string, direction: -1 | 1): Studio
   return { ...doc, edges };
 }
 
-const ID_REFERENCE_KEYS = ["retry_target", "fallback_retry_target", "human.default_choice"];
+const ID_REFERENCE_KEYS = ["retry_target", "fallback_retry_target", "human.default_choice", "on_max_visits"];
+
+/** A condition with its `visits.<oldId>` keys renamed (other clauses, quoting, and spacing are kept as written). */
+function renameVisits(condition: string, oldId: string, newId: string): string {
+  return condition.replace(new RegExp(`(^|&&|\\s)((?:context\\.)?visits\\.)${oldId}(?=\\s*(?:[=!<>]|&&|$))`, "g"), `$1$2${newId}`);
+}
 
 /**
- * Renames a node and every reference to it: edges, layout, retry targets, human default choices, and `#id`
- * selectors in the model stylesheet.
+ * Renames a node and every reference to it: edges, layout, retry targets, visit-limit targets, human default choices,
+ * `visits.<node>` conditions, and `#id` selectors in the model stylesheet.
  */
 export function renameNode(doc: StudioDoc, oldId: string, newId: string): StudioDoc {
   if (oldId === newId || !findNode(doc, oldId) || findNode(doc, newId)) return doc;
   const remap = (attrs: Attrs): Attrs => {
     let next = attrs;
     for (const key of ID_REFERENCE_KEYS) if (next[key] === oldId) next = { ...next, [key]: newId };
+    if (next.condition?.includes(oldId)) {
+      const renamed = renameVisits(next.condition, oldId, newId);
+      if (renamed !== next.condition) next = { ...next, condition: renamed };
+    }
     return next;
   };
   const nodes = doc.nodes.map((n) => ({ ...n, id: n.id === oldId ? newId : n.id, attrs: remap(n.attrs) }));
-  const edges = doc.edges.map((e) => (e.from === oldId || e.to === oldId ? { ...e, from: e.from === oldId ? newId : e.from, to: e.to === oldId ? newId : e.to } : e));
+  const edges = doc.edges.map((e) => {
+    const attrs = remap(e.attrs);
+    return e.from === oldId || e.to === oldId || attrs !== e.attrs ? { ...e, from: e.from === oldId ? newId : e.from, to: e.to === oldId ? newId : e.to, attrs } : e;
+  });
   let graphAttrs = remap(doc.graphAttrs);
   const sheet = graphAttrs.model_stylesheet;
   if (sheet && sheet.includes("#" + oldId)) {

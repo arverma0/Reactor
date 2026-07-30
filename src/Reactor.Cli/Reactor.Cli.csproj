@@ -17,6 +17,9 @@
     <PackageReference Include="GitHub.Copilot.SDK" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Reactor.Cli.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Reactor\Reactor.csproj" />
     <ProjectReference Include="..\Reactor.Llm\Reactor.Llm.csproj" />
     <ProjectReference Include="..\Reactor.Agent\Reactor.Agent.csproj" />

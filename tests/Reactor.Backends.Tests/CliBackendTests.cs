@@ -3,6 +3,7 @@ using Reactor.Backends.Cli;
 using Reactor.Backends.Tests.Support;
 using Reactor.Events;
 using Reactor.Execution;
+using Reactor.Tests.Support;
 
 namespace Reactor.Backends.Tests;
 
@@ -56,6 +57,36 @@ public sealed class CliBackendTests
         var parts = invocation.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var index = Array.IndexOf(parts, flag);
         return index >= 0 && index + 1 < parts.Length ? parts[index + 1] : "";
+    }
+
+    /// <summary>Cancels once the stage transcript has recorded <paramref name="marker"/> (the CLI's output was parsed), as a kill mid-run.</summary>
+    private static async Task CancelOnceRecordedAsync(CancellationTokenSource cts, string transcript, string marker)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTime.UtcNow < deadline && !cts.IsCancellationRequested)
+        {
+            try
+            {
+                if (File.Exists(transcript))
+                {
+                    using var stream = new FileStream(transcript, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    using var reader = new StreamReader(stream);
+                    if ((await reader.ReadToEndAsync(Ct)).Contains(marker, StringComparison.Ordinal))
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (IOException)
+            {
+            }
+
+            await Task.Delay(50, Ct);
+        }
+
+        // Lines are recorded just before they are parsed; give the parser a moment.
+        await Task.Delay(300, Ct);
+        await cts.CancelAsync();
     }
 
     [Fact]
@@ -316,6 +347,264 @@ public sealed class CliBackendTests
 
         Assert.True(result.Cancelled);
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"took {stopwatch.Elapsed}");
+    }
+
+    [Fact]
+    public async Task Cancellation_terminates_processes_the_agent_started_even_after_their_parent_exited()
+    {
+        Assert.SkipUnless(OrphanedGrandchild.Supported, "Containing orphaned processes needs Windows job objects or setsid.");
+        using var dir = new TempDir();
+        var pidFile = dir.Combine("grandchild.pid");
+        var command = CommandResolver.Resolve(OrphanedGrandchild.WriteScript(dir.Path, pidFile))!;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        try
+        {
+            var running = CliProcess.RunAsync(command, [], dir.Path, stdin: "prompt", environment: null, _ => { }, cts.Token);
+            var pid = await OrphanedGrandchild.WaitForPidAsync(pidFile, running);
+
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+            Assert.True(await OrphanedGrandchild.WaitUntilGoneAsync(pid, TimeSpan.FromSeconds(5)), "a process started by the cancelled agent kept running");
+        }
+        finally
+        {
+            OrphanedGrandchild.Kill(pidFile);
+        }
+    }
+
+    internal const string CopilotUsageOutput = """
+        {"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","content":"Writing the spec in one go.","toolRequests":[{"toolCallId":"call_1","name":"create"}]}}
+        {"type":"model.call_final_result","data":{"model":"claude-opus-4.8","result":"success"},"ephemeral":true}
+        {"type":"tool.execution_start","data":{"toolCallId":"call_1","toolName":"create","arguments":{}}}
+        {"type":"tool.execution_complete","data":{"toolCallId":"call_1","success":false,"error":{"message":"Tool call arguments truncated by the model output token limit"}}}
+        {"type":"assistant.message","data":{"messageId":"m2","model":"claude-opus-4.8","content":"DONE.","toolRequests":[]}}
+        {"type":"model.call_final_result","data":{"model":"claude-opus-4.8","result":"success"},"ephemeral":true}
+        {"type":"session.usage_checkpoint","data":{"totalNanoAiu":203947025000,"totalPremiumRequests":27,"accountingSnapshot":{"modelMetrics":{"claude-opus-4.8":{"requests":{"count":10,"cost":27},"usage":{"inputTokens":602346,"outputTokens":50992,"cacheReadTokens":521733,"cacheWriteTokens":80591,"reasoningTokens":19666}}}}}}
+        {"type":"result","sessionId":"5f0c1d2e-0000-4000-8000-000000000002","exitCode":0,"usage":{"premiumRequests":27}}
+        """;
+
+    [Fact]
+    public async Task Copilot_cli_records_ai_units_tokens_cost_and_output_limit_truncations()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), CopilotUsageOutput);
+        await using var backend = new CopilotCliBackend(new CopilotCliOptions { Executable = cli.Executable });
+        var events = new List<PipelineEvent>();
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              spec [prompt="Write the spec"]
+              start -> spec -> exit
+            }
+            """, Pipelines.Options(dir, events), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "spec", "backend.json")))!;
+        Assert.Equal(203.947025, metadata["ai_units"]!.GetValue<double>(), 6);
+        Assert.Equal(27, metadata["premium_requests"]!.GetValue<double>());
+        Assert.Equal(10, metadata["model_calls"]!.GetValue<double>());
+        Assert.Equal(602346, metadata["input_tokens"]!.GetValue<double>());
+        Assert.Equal(50992, metadata["output_tokens"]!.GetValue<double>());
+        Assert.Equal(80591, metadata["cache_write_tokens"]!.GetValue<double>());
+        Assert.Equal(2.03947, metadata["cost_usd"]!.GetValue<double>(), 5);
+        Assert.Equal("ai_units", metadata["cost_basis"]!.GetValue<string>());
+        Assert.False(metadata["cost_estimated"]!.GetValue<bool>());
+        Assert.Equal(1, metadata["output_limit_truncations"]!.GetValue<int>());
+        Assert.Contains(Pipelines.Logs(events, "spec"), l => l.StartsWith("output-token limit: the create call", StringComparison.Ordinal));
+
+        // The Copilot CLI has no system-prompt option: the house rules open the prompt instead.
+        Assert.StartsWith("# Instructions", cli.Stdin, StringComparison.Ordinal);
+        Assert.Contains("Write large files incrementally", cli.Stdin, StringComparison.Ordinal);
+        Assert.Contains("Write the spec", cli.Stdin, StringComparison.Ordinal);
+        Assert.True(File.Exists(dir.Combine("run", "spec", "instructions.md")));
+        Assert.False(((Handlers.ICodergenBackend)backend).SupportsSteering);
+
+        var marker = JsonNode.Parse(File.ReadLines(dir.Combine("run", "spec", "cli-events.jsonl")).First())!;
+        Assert.Equal("reactor.attempt", marker["type"]!.GetValue<string>());
+        Assert.NotNull(marker["ts"]);
+    }
+
+    [Fact]
+    public async Task Copilot_cli_sends_instructions_once_per_thread_session()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), CopilotOutput.Replace("\"sessionId\":\"5f0c1d2e-0000-4000-8000-000000000001\",", "", StringComparison.Ordinal));
+        await using var backend = new CopilotCliBackend(new CopilotCliOptions { Executable = cli.Executable });
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [default_fidelity="full", instructions="Use PowerShell syntax."]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan"]
+              build [prompt="Build"]
+              start -> plan -> build -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        // The resumed session already has the instructions from the first stage.
+        Assert.StartsWith("Build", cli.Stdin.TrimStart(), StringComparison.Ordinal);
+        Assert.DoesNotContain("# Instructions", cli.Stdin, StringComparison.Ordinal);
+        Assert.Contains("Use PowerShell syntax.", File.ReadAllText(dir.Combine("run", "build", "instructions.md")), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_killed_copilot_cli_run_is_accounted_from_the_session_state_and_keeps_its_last_words()
+    {
+        using var dir = new TempDir();
+        var at = DateTimeOffset.UtcNow.AddSeconds(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", System.Globalization.CultureInfo.InvariantCulture);
+        var records = $$$$"""
+            {"type":"session.start","data":{},"timestamp":"{{{{at}}}}"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":26625,"outputTokens":189,"cacheReadTokens":0,"cacheWriteTokens":26621,"reasoningTokens":15,"cost":27.0,"initiator":"user","copilotUsage":{"totalNanoAiu":17112625000}}},"timestamp":"{{{{at}}}}"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":28948,"outputTokens":205,"cacheReadTokens":26621,"cacheWriteTokens":2325,"reasoningTokens":26,"cost":27.0,"initiator":"agent","copilotUsage":{"totalNanoAiu":3297675000}}},"timestamp":"{{{{at}}}}"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":1,"outputTokens":1,"cost":27.0,"initiator":"user"}},"timestamp":"2020-01-01T00:00:00.000Z"}
+            """;
+        var home = dir.Combine("copilot-home");
+        var cli = FakeCli.Create(
+            dir.Combine("cli"),
+            CopilotUsageOutput.Split('\n')[0] + "\n" + CopilotUsageOutput.Split('\n')[1],
+            sleepSeconds: 60,
+            printBeforeSleep: true,
+            sessionStateRoot: Path.Combine(home, "session-state"),
+            sessionEvents: records);
+        await using var backend = new CopilotCliBackend(new CopilotCliOptions { Executable = cli.Executable, CopilotHome = home });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var cancel = CancelOnceRecordedAsync(cts, dir.Combine("run", "spec", "cli-events.jsonl"), "model.call_final_result");
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              spec [prompt="Write the spec"]
+              start -> spec -> exit
+            }
+            """, Pipelines.Options(dir), cts.Token);
+        await cancel;
+
+        Assert.True(result.Cancelled);
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "spec", "backend.json")))!;
+        Assert.Equal("cancelled", metadata["outcome"]!.GetValue<string>());
+        Assert.Equal("session-state", metadata["usage_source"]!.GetValue<string>());
+        Assert.Equal(2, metadata["model_calls"]!.GetValue<double>());
+        Assert.Equal(26625 + 28948, metadata["input_tokens"]!.GetValue<double>());
+        Assert.Equal(27, metadata["premium_requests"]!.GetValue<double>());
+        Assert.Equal(20.4103, metadata["ai_units"]!.GetValue<double>(), 6);
+        Assert.Equal("ai_units", metadata["cost_basis"]!.GetValue<string>());
+        Assert.Equal("claude-opus-4.8", metadata["model"]!.GetValue<string>());
+        Assert.Equal("Writing the spec in one go.\n", File.ReadAllText(dir.Combine("run", "spec", "response.partial.md")));
+    }
+
+    [Fact]
+    public async Task A_killed_copilot_cli_run_without_usage_estimates_premium_requests_from_the_price_table()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(
+            dir.Combine("cli"),
+            """{"type":"assistant.message","data":{"messageId":"m1","model":"claude-haiku-4.5","content":"Starting.","toolRequests":[]}}""",
+            sleepSeconds: 60,
+            printBeforeSleep: true);
+        await using var backend = new CopilotCliBackend(new CopilotCliOptions { Executable = cli.Executable, CopilotHome = dir.Combine("empty-home") });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var cancel = CancelOnceRecordedAsync(cts, dir.Combine("run", "spec", "cli-events.jsonl"), "Starting.");
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              spec [prompt="Write the spec"]
+              start -> spec -> exit
+            }
+            """, Pipelines.Options(dir), cts.Token);
+        await cancel;
+
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "spec", "backend.json")))!;
+        Assert.Equal(0.33, metadata["premium_requests"]!.GetValue<double>());
+        Assert.True(metadata["premium_requests_estimated"]!.GetValue<bool>());
+
+        // The built-in price table has no premium request price, so the estimate is not converted to USD.
+        Assert.Null(metadata["cost_usd"]);
+        Assert.Null(metadata["cost_basis"]);
+    }
+
+    [Fact]
+    public void Premium_requests_are_priced_when_the_price_table_has_a_premium_request_price()
+    {
+        var table = new Reactor.Llm.PriceTable([new Reactor.Llm.ModelPrice { Id = "claude-haiku-4.5", Input = 1, Output = 5, LegacyPremiumMultiplier = 0.33 }], premiumRequestUsd: 0.04);
+        var metadata = new Dictionary<string, object?> { ["premium_requests"] = 0.33 };
+
+        StageCost.AddCopilot(metadata, "claude-haiku-4.5", table, premiumRequestsEstimated: true);
+
+        Assert.Equal(0.0132, (double)metadata["cost_usd"]!, 6);
+        Assert.Equal("premium_requests", metadata["cost_basis"]);
+        Assert.Equal(true, metadata["cost_estimated"]);
+    }
+
+    internal const string ClaudeUsageOutput = """
+        {"type":"system","subtype":"init","cwd":"/work","session_id":"S","tools":["Write"],"model":"claude-sonnet-4-5-20250929"}
+        {"type":"assistant","message":{"id":"m1","model":"claude-sonnet-4-5-20250929","role":"assistant","content":[{"type":"text","text":"Halfway there."}],"usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","message":{"id":"m1","model":"claude-sonnet-4-5-20250929","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"a.txt","content":"x"}}],"usage":{"input_tokens":1000,"output_tokens":120,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","message":{"id":"m2","model":"claude-sonnet-4-5-20250929","role":"assistant","content":[{"type":"text","text":"Still working."}],"usage":{"input_tokens":2000,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        """;
+
+    [Fact]
+    public async Task Claude_code_gets_instructions_as_system_prompt_and_a_killed_run_is_priced_from_its_messages()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), ClaudeUsageOutput, sleepSeconds: 60, printBeforeSleep: true);
+        await using var backend = new ClaudeCodeBackend(new ClaudeCodeOptions { Executable = cli.Executable });
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var cancel = CancelOnceRecordedAsync(cts, dir.Combine("run", "plan", "cli-events.jsonl"), "Still working.");
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [instructions="Use PowerShell syntax."]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan"]
+              start -> plan -> exit
+            }
+            """, Pipelines.Options(dir), cts.Token);
+        await cancel;
+
+        var invocation = Assert.Single(cli.Invocations);
+        Assert.Contains("--append-system-prompt", invocation);
+        Assert.Contains("Write large files incrementally", invocation);
+        Assert.Contains("Use PowerShell syntax.", invocation);
+        Assert.DoesNotContain("# Instructions", cli.Stdin, StringComparison.Ordinal);
+
+        // Two model calls (m1 twice, last usage wins): 3,000 input and 200 output tokens at $3 / $15 per 1M.
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "plan", "backend.json")))!;
+        Assert.Equal(3000, metadata["input_tokens"]!.GetValue<long>());
+        Assert.Equal(200, metadata["output_tokens"]!.GetValue<long>());
+        Assert.Equal(2, metadata["model_calls"]!.GetValue<int>());
+        Assert.Equal(((3000 * 3.0) + (200 * 15.0)) / 1e6, metadata["cost_usd"]!.GetValue<double>(), 9);
+        Assert.True(metadata["cost_estimated"]!.GetValue<bool>());
+        Assert.Equal("Still working.\n", File.ReadAllText(dir.Combine("run", "plan", "response.partial.md")));
+    }
+
+    [Fact]
+    public async Task Claude_code_reported_cost_is_normalized()
+    {
+        using var dir = new TempDir();
+        var cli = FakeCli.Create(dir.Combine("cli"), ClaudeOutput);
+        await using var backend = new ClaudeCodeBackend(new ClaudeCodeOptions { Executable = cli.Executable });
+
+        await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              plan [prompt="Plan"]
+              start -> plan -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "plan", "backend.json")))!;
+        Assert.Equal(0.0123, metadata["cost_usd"]!.GetValue<double>());
+        Assert.Equal("tokens", metadata["cost_basis"]!.GetValue<string>());
+        Assert.False(metadata["cost_estimated"]!.GetValue<bool>());
     }
 }
 

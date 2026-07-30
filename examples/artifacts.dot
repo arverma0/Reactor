@@ -6,10 +6,13 @@
 // A failing tool still records its stdout, so when the tests fail, `implement` reads the failing report.
 // The test stage echoes a placeholder so the example runs anywhere: set its tool_command to your test runner
 // (e.g. "python -m pytest -q", "dotnet test", "npm test").
+// default_on_fail="stop" ends the run when a stage fails and nothing routes the failure (instead of carrying on as if it
+// had succeeded), and max_visits bounds the fix/revise loop: a fifth visit to `implement` fails the run.
 digraph artifacts {
     graph [
         goal="Add a slugify(text) function with unit tests to this repository",
-        default_max_retries=1
+        default_max_retries=1,
+        default_on_fail="stop"
     ]
 
     start [shape=Mdiamond]
@@ -19,7 +22,7 @@ digraph artifacts {
                prompt="Write a short specification for: $goal. Cover inputs, outputs, edge cases, and examples."]
     architect [label="Design", inputs="spec", outputs="design:docs/DESIGN.md",
                prompt="Design an implementation of the specification: files, functions, and a test plan."]
-    implement [label="Implement", inputs="spec, design, test_report, verdict", outputs="changes",
+    implement [label="Implement", inputs="spec, design, test_report, verdict", outputs="changes", max_visits=4,
                prompt="Implement the design, with unit tests. If a failing test report or a review verdict is listed, address it first. End with a short summary of what you changed."]
     test      [shape=parallelogram, label="Run tests", outputs="test_report", max_retries=0, timeout="10m",
                tool_command="echo No tests were run: set tool_command to your test runner"]

@@ -17,8 +17,8 @@ public sealed record ClaudeCodeOptions : CliAgentOptions
 /// <summary>
 /// Runs stages with Claude Code (<c>claude</c>) in print mode with streaming JSON output:
 /// <c>-p --output-format stream-json --verbose --dangerously-skip-permissions [--model m] [--effort e]</c> plus
-/// <c>--session-id</c> for a new session or <c>--resume</c> to continue a thread. The prompt goes on stdin. The executable
-/// can be set with <c>REACTOR_CLAUDE_CLI</c>.
+/// <c>--session-id</c> for a new session or <c>--resume</c> to continue a thread, and the stage's standing instructions
+/// with <c>--append-system-prompt</c>. The prompt goes on stdin. The executable can be set with <c>REACTOR_CLAUDE_CLI</c>.
 /// </summary>
 public sealed partial class ClaudeCodeBackend(ClaudeCodeOptions? options = null)
     : CliAgentBackend(options ?? new ClaudeCodeOptions(), "claude", "REACTOR_CLAUDE_CLI")
@@ -61,7 +61,26 @@ public sealed partial class ClaudeCodeBackend(ClaudeCodeOptions? options = null)
             args.AddRange(["--max-budget-usd", budget.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
         }
 
+        if (invocation.Instructions.Length > 0)
+        {
+            // cmd.exe cannot carry line breaks inside an argument; a batch-file wrapper gets the instructions on one line.
+            var instructions = invocation.ViaShell ? string.Join(" ", invocation.Instructions.ReplaceLineEndings("\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) : invocation.Instructions;
+            args.AddRange(["--append-system-prompt", instructions]);
+        }
+
         return args;
+    }
+
+    /// <summary>Claude Code appends the stage's standing instructions to its system prompt (<c>--append-system-prompt</c>).</summary>
+    protected internal override bool TakesInstructionsAsArgument(string instructions) =>
+        instructions is not null && instructions.Length <= MaxInstructionArgumentLength;
+
+    protected override void AddCostMetadata(Dictionary<string, object?> metadata)
+    {
+        ArgumentNullException.ThrowIfNull(metadata);
+
+        // Claude Code reports total_cost_usd when a run completes; a killed run is priced from the usage parsed so far.
+        StageCost.AddApi(metadata, metadata.GetValueOrDefault("model") as string, inputIncludesCache: false);
     }
 
     protected internal override ICliOutputParser CreateParser() => new ClaudeOutputParser(Options.LogAssistantText);
@@ -106,6 +125,7 @@ public sealed partial class ClaudeCodeBackend(ClaudeCodeOptions? options = null)
 internal sealed class ClaudeOutputParser(bool logAssistantText) : ICliOutputParser
 {
     private readonly Dictionary<string, string> _toolNames = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (long Input, long Output, long CacheRead, long CacheWrite)> _usageByMessage = new(StringComparer.Ordinal);
 
     public CliRunSummary Summary { get; } = new();
 
@@ -147,12 +167,14 @@ internal sealed class ClaudeOutputParser(bool logAssistantText) : ICliOutputPars
                     Summary.Model = model;
                 }
 
+                TrackUsage(message);
                 foreach (var part in (message?["content"] as JsonArray ?? []).OfType<JsonObject>())
                 {
                     switch (Str(part, "type"))
                     {
                         case "text" when !string.IsNullOrWhiteSpace(Str(part, "text")):
                             var text = Str(part, "text")!;
+                            Summary.LastAssistantText = text.Trim();
                             if (logAssistantText)
                             {
                                 log("assistant: " + LogText.Clip(text, 300), "debug");
@@ -183,6 +205,11 @@ internal sealed class ClaudeOutputParser(bool logAssistantText) : ICliOutputPars
                         var toolName = Str(part, "tool_use_id") is { } useId && _toolNames.TryGetValue(useId, out var n) ? n : "tool";
                         var content = part["content"] is JsonValue v && v.TryGetValue<string>(out var s) ? s : part["content"]?.ToJsonString();
                         log($"✗ {toolName}: {LogText.Clip(content, 300)}", "warn");
+                        if (OutputLimit.IsTruncation(content))
+                        {
+                            Summary.OutputLimitTruncations++;
+                            log(OutputLimit.Warning(toolName), "warn");
+                        }
                     }
                 }
 
@@ -221,4 +248,40 @@ internal sealed class ClaudeOutputParser(bool logAssistantText) : ICliOutputPars
 
     private static string? Str(JsonObject? obj, string key) =>
         obj?[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+    /// <summary>
+    /// Keeps running token totals from the per-message usage of assistant events (one model call per message id; the
+    /// events of one message repeat its usage), so a run killed before its <c>result</c> still records what it used.
+    /// The <c>result</c> event's totals replace them.
+    /// </summary>
+    private void TrackUsage(JsonObject? message)
+    {
+        if (Summary.Completed || message?["usage"] is not JsonObject usage)
+        {
+            return;
+        }
+
+        var id = Str(message, "id") ?? $"#{_usageByMessage.Count}";
+        _usageByMessage[id] = (Long(usage["input_tokens"]), Long(usage["output_tokens"]), Long(usage["cache_read_input_tokens"]), Long(usage["cache_creation_input_tokens"]));
+        Summary.ModelCalls = _usageByMessage.Count;
+        Summary.Metadata["input_tokens"] = _usageByMessage.Values.Sum(u => u.Input);
+        Summary.Metadata["output_tokens"] = _usageByMessage.Values.Sum(u => u.Output);
+        Summary.Metadata["cache_read_tokens"] = _usageByMessage.Values.Sum(u => u.CacheRead);
+        Summary.Metadata["cache_write_tokens"] = _usageByMessage.Values.Sum(u => u.CacheWrite);
+    }
+
+    private static long Long(JsonNode? node)
+    {
+        if (node is not JsonValue value)
+        {
+            return 0;
+        }
+
+        if (value.TryGetValue<long>(out var whole))
+        {
+            return whole;
+        }
+
+        return value.TryGetValue<double>(out var number) && double.IsFinite(number) ? (long)number : 0;
+    }
 }

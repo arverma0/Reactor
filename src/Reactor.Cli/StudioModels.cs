@@ -31,8 +31,11 @@ internal static class StudioModels
                 {
                     try
                     {
+                        var prices = PriceTable.Copilot;
                         foreach (var model in await copilot.ListModelsAsync(cancellationToken).ConfigureAwait(false))
                         {
+                            var price = prices.Find(model.Id);
+                            var priced = price?.Rates.IsComplete == true;
                             models.Add(new ModelDescriptor
                             {
                                 Id = model.Id,
@@ -42,6 +45,11 @@ internal static class StudioModels
                                 ContextWindow = model.ContextWindow > 0 ? model.ContextWindow : null,
                                 ReasoningEfforts = model.ReasoningEfforts,
                                 BillingMultiplier = model.BillingMultiplier,
+                                InputCostPerMillion = priced ? price!.Input : null,
+                                CachedInputCostPerMillion = priced ? price!.CachedInput : null,
+                                CacheWriteCostPerMillion = priced ? price!.CacheWrite : null,
+                                OutputCostPerMillion = priced ? price!.Output : null,
+                                PriceSource = priced ? "price_table" : null,
                                 PolicyState = model.PolicyState,
                                 Available = model.Enabled,
                             });
@@ -58,6 +66,7 @@ internal static class StudioModels
                 var providers = selection.Client?.ProviderNames ?? [];
                 foreach (var model in ModelCatalog.ListModels())
                 {
+                    var priced = model.InputCostPerMillion is not null && model.OutputCostPerMillion is not null;
                     models.Add(new ModelDescriptor
                     {
                         Id = model.Id,
@@ -68,6 +77,11 @@ internal static class StudioModels
                         SupportsTools = model.SupportsTools,
                         SupportsReasoning = model.SupportsReasoning,
                         ReasoningEfforts = model.SupportsReasoning ? ["low", "medium", "high"] : [],
+                        InputCostPerMillion = priced ? model.InputCostPerMillion : null,
+                        CachedInputCostPerMillion = priced ? model.CachedInputCostPerMillion : null,
+                        CacheWriteCostPerMillion = priced ? model.CacheWriteCostPerMillion : null,
+                        OutputCostPerMillion = priced ? model.OutputCostPerMillion : null,
+                        PriceSource = priced ? "catalog" : null,
                         Available = providers.Contains(model.Provider, StringComparer.Ordinal),
                     });
                 }

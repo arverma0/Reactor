@@ -13,7 +13,9 @@ namespace Reactor.Handlers;
 /// <see cref="ICodergenBackend"/> (or simulates a response), writes <c>response.md</c> and <c>status.json</c>,
 /// and honors the status-file contract: if the backend's agent wrote <c>status.json</c> during the stage, that outcome wins.
 /// Declared artifact <c>outputs</c> are then checked and recorded (see <see cref="StageArtifacts.CompleteAsync"/>); in
-/// simulation mode file outputs are recorded without being written.
+/// simulation mode file outputs are recorded without being written. Reactor extensions: the prompt states the stage's time
+/// limit, a retried stage gets a "Previous attempt" hand-off (see <see cref="PreviousAttempt"/>), and when the backend
+/// throws, the usage it attached (<see cref="BackendMetadata"/>) is still written to <c>backend.json</c>.
 /// </summary>
 public sealed class CodergenHandler : INodeHandler
 {
@@ -38,7 +40,18 @@ public sealed class CodergenHandler : INodeHandler
         IReadOnlyDictionary<string, object?> metadata = new Dictionary<string, object?>();
         if (backend is not null)
         {
-            var result = await backend.RunAsync(node, prompt, context, cancellationToken).ConfigureAwait(false);
+            CodergenResult result;
+            try
+            {
+                result = await backend.RunAsync(node, prompt, context, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // A failed, timed-out, or cancelled stage still records what it spent (and the agent's last words).
+                await RecordFailedAttemptAsync(stageDir, ex, cancellationToken.IsCancellationRequested).ConfigureAwait(false);
+                throw;
+            }
+
             metadata = result.Metadata;
             if (metadata.Count > 0)
             {
@@ -168,6 +181,18 @@ public sealed class CodergenHandler : INodeHandler
             sb.AppendLine().AppendLine().Append(artifacts);
         }
 
+        // Reactor extension: a retried stage is handed what its previous attempt did and how it ended.
+        if (PreviousAttempt.From(context, node.Id) is { } previous)
+        {
+            sb.AppendLine().AppendLine().Append(previous.PromptSection());
+        }
+
+        // Reactor extension: agents can pace themselves when they know the stage's time limit.
+        if (node.Timeout is { } limit && limit > TimeSpan.Zero)
+        {
+            sb.AppendLine().AppendLine().Append(StageTiming.PromptLine(limit));
+        }
+
         if (backend is not null && backend.SupportsStatusFileFor(node) && includeStatusProtocol)
         {
             sb.AppendLine().AppendLine().Append(StatusProtocol(node, graph, stageDir));
@@ -185,11 +210,13 @@ public sealed class CodergenHandler : INodeHandler
         sb.AppendLine("---");
         sb.AppendLine("## Reporting the stage outcome (optional)");
         sb.AppendLine("Do the task above first, using your tools to make the actual changes. This task is one stage of an automated");
-        sb.AppendLine("pipeline, and success is recorded automatically when you finish. Only if the task could not be completed, or");
-        sb.AppendLine("you need to choose the next step, write a small JSON status file as your final action:");
+        sb.AppendLine("pipeline, and success is recorded automatically when you finish. Only if the task could not be completed,");
+        sb.AppendLine("you need to choose the next step, or the task asks you to report metrics, write a small JSON status file as");
+        sb.AppendLine("your final action (write only this one file; there is no need to look at or list its directory):");
         sb.Append("  ").AppendLine(Path.Combine(Path.GetFullPath(stageDir), "status.json"));
         sb.AppendLine("Format: {\"outcome\": \"success\" | \"fail\" | \"retry\" | \"partial_success\", \"notes\": \"short summary\",");
-        sb.AppendLine("         \"failure_reason\": \"why it failed\", \"preferred_label\": \"next step label\", \"context_updates\": {\"key\": \"value\"}}");
+        sb.AppendLine("         \"failure_reason\": \"why it failed\", \"preferred_label\": \"next step label\", \"context_updates\": {\"key\": \"value\"},");
+        sb.AppendLine("         \"metrics\": {\"name\": 42}}   (metrics: numbers that measure the result, only when the task asks for them)");
         var labels = graph.OutgoingEdges(node.Id).Select(e => e.Label).Where(l => l.Length > 0).Distinct(StringComparer.Ordinal).ToList();
         if (labels.Count > 0)
         {
@@ -202,6 +229,46 @@ public sealed class CodergenHandler : INodeHandler
 
     private static Task WriteStatusAsync(string stageDir, Outcome outcome, CancellationToken cancellationToken) =>
         WriteJsonAsync(Path.Combine(stageDir, "status.json"), outcome.ToStatusJson(), cancellationToken);
+
+    /// <summary>File name for the last assistant message of an attempt that ended without a response.</summary>
+    public const string PartialResponseFileName = "response.partial.md";
+
+    /// <summary>
+    /// Writes <c>backend.json</c> for an attempt that threw: the metadata the backend attached (see <see cref="BackendMetadata"/>)
+    /// plus <c>outcome</c> (<c>cancelled</c> when the stage's token was cancelled — the engine marks timeouts — else
+    /// <c>error</c>) and <c>error</c>; the agent's last message, if any, goes to <see cref="PartialResponseFileName"/>.
+    /// Best effort: never masks the original exception.
+    /// </summary>
+    public static async Task RecordFailedAttemptAsync(string stageDir, Exception error, bool cancelled)
+    {
+        try
+        {
+            var record = new Dictionary<string, object?>(StringComparer.Ordinal);
+            if (BackendMetadata.TryGet(error, out var attached))
+            {
+                foreach (var (key, value) in attached)
+                {
+                    record[key] = value;
+                }
+            }
+
+            var lastText = record.GetValueOrDefault(BackendMetadata.LastAssistantText) as string;
+            record.Remove(BackendMetadata.LastAssistantText);
+            record["outcome"] = cancelled || error is OperationCanceledException ? "cancelled" : "error";
+            record["error"] = error.GetBaseException().Message;
+            record["ended_at"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+            Directory.CreateDirectory(stageDir);
+            await WriteJsonAsync(Path.Combine(stageDir, "backend.json"), ContextValues.ToJson(ContextValues.Normalize(record)), CancellationToken.None).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(lastText))
+            {
+                await File.WriteAllTextAsync(Path.Combine(stageDir, PartialResponseFileName), lastText.Trim() + "\n", CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Recording is best effort; the stage's own failure is what matters.
+        }
+    }
 
     private static Task WriteJsonAsync(string path, JsonNode? json, CancellationToken cancellationToken) =>
         File.WriteAllTextAsync(path, json?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "null", cancellationToken);

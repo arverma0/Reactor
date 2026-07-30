@@ -66,10 +66,13 @@ public sealed class StylesheetParseException(string message, int position) : Exc
 /// </summary>
 public sealed partial class ModelStylesheet
 {
-    /// <summary>The recognized properties.</summary>
+    /// <summary>
+    /// The recognized properties: the spec's <c>llm_model</c>, <c>llm_provider</c>, <c>reasoning_effort</c>, and the Reactor
+    /// extension <c>instructions</c> (standing instructions for the matched stages; quote the value).
+    /// </summary>
     public static IReadOnlySet<string> Properties { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
-        AttrKeys.LlmModel, AttrKeys.LlmProvider, AttrKeys.ReasoningEffort,
+        AttrKeys.LlmModel, AttrKeys.LlmProvider, AttrKeys.ReasoningEffort, AttrKeys.Instructions,
     };
 
     public ModelStylesheet(IReadOnlyList<StyleRule> rules)

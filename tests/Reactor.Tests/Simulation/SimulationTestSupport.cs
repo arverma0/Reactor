@@ -6,9 +6,21 @@ using Reactor.Tests.Support;
 
 namespace Reactor.Tests.Simulation;
 
+/// <summary>
+/// The Monte Carlo test classes share one collection, so they run one at a time: the simulator already uses every core,
+/// and several simulations at once starve the thread pool for timing-sensitive tests elsewhere.
+/// </summary>
+[CollectionDefinition(Sim.Collection)]
+public sealed class SimulationCollection
+{
+}
+
 /// <summary>Shared pipelines and helpers for simulation tests.</summary>
 internal static class Sim
 {
+    /// <summary>The xUnit collection of the Monte Carlo test classes.</summary>
+    public const string Collection = "Simulation";
+
     /// <summary>implement → test (tool) → exit on success, → fix on failure; fix → test.</summary>
     public const string TestFixLoop = """
         digraph Loop {

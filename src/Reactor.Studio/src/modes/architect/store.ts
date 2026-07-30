@@ -15,10 +15,18 @@ export type ArchitectMode = "draft" | "revise" | "critique";
 
 export interface ServerForecast {
   happy_path: number;
+  /** Clean landing rate under the realistic preset. */
   realistic: number;
+  /** Any landing (clean or with failed stages) under the realistic preset. */
+  realistic_landed?: number;
+  /** Share of realistic flights that land with failed stages behind them. */
+  failed_stage_landings?: number;
+  failed_stages?: string[];
   step_limit: number;
   mean_steps: number;
   p90_steps: number;
+  mean_duration_ms?: number;
+  p90_duration_ms?: number;
   stages: number;
   routes: number;
   failures: { kind: string; reason: string; share: number; last_node?: string | null }[];
@@ -34,6 +42,8 @@ export interface ArchitectState {
   rationale: string | null;
   proposal: { dot: string; checked: boolean; valid: boolean; problems: string[]; warnings: string[]; forecast: ServerForecast | null } | null;
   feedback: string | null;
+  /** The drafting model's self-review of the checked draft against the brief (`VERDICT: PASS` or `VERDICT: REVISE` with changes). */
+  review?: string | null;
   error: string | null;
 }
 

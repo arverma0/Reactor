@@ -37,7 +37,7 @@ exceptions) plug in without a dependency. `Reactor.Agent` and `Reactor.Llm` are 
 
 ```text
 DOT ──DotParser──▶ Graph ──transforms──▶ Graph ──PipelineValidator──▶ diagnostics ──PipelineRunner──▶ PipelineResult
-                         ($goal expansion,                (23 rules; errors
+                         ($goal expansion,                (25 rules; errors
                           model stylesheet,               stop the run)
                           custom IGraphTransform)
 ```
@@ -67,6 +67,24 @@ Supporting pieces:
   the join node.
 - **Child pipelines** — the manager handler starts a child run through `IChildPipelineLauncher` (same runner,
   backend, and interviewer, separate logs root) and observes it via its events.
+- **Workspaces** (Reactor extension, `Reactor.Workspaces`) — one `WorkspaceTracker` per execution, reached by
+  handlers through `RunServices.Workspace`. The engine runs every node through it (`RunTrackedNodeAsync` wraps the
+  retry loop): it waits for the node's `concurrency_group` semaphore, snapshots the stage's working directory before
+  and after the visit, writes `changes.json`, emits `WorkspaceChanged`, and checks `write_scope` (holding the
+  stage's `StageCompleted` event when `write_scope_enforce` may still turn the outcome into a failure). Snapshots
+  use `GitSnapshotter` in a git work tree — a private index (`GIT_INDEX_FILE` in the run directory), `git add -A`,
+  `write-tree`, and `commit-tree` onto `refs/reactor/runs/<run>/…`, so the user's index, `HEAD`, and branches are never
+  touched — and `WalkSnapshotter` (size/time/SHA-256 with a cache) elsewhere. The parallel handler asks it for branch
+  workspaces (`branch_workdir`: git worktrees of a snapshot commit, or copies) and sets each branch context's
+  `internal.working_directory`; `PipelineContext.WorkingDirectory` resolves it (falling back to the run's directory)
+  for every consumer — tools, backends' `StageSettings`, tool hooks, artifact files, child pipelines. The fan-in calls
+  it to promote the winner, and the runner disposes it after the run (removing worktrees, pruning ones crashed runs
+  left behind). Simulations (no run directory or no backend) never snapshot or create workspaces. With checkpoint
+  history on, the runner also records the main workspace's snapshot next to each top-level checkpoint snapshot
+  (`checkpoints/<NNNN-node>.workspace.json`, `CheckpointWorkspace`), reusing the stage's "after" snapshot when nothing
+  ran since; `WorkspaceRewind.RestoreAsync` puts a directory back to such a snapshot (undo snapshot first, then
+  `read-tree` + `checkout-index` through a temporary index), which `PipelineRunManager.StartFromCheckpointAsync` uses
+  for forks with `restore_workspace`.
 - **Human interaction** — handlers only see `IInterviewer` (`AskAsync(Question)`); console, queue, callback,
   auto-approve, recording, and the server's web interviewer are interchangeable. Timeouts cancel the ask.
 - **Events** — typed records (`StageStarted`, `StageLog`, …) flow through `PipelineEventBus` to the run's
@@ -82,9 +100,12 @@ Supporting pieces:
   outcomes, last fidelity/thread, history) and continues after the checkpointed node; a `full`-fidelity stage right
   after resume degrades to `summary:high` because agent sessions are not persisted.
 - **Simulation** — `Reactor.Simulation` (the Studio's wind tunnel) runs the real engine on a dedicated runner whose
-  codergen, tool, manager, and custom handlers return scenario-drawn outcomes; human gates and parallel nodes keep their
-  real handlers. Draws are a pure function of (seed, sample, node, execution), so Monte Carlo samples replay exactly as
-  traces; samples run in memory (`PipelineRunnerOptions.PersistRunState = false`), without any engine file I/O.
+  codergen, tool, manager, and custom handlers return scenario-drawn outcomes (with outcome metrics, durations, and
+  costs); human gates and parallel nodes keep their real handlers. Draws are a pure function of (seed, sample, node,
+  execution), so Monte Carlo samples replay exactly as traces; samples run in memory
+  (`PipelineRunnerOptions.PersistRunState = false`), without any engine file I/O. Reports separate clean landings from
+  landings with failed stages (from `FailedStageContinued` events). The scenario presets (`SimulationPreset`) are the
+  one definition shared by `reactor simulate`, the simulate API, the Architect's checks, and the Studio.
 
 ## Agent loop (Reactor.Agent)
 
@@ -106,7 +127,8 @@ user input ─▶ [steering] ─▶ LLM request (system prompt + history + tools
 - **Provider profiles** pair a tool set and system prompt with a model family (OpenAI/codex, Anthropic/Claude Code,
   Gemini/gemini-cli); custom tools register on the profile's `ToolRegistry`.
 - **Execution environments** (`IExecutionEnvironment`) isolate where tools run: `LocalExecutionEnvironment`
-  (process trees killed on timeout/abort, sensitive environment variables filtered, ripgrep when available), plus
+  (process trees killed on timeout/abort — in a job object on Windows, a process group elsewhere, so orphaned
+  grandchildren are reached too — sensitive environment variables filtered, ripgrep when available), plus
   logging, read-only, and scoped (subdirectory) wrappers.
 - **Subagents** (`spawn_agent`, `send_input`, `wait`, `close_agent`) run child sessions sharing the environment,
   with a depth limit; their events are forwarded with an `agent_id`.

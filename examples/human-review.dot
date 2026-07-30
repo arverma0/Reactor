@@ -2,7 +2,7 @@
 // (console prompt, `--answer A`, or the web console / POST /pipelines/{id}/questions/{qid}/answer).
 // After 30 minutes without an answer it takes the default choice.
 digraph human_review {
-    graph [goal="Add a CONTRIBUTING.md that explains how to build and test this repository"]
+    graph [goal="Add a CONTRIBUTING.md that explains how to build and test this repository", default_on_fail="stop"]
 
     start [shape=Mdiamond]
     exit  [shape=Msquare]

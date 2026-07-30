@@ -601,4 +601,88 @@ public sealed class AgentLoopBackendTests
         Assert.StartsWith("claude-", latest);
         Assert.Throws<ConfigurationError>(() => ModelResolution.Resolve(Stage("nobody", null), client, null, null));
     }
+
+    [Fact]
+    public async Task Standing_instructions_reach_the_system_prompt_and_the_stage_directory()
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create();
+        llm.Responder = _ => FakeLlm.Text("done");
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              graph [instructions="Use PowerShell syntax."]
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              implement [prompt="Do it", instructions="Write tests first.", agent.instructions="Legacy rule."]
+              start -> implement -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Success, result.Status);
+        var system = llm.Requests[0].Messages[0].Text;
+        Assert.Contains("Write large files incrementally", system, StringComparison.Ordinal);
+        Assert.Contains("## Pipeline instructions\nUse PowerShell syntax.", system, StringComparison.Ordinal);
+        Assert.Contains("## Stage instructions\nWrite tests first.\n\nLegacy rule.", system, StringComparison.Ordinal);
+        var recorded = File.ReadAllText(dir.Combine("run", "implement", StageInstructions.FileName));
+        Assert.Contains("Legacy rule.", recorded, StringComparison.Ordinal);
+        Assert.True(((Handlers.ICodergenBackend)backend).SupportsSteering);
+
+        // The transcript opens with the attempt marker, and every record carries a timestamp.
+        var lines = File.ReadAllLines(dir.Combine("run", "implement", "agent-events.jsonl"));
+        var marker = JsonNode.Parse(lines[0])!;
+        Assert.Equal("reactor.attempt", marker["type"]!.GetValue<string>());
+        Assert.Equal(1, marker["attempt"]!.GetValue<int>());
+        Assert.All(lines, l => Assert.NotNull(JsonNode.Parse(l)!["ts"]));
+    }
+
+    [Fact]
+    public async Task A_timed_out_attempt_records_its_usage_and_last_words_and_each_attempt_is_marked()
+    {
+        using var dir = new TempDir();
+        var (backend, llm) = Create();
+        llm.BeforeRespond = (r, ct) => ToolResultCount(r) > 0 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask;
+        llm.Responder = _ => new Response
+        {
+            Id = "r1",
+            Model = "test-model",
+            Message = new Message
+            {
+                Role = Role.Assistant,
+                Content = [ContentPart.TextPart("Writing the first half now."), ContentPart.ToolCallPart("c1", "write_file", JsonNode.Parse(Args(new { file_path = "half.txt", content = "1" })))],
+            },
+            FinishReason = FinishReason.ToolCalls,
+            Usage = new Usage { InputTokens = 120, OutputTokens = 30, TotalTokens = 150 },
+        };
+
+        var result = await Pipelines.Runner(backend).RunAsync("""
+            digraph G {
+              start [shape=Mdiamond]
+              exit [shape=Msquare]
+              implement [prompt="Do it", timeout="3s", max_retries=1]
+              start -> implement -> exit
+            }
+            """, Pipelines.Options(dir), Ct);
+
+        Assert.Equal(StageStatus.Fail, result.NodeOutcomes["implement"].Status);
+        var stage = dir.Combine("run", "implement");
+        var metadata = JsonNode.Parse(File.ReadAllText(Path.Combine(stage, "backend.json")))!;
+        Assert.Equal(120, metadata["input_tokens"]!.GetValue<long>());
+        Assert.Equal(30, metadata["output_tokens"]!.GetValue<long>());
+        Assert.Equal(1, metadata["tool_calls"]!.GetValue<int>());
+        Assert.Equal(2, metadata["attempt"]!.GetValue<int>());
+        Assert.NotNull(metadata["outcome"]);
+        Assert.Null(metadata["last_assistant_text"]);
+        Assert.Equal("Writing the first half now.\n", File.ReadAllText(Path.Combine(stage, "response.partial.md")));
+
+        // Each attempt's transcript opens with its marker (wherever the engine keeps earlier attempts' files).
+        var markers = Directory.GetFiles(stage, "agent-events.jsonl", SearchOption.AllDirectories)
+            .SelectMany(File.ReadAllLines)
+            .Select(l => JsonNode.Parse(l)!)
+            .Where(e => e["type"]?.GetValue<string>() == "reactor.attempt")
+            .Select(e => e["attempt"]!.GetValue<int>())
+            .Order()
+            .ToList();
+        Assert.Equal([1, 2], markers);
+    }
 }

@@ -32,6 +32,9 @@ public static partial class ArchitectApi
     /// <summary>Handler type of the check stage.</summary>
     public const string CheckType = "studio.check";
 
+    /// <summary>Handler type of the self-review stage (the model critiques a passing draft against the brief).</summary>
+    public const string ReviewType = "studio.review";
+
     /// <summary>Drafts (the first and its repairs) before the Architect gives up.</summary>
     public const int MaxDrafts = 3;
 
@@ -54,17 +57,14 @@ public static partial class ArchitectApi
     internal const string Forecast = "architect.forecast";
     internal const string Feedback = "architect.feedback";
     internal const string GiveUp = "architect.give_up";
+    internal const string Review = "architect.review";
 
-    private static readonly SimulationScenario HappyPath = Scenario("""
-        {"defaults": {"codergen": {"outcomes": {"success": 1}}, "tool": {"outcomes": {"success": 1}},
-                      "stack.manager_loop": {"outcomes": {"success": 1}}}}
-        """);
-
-    private static readonly SimulationScenario Realistic = Scenario("""
-        {"defaults": {"codergen": {"outcomes": {"success": 0.9, "retry": 0.03, "fail": 0.07}},
-                      "tool": {"outcomes": {"success": 0.75, "fail": 0.25}},
-                      "stack.manager_loop": {"outcomes": {"success": 0.9, "fail": 0.1}}}}
-        """);
+    /// <summary>
+    /// The draft that passed the checker before the self-review sent it back (<c>architect.checked.proposal</c>, <c>.rationale</c>,
+    /// <c>.forecast</c>, <c>.warnings</c>, <c>.attempt</c>, <c>.changes</c>): restored when the revision cannot pass the checker
+    /// before the drafts run out, so a review never turns a checked draft into a failed run.
+    /// </summary>
+    internal const string Checked = "architect.checked";
 
     /// <summary>Registers the Architect's handlers on the server's runner and maps its endpoints.</summary>
     public static WebApplication MapArchitectApi(this WebApplication app)
@@ -73,6 +73,7 @@ public static partial class ArchitectApi
         var manager = app.Services.GetRequiredService<PipelineRunManager>();
         manager.Runner.Handlers.Register(DesignType, new ArchitectDesignHandler(manager));
         manager.Runner.Handlers.Register(CheckType, new ArchitectCheckHandler(manager));
+        manager.Runner.Handlers.Register(ReviewType, new ArchitectReviewHandler());
         app.Services.GetRequiredService<StudioFeatures>().Add("architect");
         var api = app.MapGroup("/studio/api");
         api.MapPost("/architect", StartAsync);
@@ -142,7 +143,7 @@ public static partial class ArchitectApi
             ".reactor",
             "studio",
             "architect",
-            $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..6]}");
+            $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture)}-{Guid.NewGuid().ToString("N")[..6]}");
         var result = manager.Start(new StartRequest
         {
             Dot = template,
@@ -208,6 +209,7 @@ public static partial class ArchitectApi
                     ["forecast"] = Json(Forecast),
                 },
             ["feedback"] = Text(Feedback),
+            ["review"] = Text(Review),
             ["error"] = run.Error ?? (run.Result is { Status: StageStatus.Fail } failed ? failed.FailureReason : null),
             ["links"] = new JsonObject { ["run"] = $"/pipelines/{run.Id}", ["events"] = $"/pipelines/{run.Id}/events" },
         };
@@ -258,12 +260,12 @@ public static partial class ArchitectApi
         return reader.ReadToEnd();
     }
 
-    /// <summary>Sets the model (and reasoning effort) of the template's design stages by redeclaring them.</summary>
+    /// <summary>Sets the model (and reasoning effort) of the template's design and review stages by redeclaring them.</summary>
     internal static string WithModel(string template, string model, string? effort)
     {
         var graph = DotParser.Parse(template);
         var lines = new StringBuilder();
-        foreach (var node in graph.Nodes.Values.Where(n => n.Type == DesignType))
+        foreach (var node in graph.Nodes.Values.Where(n => n.Type is DesignType or ReviewType))
         {
             lines.Append("    ").Append(node.Id).Append(" [llm_model=\"").Append(model).Append('"');
             if (effort is not null)
@@ -334,6 +336,79 @@ public static partial class ArchitectApi
         return sb.ToString().TrimEnd().ReplaceLineEndings("\n");
     }
 
+    /// <summary>
+    /// The self-review prompt: the model that drafted the pipeline checks it against the brief — the contracts and quality bar
+    /// the brief states, its budget, and the design rules a checker cannot judge — and answers PASS or REVISE with changes.
+    /// </summary>
+    internal static string ComposeReviewPrompt(PipelineContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        var sb = new StringBuilder();
+        sb.AppendLine("You are reviewing a Reactor pipeline (an agent factory written in Graphviz DOT) that you designed, before it is");
+        sb.AppendLine("handed to the person who asked for it. It already parses, validates, and lands in the wind tunnel; judge whether");
+        sb.AppendLine("it does what the brief asks. Check, in this order:");
+        sb.AppendLine();
+        sb.AppendLine("1. Contracts. Every path, file name, script, command, tool, and format the brief names appears in the prompts and");
+        sb.AppendLine("   tool commands exactly as written; no prompt contradicts the brief or another prompt.");
+        sb.AppendLine("2. The quality bar. The brief's central requirement (what would make the person call the result excellent) has a");
+        sb.AppendLine("   stage that produces it and a critic or check that measures it, with routing on the result.");
+        sb.AppendLine("3. Budget. If the brief states a time or cost budget for the run, the forecast below fits it, or the rationale says");
+        sb.AppendLine("   why not; a `Forecast:` warning below compares the forecast with a budget read from the brief's wording — decide");
+        sb.AppendLine("   whether that wording is the run's budget (not a requirement of the product) before acting on it.");
+        sb.AppendLine("4. Loops and defaults. Every rework loop is bounded by max_visits or a visits.<node> condition and escalates");
+        sb.AppendLine("   sensibly; a stage choosing between labeled routes defaults (highest weight) to the conservative one.");
+        sb.AppendLine("5. Evidence and time. Fixers read the failing report; timeouts fit the work (building takes hours, not minutes).");
+        sb.AppendLine("6. Proportion. Human feedback takes a short path (apply, verify, back to the person), not the full review machinery.");
+        sb.AppendLine();
+        sb.AppendLine("Answer with exactly one line `VERDICT: PASS` when nothing important is wrong, or `VERDICT: REVISE` followed by a");
+        sb.AppendLine("numbered list of specific changes (which stage or edge, and what to change). Do not rewrite the pipeline, and do");
+        sb.AppendLine("not create, read, or change files.");
+        sb.AppendLine().AppendLine("## Brief").AppendLine(context.GetString(Brief) is { Length: > 0 } brief ? brief : "(none)").AppendLine();
+        if (context.GetString(Rationale) is { Length: > 0 } rationale)
+        {
+            sb.AppendLine("## Your rationale").AppendLine(rationale).AppendLine();
+        }
+
+        sb.AppendLine("## The pipeline").AppendLine("```dot").AppendLine(context.GetString(Proposal).Trim()).AppendLine("```").AppendLine();
+        if (context.Get(Forecast) is { } forecast)
+        {
+            sb.AppendLine("## Wind tunnel forecast (typical stage durations; real build stages often take longer)")
+                .AppendLine("```json").AppendLine(ContextValues.ToJson(forecast)?.ToJsonString()).AppendLine("```").AppendLine();
+        }
+
+        if (context.Get(Warnings) is List<object?> { Count: > 0 } warnings)
+        {
+            sb.AppendLine("## Checker warnings").AppendJoin("\n", warnings.Select(w => "- " + ContextValues.ToDisplayString(w))).AppendLine().AppendLine();
+        }
+
+        return sb.ToString().TrimEnd().ReplaceLineEndings("\n");
+    }
+
+    /// <summary>The verdict of a self-review answer: REVISE with the requested changes, or PASS (also when no verdict is given).</summary>
+    internal static (bool Revise, string Changes) ParseReview(string answer)
+    {
+        var lines = (answer ?? "").ReplaceLineEndings("\n").Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            // Markdown around the verdict is common: **VERDICT:** REVISE, **VERDICT**: REVISE, `VERDICT: REVISE`, ## VERDICT: …
+            var match = VerdictPattern().Match(lines[i]);
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            if (!string.Equals(match.Groups["v"].Value, "REVISE", StringComparison.OrdinalIgnoreCase))
+            {
+                return (false, "");
+            }
+
+            var changes = string.Join("\n", lines.Skip(i + 1)).Trim();
+            return (true, changes.Length > 0 ? changes : "The review asked for a revision without listing changes.");
+        }
+
+        return (false, "");
+    }
+
     /// <summary>Splits an answer into the pipeline (the last fenced block holding a digraph) and the rest (the rationale).</summary>
     internal static (string? Dot, string Rationale) SplitAnswer(string answer)
     {
@@ -383,10 +458,11 @@ public static partial class ArchitectApi
 
     /// <summary>
     /// Checks a draft: it must parse and validate without errors (warnings are reported), and in the wind tunnel every
-    /// simulated flight must land when every stage succeeds. A second, realistic pass (agents succeed 90% of the time,
-    /// tools 75%) produces the forecast and flags loops that do not converge.
+    /// simulated flight must land when every stage succeeds (the <c>happy</c> preset). A second pass under the
+    /// <c>realistic</c> preset (agents succeed 90% of the time, tools 75%, typical stage durations) produces the forecast —
+    /// landing judged on clean landings, plus time — and flags loops that do not converge and failures that flow onward.
     /// </summary>
-    internal static async Task<CheckResult> CheckAsync(PipelineRunManager manager, string proposal, string mode, string current, CancellationToken cancellationToken)
+    internal static async Task<CheckResult> CheckAsync(PipelineRunManager manager, string proposal, string mode, string current, CancellationToken cancellationToken, string brief = "")
     {
         var problems = new List<string>();
         var warnings = new List<string>();
@@ -411,8 +487,9 @@ public static partial class ArchitectApi
         foreach (var diagnostic in prepared.Diagnostics)
         {
             var text = Describe(diagnostic);
-            if (diagnostic.Severity == Severity.Error)
+            if (diagnostic.Severity == Severity.Error || DesignRules.Contains(diagnostic.Rule))
             {
+                // The Architect's drafts must pass the flow-control rules a person would otherwise have to catch.
                 problems.Add(text);
             }
             else if (diagnostic.Severity == Severity.Warning)
@@ -420,6 +497,8 @@ public static partial class ArchitectApi
                 warnings.Add(text);
             }
         }
+
+        warnings.AddRange(ContractFindings(brief, parsed));
 
         if (mode != "draft" && TryParse(current) is { } original && original.Name != parsed.Name)
         {
@@ -432,17 +511,19 @@ public static partial class ArchitectApi
         }
 
         var custom = manager.CustomHandlerTypes();
-        var happy = await MonteCarloSimulator.RunAsync(prepared.Graph, HappyPath, new MonteCarloOptions { Runs = 60, MaxSteps = 300, Seed = 1, CustomHandlerTypes = custom }, cancellationToken).ConfigureAwait(false);
-        if (happy.SuccessRate < 1)
+        var happyScenario = SimulationPreset.Find(SimulationPreset.Happy)!.ToScenario(prepared.Graph);
+        var happy = await MonteCarloSimulator.RunAsync(prepared.Graph, happyScenario, new MonteCarloOptions { Runs = 60, MaxSteps = 300, Seed = 1, CustomHandlerTypes = custom }, cancellationToken).ConfigureAwait(false);
+        if (happy.CleanSuccessRate < 1)
         {
             var failure = happy.Failures.FirstOrDefault();
             var where = failure?.LastNode is { } last ? $", last stage '{last}'" : "";
             problems.Add(
-                $"Wind tunnel: even with every stage succeeding, {Percent(1 - happy.SuccessRate)} of simulated flights do not land " +
+                $"Wind tunnel: even with every stage succeeding, {Percent(1 - happy.CleanSuccessRate)} of simulated flights do not land " +
                 $"({failure?.Kind ?? "fail"}: {failure?.Reason ?? "unknown"}{where}). Every route must lead to the exit.");
         }
 
-        var realistic = await MonteCarloSimulator.RunAsync(prepared.Graph, Realistic, new MonteCarloOptions { Runs = 400, MaxSteps = 300, Seed = 7, CustomHandlerTypes = custom }, cancellationToken).ConfigureAwait(false);
+        var realisticScenario = SimulationPreset.Find(SimulationPreset.Realistic)!.ToScenario(prepared.Graph);
+        var realistic = await MonteCarloSimulator.RunAsync(prepared.Graph, realisticScenario, new MonteCarloOptions { Runs = 400, MaxSteps = 300, Seed = 7, CustomHandlerTypes = custom }, cancellationToken).ConfigureAwait(false);
         var stepLimit = realistic.Outcomes.GetValueOrDefault(SimulationOutcomeKinds.StepLimit) / (double)Math.Max(1, realistic.Runs);
         if (stepLimit > 0.05)
         {
@@ -451,15 +532,35 @@ public static partial class ArchitectApi
                 "Bound the loops with max_retries, goal gates and a retry_target, or an escape route.");
         }
 
+        var dirtyShare = realistic.FailedStageLandings / (double)Math.Max(1, realistic.Runs);
+        var failedStages = realistic.Nodes
+            .Where(kv => kv.Value.FailedStageLandings > 0)
+            .OrderByDescending(kv => kv.Value.FailedStageLandings)
+            .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+            .ToList();
+        if (failedStages.Count > 0)
+        {
+            warnings.Add(
+                $"Wind tunnel: {Percent(dirtyShare)} of realistic flights land with a failed stage behind them, because a failure flows on " +
+                $"along an unconditional edge ({string.Join(", ", failedStages.Take(5).Select(kv => $"'{kv.Key}' in {Percent(kv.Value.FailedStageLandings / (double)realistic.Runs)}"))}). " +
+                "Condition the onward edge on outcome=success and route failures explicitly (condition=\"outcome=fail\").");
+        }
+
         var forecast = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
-            ["happy_path"] = Math.Round(happy.SuccessRate, 4),
-            ["realistic"] = Math.Round(realistic.SuccessRate, 4),
+            ["happy_path"] = Math.Round(happy.CleanSuccessRate, 4),
+            ["realistic"] = Math.Round(realistic.CleanSuccessRate, 4),
+            ["realistic_landed"] = Math.Round(realistic.SuccessRate, 4),
+            ["failed_stage_landings"] = Math.Round(dirtyShare, 4),
+            ["failed_stages"] = failedStages.Select(kv => (object?)kv.Key).ToList(),
             ["step_limit"] = Math.Round(stepLimit, 4),
             ["mean_steps"] = Math.Round(realistic.Steps.Mean, 1),
             ["p90_steps"] = (long)realistic.Steps.P90,
+            ["mean_duration_ms"] = (long)Math.Round(realistic.SimulatedDuration.Mean),
+            ["p90_duration_ms"] = realistic.SimulatedDuration.P90,
             ["stages"] = (long)prepared.Graph.Nodes.Count,
             ["routes"] = (long)prepared.Graph.Edges.Count,
+            ["budget_hours"] = BriefBudgetHours(brief) is { } budget ? Math.Round(budget.Hours, 2) : null,
             ["failures"] = realistic.Failures.Take(3)
                 .Select(f => (object?)new Dictionary<string, object?>(StringComparer.Ordinal)
                 {
@@ -470,8 +571,186 @@ public static partial class ArchitectApi
                 })
                 .ToList(),
         };
+        if (BriefBudgetHours(brief) is { } hours)
+        {
+            // The budget is read from prose, so it may be a product requirement ("tests run in under 5 minutes") rather than
+            // the run's: a warning, which the self-review weighs (it asks for a revision when the brief really meant it).
+            var mean = TimeSpan.FromMilliseconds(realistic.SimulatedDuration.Mean);
+            var p90 = TimeSpan.FromMilliseconds(realistic.SimulatedDuration.P90);
+            var limit = TimeSpan.FromHours(hours.Hours);
+            var said = $"the time budget the brief seems to state (\"{hours.Text}\")";
+            if (mean > limit && !hours.Approximate)
+            {
+                warnings.Add(
+                    $"Forecast: a typical flight takes {Hours(mean)} (p90 {Hours(p90)}) with the wind tunnel's typical stage durations, over {said}. " +
+                    "If that is the run's budget, fewer or larger stages, fewer rework rounds (lower max_visits), or cheaper checks would fit it; if it cannot be met, say so in the rationale.");
+            }
+            else if (p90 > limit)
+            {
+                warnings.Add($"Forecast: a typical flight takes {Hours(mean)}, but the slowest 10% take {Hours(p90)} or more, over {said}.");
+            }
+        }
+
         return new CheckResult(problems, warnings, forecast);
     }
+
+    /// <summary>
+    /// Lint rules an Architect draft must pass even though they are warnings (or notes) for hand-written pipelines: failures
+    /// that flow on silently, defaults decided by id order, loops without an engine-enforced bound, fixers sent back
+    /// without the failing report, and broken visit limits.
+    /// </summary>
+    internal static readonly IReadOnlySet<string> DesignRules = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "fail_flows_onward", "default_route", "unbounded_loop", "failure_evidence", "visit_limits",
+    };
+
+    /// <summary>
+    /// Paths the brief names that the draft contradicts: the draft never mentions the brief's path but uses a sibling with
+    /// another name (the brief says <c>qa/shots/</c>, every prompt says <c>qa/screenshots/</c>).
+    /// </summary>
+    internal static IReadOnlyList<string> ContractFindings(string brief, Graph draft)
+    {
+        if (string.IsNullOrWhiteSpace(brief))
+        {
+            return [];
+        }
+
+        var briefPaths = PathsIn(brief);
+        if (briefPaths.Count == 0)
+        {
+            return [];
+        }
+
+        var uses = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var draftText = new StringBuilder();
+        foreach (var node in draft.Nodes.Values)
+        {
+            foreach (var value in node.Attributes.Values)
+            {
+                draftText.AppendLine(value);
+                foreach (var path in PathsIn(value))
+                {
+                    if (!uses.TryGetValue(path, out var stages))
+                    {
+                        uses[path] = stages = new SortedSet<string>(StringComparer.Ordinal);
+                    }
+
+                    stages.Add(node.Id);
+                }
+            }
+        }
+
+        var text = Normalize(draftText.ToString());
+        var findings = new List<string>();
+        foreach (var expected in briefPaths)
+        {
+            if (text.Contains(expected, StringComparison.OrdinalIgnoreCase) || text.Contains(expected.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var siblings = uses.Keys
+                .Where(used => !briefPaths.Contains(used) && Siblings(expected, used))
+                .Order(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (siblings.Count > 0)
+            {
+                var where = string.Join("; ", siblings.Select(used => $"`{used}` ({string.Join(", ", uses[used])})"));
+                findings.Add($"Contract: the brief names `{expected}`, but the draft never uses it and uses {where} instead. Use the brief's paths exactly.");
+            }
+        }
+
+        return findings;
+    }
+
+    /// <summary>Relative paths in a text that look like contracts: a directory (<c>qa/shots/</c>), a file (<c>docs/PRODUCT.md</c>), or a deep path.</summary>
+    internal static HashSet<string> PathsIn(string text)
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match match in PathPattern().Matches(Normalize(UrlPattern().Replace(text, " "))))
+        {
+            var path = match.Value.TrimStart('.', '/');
+            var segments = path.TrimEnd('/').Split('/');
+            var isDirectory = path.EndsWith('/');
+            var isFile = segments[^1].Contains('.', StringComparison.Ordinal) && !segments[^1].EndsWith('.');
+            if (segments.Length >= 2 && segments.All(s => s.Any(char.IsLetter)) && (isDirectory || isFile || segments.Length >= 3))
+            {
+                paths.Add(path);
+            }
+        }
+
+        return paths;
+    }
+
+    private static bool Siblings(string expected, string used)
+    {
+        var a = expected.TrimEnd('/').Split('/');
+        var b = used.TrimEnd('/').Split('/');
+        if (a.Length != b.Length || string.Equals(a[^1], b[^1], StringComparison.OrdinalIgnoreCase) ||
+            !a[..^1].SequenceEqual(b[..^1], StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Same kind: both directories, or files with the same extension.
+        return expected.EndsWith('/') == used.EndsWith('/') &&
+               string.Equals(Path.GetExtension(a[^1]), Path.GetExtension(b[^1]), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string Normalize(string text) => text.Replace('\\', '/');
+
+    /// <summary>A time budget stated in the brief ("at most 3 hours", "under 90 minutes", "a few hours at most"), or null.</summary>
+    internal static (double Hours, string Text, bool Approximate)? BriefBudgetHours(string brief)
+    {
+        if (string.IsNullOrWhiteSpace(brief))
+        {
+            return null;
+        }
+
+        foreach (var pattern in new[] { BudgetBeforePattern(), BudgetAfterPattern() })
+        {
+            var match = pattern.Match(brief);
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            var amount = match.Groups["n"].Value.ToLowerInvariant();
+            var approximate = !double.TryParse(amount, NumberStyles.Float, CultureInfo.InvariantCulture, out var number);
+            if (approximate)
+            {
+                number = amount switch
+                {
+                    "an" or "a" or "one" => 1,
+                    "a couple of" or "couple of" or "two" => 2,
+                    "a few" or "few" or "three" => 3,
+                    "four" => 4,
+                    "five" => 5,
+                    "six" => 6,
+                    "eight" => 8,
+                    "ten" => 10,
+                    "twelve" => 12,
+                    _ => 0,
+                };
+                approximate = amount.Contains("few", StringComparison.Ordinal) || amount.Contains("couple", StringComparison.Ordinal);
+            }
+
+            if (number <= 0)
+            {
+                continue;
+            }
+
+            var unit = match.Groups["u"].Value.ToLowerInvariant();
+            var hours = unit.StartsWith('m') ? number / 60 : unit.StartsWith('d') ? number * 24 : number;
+            return (hours, match.Value.Trim(), approximate);
+        }
+
+        return null;
+    }
+
+    private static string Hours(TimeSpan span) => span.TotalHours >= 1
+        ? span.TotalHours.ToString("0.#", CultureInfo.InvariantCulture) + " h"
+        : Math.Round(span.TotalMinutes).ToString("0", CultureInfo.InvariantCulture) + " min";
 
     private static string Describe(Diagnostic diagnostic)
     {
@@ -497,8 +776,6 @@ public static partial class ArchitectApi
         }
     }
 
-    private static SimulationScenario Scenario(string json) => SimulationScenario.FromJson(JsonNode.Parse(json)!.AsObject());
-
     private static string Percent(double share) => share.ToString("P0", CultureInfo.InvariantCulture).Replace(" ", "", StringComparison.Ordinal);
 
     internal static int ToInt(object? value) => value switch
@@ -523,6 +800,22 @@ public static partial class ArchitectApi
 
     [GeneratedRegex(@"\b(strict\s+)?digraph\b", RegexOptions.CultureInvariant)]
     private static partial Regex DigraphPattern();
+
+    [GeneratedRegex(@"(?<![\w.\-/])(?:\.{1,2}/)?[A-Za-z0-9_][A-Za-z0-9_.\-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.\-]*)+/?", RegexOptions.CultureInvariant)]
+    private static partial Regex PathPattern();
+
+    [GeneratedRegex(@"\b[A-Za-z][A-Za-z0-9+.\-]*://\S+", RegexOptions.CultureInvariant)]
+    private static partial Regex UrlPattern();
+
+    [GeneratedRegex(@"(?:at most|under|within|no more than|less than|max(?:imum)?(?: of)?|budget(?: of| is)?|(?:finish(?:es|ed)?|done|ship(?:s|ped)?|deliver(?:s|ed)?|complete(?:s|d)?)\s+in)\s+(?:about\s+|roughly\s+)?(?<n>\d+(?:\.\d+)?|an?|one|two|three|four|five|six|eight|ten|twelve|a few|a couple of)\s*(?<u>hours?|hrs?|h|minutes?|mins?|days?)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex BudgetBeforePattern();
+
+    [GeneratedRegex(@"(?<n>\d+(?:\.\d+)?|an?|one|two|three|four|five|six|eight|ten|twelve|a few|a couple of)\s*(?<u>hours?|hrs?|h|minutes?|mins?|days?)\s+(?:at most|max(?:imum)?|or less|tops)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex BudgetAfterPattern();
+
+    /// <summary>A self-review verdict line, with or without Markdown around it.</summary>
+    [GeneratedRegex(@"^[\s*_`#>-]*VERDICT[\s*_`]*:[\s*_`]*(?<v>PASS|REVISE)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex VerdictPattern();
 }
 
 /// <summary>
@@ -602,7 +895,7 @@ internal sealed class ArchitectCheckHandler(PipelineRunManager manager) : INodeH
         ArgumentNullException.ThrowIfNull(context);
         var attempt = (context.TryGet(ArchitectApi.Attempt, out var count) ? ArchitectApi.ToInt(count) : 0) + 1;
         var proposal = context.GetString(ArchitectApi.Proposal);
-        var result = await ArchitectApi.CheckAsync(manager, proposal, context.GetString(ArchitectApi.Mode, "draft"), context.GetString(ArchitectApi.Current), cancellationToken).ConfigureAwait(false);
+        var result = await ArchitectApi.CheckAsync(manager, proposal, context.GetString(ArchitectApi.Mode, "draft"), context.GetString(ArchitectApi.Current), cancellationToken, context.GetString(ArchitectApi.Brief)).ConfigureAwait(false);
 
         var stageDir = Path.Combine(logsRoot, node.Id);
         Directory.CreateDirectory(stageDir);
@@ -639,9 +932,120 @@ internal sealed class ArchitectCheckHandler(PipelineRunManager manager) : INodeH
         }
 
         updates[ArchitectApi.GiveUp] = attempt >= ArchitectApi.MaxDrafts;
+        if (attempt >= ArchitectApi.MaxDrafts && context.GetString(ArchitectApi.Checked + ".proposal") is { Length: > 0 } checkedProposal)
+        {
+            // The self-review sent back a draft that had passed; its revision still fails, and no drafts are left: the
+            // checked draft stands, and the review's changes are reported as not applied.
+            var kept = context.Get(ArchitectApi.Checked + ".warnings") as List<object?> ?? [];
+            var checkedAttempt = ArchitectApi.ToInt(context.Get(ArchitectApi.Checked + ".attempt"));
+            return Outcome.Success(
+                $"Draft {attempt}, revised as the self-review asked, fails its checks; draft {checkedAttempt}, which passed them, stands.",
+                new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    [ArchitectApi.Attempt] = (long)attempt,
+                    [ArchitectApi.Proposal] = checkedProposal,
+                    [ArchitectApi.Rationale] = context.GetString(ArchitectApi.Checked + ".rationale"),
+                    [ArchitectApi.Forecast] = context.Get(ArchitectApi.Checked + ".forecast"),
+                    [ArchitectApi.Valid] = true,
+                    [ArchitectApi.Problems] = new List<object?>(),
+                    [ArchitectApi.Warnings] = kept.Append(
+                        $"Self-review (not applied: draft {attempt}, revised as it asked, failed its checks — {result.Problems[0]}; draft {checkedAttempt} stands): " +
+                        context.GetString(ArchitectApi.Checked + ".changes")).ToList(),
+                    [ArchitectApi.Feedback] = "",
+                    [ArchitectApi.GiveUp] = false,
+                    [ArchitectApi.Checked + ".restored"] = true,
+                });
+        }
+
         var summary = attempt >= ArchitectApi.MaxDrafts
             ? $"Draft {attempt} still fails its checks; giving up after {ArchitectApi.MaxDrafts} drafts: {result.Problems[0]}"
             : $"Draft {attempt} fails {result.Problems.Count} check(s): {result.Problems[0]}";
         return Outcome.Fail(summary, updates);
+    }
+}
+
+/// <summary>
+/// The Architect's self-review stage: once a draft passes the checker, the drafting model reviews it against the brief
+/// (contracts, the quality bar, the budget, loop bounds and defaults; see <see cref="ArchitectApi.ComposeReviewPrompt"/>).
+/// <c>VERDICT: REVISE</c> fails the stage with the requested changes as <c>architect.feedback</c>, so the pipeline routes back to
+/// the design stage — unless the drafts are used up, in which case the checked draft is kept and the review is reported. A
+/// review that cannot run (no backend, a backend error) does not block a checked draft.
+/// </summary>
+internal sealed class ArchitectReviewHandler : INodeHandler
+{
+    private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
+
+    public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(node);
+        ArgumentNullException.ThrowIfNull(context);
+        var stageDir = Path.Combine(logsRoot, node.Id);
+        Directory.CreateDirectory(stageDir);
+        if (context.Run?.Backend is not { } backend || context.GetString(ArchitectApi.Proposal).Trim().Length == 0)
+        {
+            return Outcome.Success("No self-review (no backend or no draft).");
+        }
+
+        if (context.Get(ArchitectApi.Checked + ".restored") is true &&
+            string.Equals(context.GetString(ArchitectApi.Checked + ".proposal").Trim(), context.GetString(ArchitectApi.Proposal).Trim(), StringComparison.Ordinal))
+        {
+            // The checked draft, restored after its revision failed the checks (the check stage reported it): reviewed already.
+            return Outcome.Success("The checked draft was reviewed already; it stands.");
+        }
+
+        var prompt = ArchitectApi.ComposeReviewPrompt(context);
+        await File.WriteAllTextAsync(Path.Combine(stageDir, "prompt.md"), prompt, cancellationToken).ConfigureAwait(false);
+        var stage = node.Clone();
+        stage[AttrKeys.Prompt] = prompt;
+        CodergenResult result;
+        try
+        {
+            result = await backend.RunAsync(stage, prompt, context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            await CodergenHandler.RecordFailedAttemptAsync(stageDir, ex, cancellationToken.IsCancellationRequested).ConfigureAwait(false);
+            return Outcome.Success($"The self-review could not run ({ex.Message}); the checked draft stands.",
+                new Dictionary<string, object?>(StringComparer.Ordinal) { [ArchitectApi.Review] = $"(not reviewed: {ex.Message})" });
+        }
+
+        if (result.Metadata.Count > 0)
+        {
+            var metadata = ContextValues.ToJson(ContextValues.Normalize(result.Metadata));
+            await File.WriteAllTextAsync(Path.Combine(stageDir, "backend.json"), metadata?.ToJsonString(Indented) ?? "{}", cancellationToken).ConfigureAwait(false);
+        }
+
+        var answer = result.Text ?? result.Outcome?.Notes ?? "";
+        await File.WriteAllTextAsync(Path.Combine(stageDir, "response.md"), answer, cancellationToken).ConfigureAwait(false);
+        var (revise, changes) = ArchitectApi.ParseReview(answer);
+        var updates = new Dictionary<string, object?>(StringComparer.Ordinal) { [ArchitectApi.Review] = answer.Trim() };
+        if (!revise)
+        {
+            return Outcome.Success("The self-review passed the draft.", updates);
+        }
+
+        var attempt = context.TryGet(ArchitectApi.Attempt, out var count) ? ArchitectApi.ToInt(count) : 0;
+        if (attempt >= ArchitectApi.MaxDrafts)
+        {
+            updates[ArchitectApi.Warnings] = ((context.Get(ArchitectApi.Warnings) as List<object?>) ?? [])
+                .Append("Self-review (not applied: no drafts left): " + changes).ToList();
+            return Outcome.Success("The self-review asked for changes, but no drafts are left; the checked draft stands.", updates);
+        }
+
+        updates[ArchitectApi.Feedback] = "The self-review against the brief asks for these changes:\n" + changes;
+        updates[ArchitectApi.Valid] = false;
+        updates[ArchitectApi.Checked + ".proposal"] = context.GetString(ArchitectApi.Proposal);
+        updates[ArchitectApi.Checked + ".rationale"] = context.GetString(ArchitectApi.Rationale);
+        updates[ArchitectApi.Checked + ".forecast"] = context.Get(ArchitectApi.Forecast);
+        updates[ArchitectApi.Checked + ".warnings"] = context.Get(ArchitectApi.Warnings);
+        updates[ArchitectApi.Checked + ".attempt"] = (long)attempt;
+        updates[ArchitectApi.Checked + ".changes"] = changes;
+        return Outcome.Fail("The self-review asked for changes: " + LogClip(changes), updates);
+    }
+
+    private static string LogClip(string text)
+    {
+        var line = text.ReplaceLineEndings(" ").Trim();
+        return line.Length <= 300 ? line : line[..299] + "…";
     }
 }

@@ -6,6 +6,7 @@ import { findNode, handlerOf, nodeLabel, startNode } from "../model/doc";
 import { writeDot } from "../model/dot";
 import type { StudioDoc } from "../model/types";
 import { focusNode, select, useStudio } from "../state/store";
+import { QuickFixes } from "./QuickFixes";
 
 export function Problems() {
   const analysis = useStudio((s) => s.analysis);
@@ -30,24 +31,30 @@ export function Problems() {
       {items.map((d, i) => {
         const node = d.node_id ? findNode(doc, d.node_id) : undefined;
         const edge = d.edge ? doc.edges.find((e) => `${e.from} -> ${e.to}` === d.edge) : undefined;
+        const reveal = () => {
+          if (node) focusNode(node.id);
+          else if (edge) select({ edges: [edge.uid] });
+        };
         return (
-          <button
+          <div
             key={i}
-            type="button"
+            role="button"
+            tabIndex={0}
             className={cx("rs-problem", `is-${d.severity}`)}
-            onClick={() => {
-              if (node) focusNode(node.id);
-              else if (edge) select({ edges: [edge.uid] });
+            onClick={reveal}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && e.target === e.currentTarget) reveal();
             }}
           >
             <span className="rs-problem__sev" />
             <span className="rs-problem__rule mono">{d.rule}</span>
-            <span className="rs-problem__msg">
+            <div className="rs-problem__msg">
               {d.message}
               {d.fix ? <span className="rs-problem__fix"> — {d.fix}</span> : null}
-            </span>
+              <QuickFixes diagnostic={d} />
+            </div>
             <span className="rs-problem__where mono">{node ? nodeLabel(doc, node) : d.edge ?? "pipeline"}</span>
-          </button>
+          </div>
         );
       })}
     </div>

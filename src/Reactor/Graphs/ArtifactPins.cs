@@ -52,8 +52,11 @@ public static class ArtifactPins
     /// <summary>The wire name of a kind: <c>file</c> or <c>text</c>.</summary>
     public static string KindName(ArtifactKind kind) => kind == ArtifactKind.File ? "file" : "text";
 
-    /// <summary>True for the handler types that consume and produce artifacts (codergen and tool).</summary>
-    public static bool IsSupportedHandlerType(string handlerType) => handlerType is HandlerTypes.Codergen or HandlerTypes.Tool;
+    /// <summary>
+    /// True for the handler types that consume and produce artifacts: codergen, tool, and fan-in (whose LLM judge — a fan-in
+    /// with a <c>prompt</c> — reads its inputs and records its outputs).
+    /// </summary>
+    public static bool IsSupportedHandlerType(string handlerType) => handlerType is HandlerTypes.Codergen or HandlerTypes.Tool or HandlerTypes.FanIn;
 
     /// <summary>True when the node has a non-blank <c>inputs</c> or <c>outputs</c> attribute.</summary>
     public static bool Declares(Node node)

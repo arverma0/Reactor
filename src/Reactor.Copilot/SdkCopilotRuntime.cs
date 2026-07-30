@@ -75,6 +75,12 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
             config.ExcludedTools = excluded.ToList();
         }
 
+        if (!string.IsNullOrWhiteSpace(conversation.SystemMessage))
+        {
+            // Append mode keeps the runtime's own system prompt (tools, environment) and adds the stage's house rules.
+            config.SystemMessage = new SystemMessageConfig { Mode = SystemMessageMode.Append, Content = conversation.SystemMessage };
+        }
+
         var session = await client.CreateSessionAsync(config, cancellationToken).ConfigureAwait(false);
         try
         {
@@ -244,7 +250,12 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
                 u.Data.InputTokens ?? 0,
                 u.Data.OutputTokens ?? 0,
                 u.Data.CacheReadTokens ?? 0,
-                u.Data.ReasoningTokens ?? 0) { FromSubagent = IsSub(evt.AgentId) },
+                u.Data.ReasoningTokens ?? 0)
+            {
+                FromSubagent = IsSub(evt.AgentId),
+                CacheWriteTokens = u.Data.CacheWriteTokens ?? 0,
+                NanoAiu = u.Data.CopilotUsage?.TotalNanoAiu,
+            },
             SessionErrorEvent e => new CopilotActivity.Error(e.Data.Message ?? "unknown error", e.Data.ErrorType, e.Data.StatusCode),
             SessionWarningEvent w => new CopilotActivity.Warning(w.Data.Message ?? ""),
             SessionUsageCheckpointEvent k => new CopilotActivity.UsageCheckpoint(k.Data.TotalNanoAiu),

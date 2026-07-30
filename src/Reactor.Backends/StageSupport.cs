@@ -39,6 +39,9 @@ public sealed record StageSettings
 
     public TimeSpan? Timeout { get; init; }
 
+    /// <summary>The attempt of this stage visit (1 = first; the engine's <c>internal.retry_count.&lt;node&gt;</c> + 1).</summary>
+    public int Attempt { get; init; } = 1;
+
     /// <summary>
     /// Identifies one engine execution: a fresh run, a resume, and each <c>loop_restart</c> get distinct scopes, while
     /// parallel branches share their run's scope. Thread-scoped sessions never cross scopes.
@@ -64,15 +67,19 @@ public sealed record StageSettings
             Fidelity = fidelity,
             ThreadId = string.IsNullOrWhiteSpace(thread) ? null : thread,
             RunId = run?.RunId ?? context.GetString("internal.run_id"),
-            WorkingDirectory = Path.GetFullPath(run?.WorkingDirectory ?? Directory.GetCurrentDirectory()),
+            WorkingDirectory = Path.GetFullPath(context.WorkingDirectory),
             StageDirectory = run?.StageDirectory(node.Id),
             Timeout = node.Timeout,
+            Attempt = int.TryParse(context.GetString($"internal.retry_count.{node.Id}"), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var retries) && retries > 0 ? retries + 1 : 1,
             ExecutionScope = run is null ? "" : Scopes.GetValue(run, _ => Guid.NewGuid().ToString("N")),
         };
     }
 
-    /// <summary>Key for thread-scoped session reuse (null when the stage does not share a thread).</summary>
-    public string? ThreadKey(string scope) => ThreadId is null ? null : string.Join('\u001f', RunId, ExecutionScope, scope, ThreadId);
+    /// <summary>
+    /// Key for thread-scoped session reuse (null when the stage does not share a thread). It includes the working directory,
+    /// so a parallel branch with its own workspace never continues a session that works in another directory.
+    /// </summary>
+    public string? ThreadKey(string scope) => ThreadId is null ? null : string.Join('\u001f', RunId, ExecutionScope, scope, WorkingDirectory, ThreadId);
 }
 
 /// <summary>
@@ -305,9 +312,16 @@ internal static class ThreadContinuity
         stage.ThreadId is null ? null : contextLost ? "recovered" : isNew ? "new" : "continued";
 }
 
-/// <summary>Appends backend activity to <c>{stage}/agent-events.jsonl</c> (one JSON object per line).</summary>
+/// <summary>
+/// Appends backend activity to <c>{stage}/agent-events.jsonl</c> (one JSON object per line). Records written with
+/// <see cref="Write"/> get a <c>ts</c> (ISO 8601 UTC) unless they carry one; raw lines (<see cref="WriteRaw"/>) are kept
+/// as they are. Each attempt of a stage starts with a <c>reactor.attempt</c> marker (<see cref="WriteAttempt"/>).
+/// </summary>
 internal sealed class StageEventLog : IDisposable
 {
+    /// <summary>The <c>type</c> of the record that marks the start of an attempt.</summary>
+    public const string AttemptRecordType = "reactor.attempt";
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
     private readonly object _gate = new();
     private readonly StreamWriter? _writer;
@@ -323,11 +337,19 @@ internal sealed class StageEventLog : IDisposable
         _writer = new StreamWriter(new FileStream(Path.Combine(stageDirectory, fileName), FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
     }
 
+    /// <summary>The current time as written in <c>ts</c> fields.</summary>
+    public static string Timestamp() => DateTimeOffset.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", System.Globalization.CultureInfo.InvariantCulture);
+
     public void Write(JsonObject record)
     {
         if (_writer is null)
         {
             return;
+        }
+
+        if (!record.ContainsKey("ts"))
+        {
+            record.Insert(0, "ts", Timestamp());
         }
 
         lock (_gate)
@@ -336,6 +358,10 @@ internal sealed class StageEventLog : IDisposable
             _writer.Flush();
         }
     }
+
+    /// <summary>Writes the marker that starts attempt <paramref name="attempt"/> (1-based) of the stage.</summary>
+    public void WriteAttempt(int attempt) =>
+        Write(new JsonObject { ["type"] = AttemptRecordType, ["attempt"] = attempt, ["ts"] = Timestamp() });
 
     /// <summary>Writes an already-serialized JSON line (e.g. raw CLI output).</summary>
     public void WriteRaw(string line)
@@ -364,6 +390,7 @@ internal sealed class StageEventLog : IDisposable
 /// <summary>Small formatting helpers for stage logs.</summary>
 internal static class LogText
 {
+    /// <summary>One line of plain text (escape sequences stripped, see <see cref="AnsiText"/>), at most <paramref name="max"/> characters.</summary>
     public static string Clip(string? text, int max = 160)
     {
         if (string.IsNullOrEmpty(text))
@@ -371,7 +398,7 @@ internal static class LogText
             return "";
         }
 
-        var single = text.ReplaceLineEndings(" ").Trim();
+        var single = AnsiText.Strip(text).ReplaceLineEndings(" ").Trim();
         return single.Length <= max ? single : single[..max] + "…";
     }
 

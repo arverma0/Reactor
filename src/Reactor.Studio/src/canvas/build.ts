@@ -1,6 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import type { PendingQuestion } from "../api/types";
 import { artifactIndex, dataLinks, nodeInputs, nodeOutputs } from "../model/artifacts";
+import { parsePositiveInt } from "../model/attributes";
 import { describeCondition } from "../model/conditions";
 import { edgeAttr, groupChain, handlerOf, kindOf, nodeAttr, nodeClasses, nodeLabel } from "../model/doc";
 import { KINDS, type NodeKind } from "../model/handlers";
@@ -9,7 +10,7 @@ import { ghostRoutes, routeKeyOf, routesOf, type Route } from "../model/routes";
 import { effectiveModel, parseStylesheet } from "../model/stylesheet";
 import type { Diagnostic, DocNode, Effective, StudioDoc } from "../model/types";
 
-export type NodeState = "idle" | "running" | "success" | "partial_success" | "fail" | "retry" | "skipped" | "waiting" | "dim" | "visited" | "restored";
+export type NodeState = "idle" | "running" | "success" | "partial_success" | "fail" | "retry" | "skipped" | "waiting" | "dim" | "visited" | "restored" | "stopped";
 
 export interface NodeOverlay {
   state?: NodeState;
@@ -83,6 +84,10 @@ export interface StageData extends Record<string, unknown> {
   overlayKind?: CanvasOverlay["kind"];
   details: { label: string; value: string }[];
   gateCount?: number;
+  /** `max_visits`: the most times the stage may run in one run. */
+  maxVisits?: number;
+  /** Where the run goes once `max_visits` is used up (`on_max_visits`; null = the run fails). */
+  reroute?: { max: number; target: string | null; targetLabel?: string };
 }
 
 export interface FrameData extends Record<string, unknown> {
@@ -119,6 +124,21 @@ export interface DataEdgeData extends Record<string, unknown> {
   name: string;
   color: string;
   active?: boolean;
+}
+
+/** The `on_max_visits` reroute of a stage: not an edge, but where the run goes once the stage's `max_visits` is used up. */
+export interface RerouteData extends Record<string, unknown> {
+  node: string;
+  max: number;
+  overlay?: EdgeOverlay;
+  overlayKind?: CanvasOverlay["kind"];
+  lane: number;
+}
+
+/** The `on_max_visits` target of a node that has a usable visit limit, or null. */
+export function rerouteTarget(doc: StudioDoc, node: DocNode): string | null {
+  const target = nodeAttr(doc, node, "on_max_visits");
+  return target && target !== node.id && doc.nodes.some((n) => n.id === target) ? target : null;
 }
 
 function threadOf(doc: StudioDoc, node: DocNode): string | undefined {
@@ -159,9 +179,11 @@ export function buildStageData(
     } else if (kind === "fanout") {
       details.push({ label: "join", value: nodeAttr(doc, node, "join_policy") || "wait_all" });
       add("max", "max_parallel");
+      add("workdirs", "branch_workdir");
     } else if (kind === "join") {
       if (nodeAttr(doc, node, "prompt")) details.push({ label: "picks", value: "LLM judge" });
       else details.push({ label: "picks", value: "by status" });
+      if (nodeAttr(doc, node, "promote") === "best") details.push({ label: "promotes", value: "winner" });
     } else if (kind === "supervisor") {
       const child = nodeAttr(doc, node, "stack.child_dotfile") || doc.graphAttrs["stack.child_dotfile"];
       if (child) details.push({ label: "child", value: child });
@@ -169,6 +191,11 @@ export function buildStageData(
       add("actions", "manager.actions");
     } else if (kind === "custom") {
       add("type", "type");
+    }
+
+    if (kind === "agent" || kind === "tool" || kind === "supervisor" || kind === "custom") {
+      add("scope", "write_scope");
+      add("group", "concurrency_group");
     }
 
     const nodeDiagnostics = diagnostics.filter((d) => d.node_id === node.id);
@@ -182,6 +209,9 @@ export function buildStageData(
       ? nodeOutputs(doc, node).map((o) => ({ name: o.name, path: o.path, color: artifacts.get(o.name)?.color ?? lineColor(o.name) }))
       : [];
     const retries = nodeAttr(doc, node, "max_retries");
+    const maxVisits = parsePositiveInt(nodeAttr(doc, node, "max_visits"));
+    const target = maxVisits ? rerouteTarget(doc, node) : null;
+    const targetNode = target ? doc.nodes.find((n) => n.id === target) : undefined;
     result.set(node.id, {
       id: node.id,
       kind,
@@ -207,6 +237,8 @@ export function buildStageData(
       overlayKind: overlay?.kind,
       details,
       gateCount: kind === "exit" ? goalGates : undefined,
+      maxVisits: maxVisits ?? undefined,
+      reroute: maxVisits && kind !== "start" && kind !== "exit" ? { max: maxVisits, target, targetLabel: targetNode ? nodeLabel(doc, targetNode) : undefined } : undefined,
     });
   }
   return result;
@@ -260,6 +292,22 @@ export function buildEdges(doc: StudioDoc, diagnostics: Diagnostic[], overlay: C
         overlayKind: overlay?.kind,
         lane: back ? lane++ : 0,
       } satisfies CableData,
+    });
+  }
+  for (const node of doc.nodes) {
+    const max = parsePositiveInt(nodeAttr(doc, node, "max_visits"));
+    const target = max ? rerouteTarget(doc, node) : null;
+    if (!max || !target) continue;
+    const back = (positions[target]?.x ?? 0) <= (positions[node.id]?.x ?? 0) + 40;
+    edges.push({
+      id: `reroute:${node.id}`,
+      type: "reroute",
+      source: node.id,
+      target,
+      sourceHandle: "out:max_visits",
+      targetHandle: "in",
+      zIndex: 0,
+      data: { node: node.id, max, overlay: overlay?.edges[edgeKey(node.id, target)], overlayKind: overlay?.kind, lane: back ? lane++ : 0 } satisfies RerouteData,
     });
   }
   if (showData) {

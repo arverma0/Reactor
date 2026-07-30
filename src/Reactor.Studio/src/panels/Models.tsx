@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import type { ModelDescriptor } from "../api/types";
 import { Button, Dropdown, Segmented, TextArea, cx, type DropdownOption } from "../components/controls";
 import { Glyph } from "../components/Glyph";
+import { modelPriceText, modelPriceTitle } from "../model/cost";
 import { kindOf, nodeClasses, nodeLabel, setGraphAttr } from "../model/doc";
 import { KINDS } from "../model/handlers";
 import { effectiveModel, formatStylesheet, parseStylesheet, selectorKind, type StyleRule } from "../model/stylesheet";
@@ -18,8 +19,9 @@ export function modelOptions(models: ModelDescriptor[], current?: string): Dropd
     if (seen.has(m.id)) continue;
     seen.add(m.id);
     const group = m.source === "copilot" ? "GitHub Copilot" : `${m.provider}${m.available ? "" : " · no key"}`;
-    const detail = m.billing_multiplier != null ? `${m.billing_multiplier}×` : m.context_window ? `${m.context_window >= 1_000_000 ? `${(m.context_window / 1_000_000).toFixed(m.context_window % 1_000_000 ? 1 : 0)}M` : `${Math.round(m.context_window / 1000)}k`}` : undefined;
-    options.push({ value: m.id, label: <span className="mono">{m.id}</span>, text: `${m.id} ${m.display_name ?? ""} ${m.provider}`, group, detail, disabled: m.policy_state === "disabled" });
+    const context = m.context_window ? `${m.context_window >= 1_000_000 ? `${(m.context_window / 1_000_000).toFixed(m.context_window % 1_000_000 ? 1 : 0)}M` : `${Math.round(m.context_window / 1000)}k`}` : undefined;
+    const detail = modelPriceText(m) ?? context;
+    options.push({ value: m.id, label: <span className="mono" title={modelPriceTitle(m)}>{m.id}</span>, text: `${m.id} ${m.display_name ?? ""} ${m.provider}`, group, detail, disabled: m.policy_state === "disabled" });
   }
   if (current && !seen.has(current)) options.unshift({ value: current, label: <span className="mono">{current}</span>, text: current, group: "Current", detail: "custom" });
   return options;
@@ -106,6 +108,10 @@ export function ModelsPanel() {
                   clearLabel="inherit"
                   mono
                 />
+              </div>
+              <div className="rs-rule__row">
+                <span className="rs-rule__prop" title="Standing instructions for the matched stages (Reactor extension; every backend honors them)">instructions</span>
+                <TextArea value={rule.declarations.instructions ?? ""} onChange={(v) => setDecl(index, "instructions", v.trim() ? v : undefined)} placeholder="inherit" minRows={1} />
               </div>
               <div className="rs-rule__matches">
                 {matched.length === 0 ? <span className="faint">matches no LLM stage</span> : matched.slice(0, 8).map((n) => <span key={n.id} className="rs-chip">{n.id}</span>)}

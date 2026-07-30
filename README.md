@@ -102,8 +102,9 @@ Reactor Studio is a visual workbench for agent factories, built on the real engi
 - **Design** pipelines on a canvas where every route is a port (`✓ on success`, `✕ on fail`, gate options, labels),
   with groups, artifact wires, a model stylesheet editor, a two-way DOT editor, and an exact prompt preview.
 - **Wind tunnel**: fly the design hundreds of times with simulated stage outcomes — zero tokens — to find loops that
-  never converge, dead ends, and unreachable goal gates; calibrate it to your real flights to forecast what a change
-  will do to the success rate and cost.
+  never converge, dead ends, unreachable goal gates, and failures that silently flow on; forecast time and cost per
+  flight, and calibrate it to your real flights to forecast what a change will do to the clean landing rate, time, and
+  cost. Also from the command line: `reactor simulate`.
 - **Flights**: launch runs, answer human gates on the canvas, steer running agents, replay any run (from this server
   or `reactor run`) on a timeline, re-fly a run from just before any stage with an edited pipeline, and read each
   pipeline's flight record (success, time, cost, where it breaks).
@@ -153,21 +154,71 @@ Full reference: [docs/pipelines.md](docs/pipelines.md). Examples in [examples/](
 ## Command line
 
 ```text
-reactor run <file.dot>        Run a pipeline        (--backend, --model, -C <workdir>, --set k=v, --answer, -y, --json, -v/-q)
-reactor resume <run-dir>      Resume from the last checkpoint
-reactor validate <file.dot>   Parse and lint
-reactor render <file.dot>     Render to SVG/PNG/PDF (--run <run-dir> colors stages by status)
-reactor serve                 HTTP API + Reactor Studio + console (--urls, --token, --max-concurrent)
+reactor run <file.dot>        Run a pipeline        (--backend, --model, -C <workdir>, --set k=v, --answer, -y, --json, -v/-q, --logs <dir>, --max-cost <usd>, --no-track-changes)
+reactor resume <run-dir>      Resume from the last checkpoint (same flags; --max-cost raises a budget the run stopped at)
+reactor validate <file.dot>   Parse and lint (--simulate: every simulated happy-path flight must land)
+reactor simulate <file.dot>   Fly it in the wind tunnel: many simulated runs, zero tokens
+                              (--runs 1000, --scenario happy|realistic|stress|chaos|<file.json>, --seed, --max-steps,
+                               --min-success 0.95, --trace <run>, --set k=v, --json)
+reactor render <file.dot>     Render to SVG/PNG/PDF/DOT (-o graph.png picks the format; --run <run-dir> colors stages by status)
+reactor serve                 HTTP API + Reactor Studio + console (--urls, --token, --max-concurrent, --max-cost, and run's backend flags)
 reactor studio                Same server, and opens the Studio in a browser
 reactor agent [prompt]        Talk to the coding agent loop directly
-reactor models                List catalog models (--provider copilot: models your Copilot account can use)
+reactor models                List catalog models with their token prices (--provider copilot: models your Copilot
+                              account can use, priced from Reactor's Copilot price table; REACTOR_PRICES=<file> overrides it)
 reactor doctor                Check backends, credentials, and tools
 ```
 
-Runs are written to `<workdir>/.reactor/runs/<timestamp>-<name>/`: `checkpoint.json`, `events.jsonl`,
-`result.json`, `graph.dot`, and one directory per stage with `prompt.md`, `response.md`, `status.json`,
-`backend.json` (model, tokens, cost) and agent transcripts. Exit codes: 0 success, 1 pipeline failed,
-2 invalid input, 3 configuration error, 130 cancelled. Press Ctrl+C to stop gracefully; `reactor resume` continues.
+Runs are written to `<workdir>/.reactor/runs/<timestamp>-<name>/` (the timestamp is UTC, `yyyyMMdd-HHmmss`, as for
+runs started by the server), or to the directory given with `--logs` — then nothing is created under
+`<workdir>/.reactor`. A run directory holds `checkpoint.json`, `events.jsonl`, `result.json`, `graph.dot`, and one
+directory per stage with `prompt.md`, `response.md`, `status.json`, `instructions.md` (the stage's standing
+instructions), `backend.json` (model, tokens, and cost — native units plus a comparable `cost_usd`, also for attempts
+that time out or fail) and agent transcripts. The run summary ends with the run's usage totals (cost, AI units or premium requests, tokens — failed and
+timed-out attempts included); `--max-cost <usd>` (or the graph's `max_cost`) stops a run, resumably, before its next
+stage once its recorded cost reaches the budget. Every stage's checkpoint is kept under `checkpoints/`, so the Studio
+can re-fly a CLI run from any stage. Each stage that can change files also gets a `changes.json` (what it changed in
+the working directory, from snapshots that never touch your git index or branches); `--no-track-changes` turns the
+snapshots off for a run. Exit codes: 0 success, 1 pipeline failed, 2 invalid input, 3 configuration
+error, 130 cancelled. Press Ctrl+C to stop gracefully; `reactor resume` continues.
+
+House rules for agents go in the graph's (or a stage's, or a stylesheet rule's) `instructions` attribute; every backend
+honors them, on top of a small built-in set (`house_rules=false` turns that off). See
+[docs/pipelines.md](docs/pipelines.md#standing-instructions-reactor-extension).
+
+While parallel branches run, every activity line names the stage it comes from (in a color of its own unless
+`--no-color` or `NO_COLOR` is set), so concurrent agents stay apart:
+
+```text
+● proto_a [codergen]
+● proto_b [codergen]
+  │ proto_a: copilot-cli session 358962f6-… (claude-sonnet-5)
+  │ proto_b: copilot-cli session 4e960be1-… (gpt-5.6-sol)
+  │ proto_b → view docs/GAME_DESIGN.md
+```
+
+`reactor render <file.dot> --run <run-dir>` colors the stages of a run: finished stages by their latest status (from
+`checkpoint.json` and `events.jsonl`), and the stages executing now — several while parallel branches run, none once
+the run has ended — as running. The output format follows `-o`'s extension (`.svg`, `.png`, `.pdf`, `.jpg`, `.gif`,
+`.json`, `.ps`, `.eps`, or `.dot`/`.gv` for the display DOT, which needs no Graphviz); `-f` must agree with it.
+
+`reactor simulate` is the Studio's wind tunnel from the command line: it flies the pipeline through the real engine
+with simulated stage outcomes (no model calls, no tool commands) and prints the readiness gauge — the **clean landing
+rate** with its 95% interval, and the flights that landed with failed stages behind them — how flights go down (each
+failure group with the stage and a replayable run), hot spots and loops, and simulated time and cost per flight. The
+presets assume rough typical stage durations (agents 10 min, tools 1 min, supervisors 30 min); a scenario file can
+start from a preset and set per-stage `duration_ms`, `cost` (USD per run), outcome `metrics`, and more (see
+[http-api.md](docs/http-api.md#scenarios)):
+
+```powershell
+reactor simulate factory.dot --scenario realistic --min-success 0.95   # CI gate: exit 1 below 95% clean landings
+reactor simulate factory.dot --seed 4242 --trace 17                    # replay flight 17 of that report, event by event
+reactor simulate factory.dot --scenario my-scenario.json --json        # the report as POST /studio/api/simulate returns it
+reactor validate factory.dot --simulate                                # exit 2 if any happy-path flight cannot land
+```
+
+`reactor simulate` exits 1 when the clean landing rate is below `--min-success`, and 2 on an invalid pipeline or
+scenario.
 
 ## HTTP server
 
@@ -219,7 +270,7 @@ src/Reactor.Copilot  GitHub Copilot SDK backend
 src/Reactor.Server   HTTP API, server-sent events, Studio API and hosting, web console
 src/Reactor.Studio   Reactor Studio web app (React, TypeScript, React Flow), embedded into Reactor.Server
 src/Reactor.Cli      the `reactor` command
-tests/               xUnit v3 test projects (one per library)
+tests/               xUnit v3 test projects (one per library, and one for the CLI)
 examples/            example pipelines
 docs/                architecture, pipeline reference, backends, Studio, HTTP API, spec conformance
 ```
@@ -228,7 +279,7 @@ docs/                architecture, pipeline reference, backends, Studio, HTTP AP
 
 ```powershell
 dotnet build                     # warnings are errors; builds and embeds the Studio when Node.js 20.19+ is installed
-dotnet test                      # ~1,100 tests across six projects
+dotnet test                      # ~1,100 tests across seven projects
 cd src/Reactor.Studio; npm test  # Studio unit tests (Vitest)
 ```
 

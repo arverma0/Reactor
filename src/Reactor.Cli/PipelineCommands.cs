@@ -46,6 +46,8 @@ internal sealed class RunOptionSet
 
     public Option<int> MaxSteps { get; } = new("--max-steps") { Description = "Fail the run after this many stage executions, a guard against runaway loops (0 = unlimited)", DefaultValueFactory = _ => 500 };
 
+    public Option<double?> MaxCost { get; } = new("--max-cost") { Description = "Stop (resumably) before the next stage once the run's recorded cost reaches this many US dollars; overrides the graph's max_cost (0 = no budget)" };
+
     public Option<bool> Json { get; } = new("--json") { Description = "Emit events and the result as JSON lines" };
 
     public Option<bool> Verbose { get; } = new("--verbose", "-v") { Description = "Show debug logs, edges, and checkpoints" };
@@ -60,15 +62,33 @@ internal sealed class RunOptionSet
 
     public Option<string?> ClaudeCli { get; } = new("--claude-cli") { Description = "Path to the claude CLI (default: claude on PATH, or $REACTOR_CLAUDE_CLI)" };
 
+    public Option<bool> NoTrackChanges { get; } = new("--no-track-changes")
+    {
+        Description = "Do not snapshot the working directory around stages (no <stage>/changes.json, no workspace rewind on re-fly); like the graph attribute track_changes=false",
+    };
+
     public void AddTo(Command command)
     {
-        foreach (var option in new Option[] { Backend, Model, Provider, MaxTokens, WorkingDirectory, Set, AutoApprove, Answers, MaxSteps, Json, Verbose, Quiet, NoColor, CopilotRuntime, CopilotCli, ClaudeCli })
+        foreach (var option in new Option[] { Backend, Model, Provider, MaxTokens, WorkingDirectory, Set, AutoApprove, Answers, MaxSteps, MaxCost, NoTrackChanges, Json, Verbose, Quiet, NoColor, CopilotRuntime, CopilotCli, ClaudeCli })
         {
             command.Options.Add(option);
         }
 
+        AddValidators();
+    }
+
+    /// <summary>Restricts <see cref="Backend"/> to the known kinds and <see cref="MaxTokens"/> to positive values.</summary>
+    public void AddValidators()
+    {
         Backend.AcceptOnlyFromAmong(BackendFactory.Kinds);
         MaxTokens.Validators.Add(PositiveIfSet);
+        MaxCost.Validators.Add(result =>
+        {
+            if (result.GetValueOrDefault<double?>() is { } cost && (cost < 0 || !double.IsFinite(cost)))
+            {
+                result.AddError($"{result.Option.Name} must be zero or a positive amount of US dollars.");
+            }
+        });
     }
 
     /// <summary>Rejects zero or negative values of an optional count.</summary>
@@ -157,7 +177,7 @@ internal static class PipelineCommands
     public static Command Run()
     {
         var file = new Argument<string>("file") { Description = "DOT pipeline file ('-' reads standard input)" };
-        var logs = new Option<string?>("--logs") { Description = "Run directory (default: <workdir>/.reactor/runs/<timestamp>-<name>)" };
+        var logs = new Option<string?>("--logs") { Description = "Run directory (default: <workdir>/.reactor/runs/<UTC timestamp>-<name>)" };
         var startAt = new Option<string?>("--start-at") { Description = "Start at this node instead of the start node" };
         var options = new RunOptionSet();
         var command = new Command("run", "Run a pipeline") { file, logs, startAt };
@@ -198,9 +218,22 @@ internal static class PipelineCommands
                     return null;
                 }
 
-                var logsRoot = result.GetValue(logs) is { } explicitLogs
-                    ? Path.GetFullPath(explicitLogs)
-                    : UniqueRunDirectory(RunsDirectory(workDir), $"{DateTime.Now:yyyyMMdd-HHmmss}-{Sanitize(prepared.Graph.Name)}");
+                string logsRoot;
+                if (result.GetValue(logs) is { } explicitLogs)
+                {
+                    // Nothing is created under the working directory's .reactor unless the run directory is in it.
+                    logsRoot = Path.GetFullPath(explicitLogs);
+                    if (IsInside(logsRoot, ReactorDirectory(workDir)))
+                    {
+                        EnsureReactorDirectory(workDir);
+                    }
+                }
+                else
+                {
+                    EnsureRunsDirectory(workDir);
+                    logsRoot = UniqueRunDirectory(RunsDirectory(workDir), RunDirectoryName(prepared.Graph.Name, DateTime.UtcNow));
+                }
+
                 return await runner.RunAsync(graph, runOptions with { LogsRoot = logsRoot, StartAt = result.GetValue(startAt) }, ct).ConfigureAwait(false);
             }).ConfigureAwait(false);
         });
@@ -234,7 +267,8 @@ internal static class PipelineCommands
         var file = new Argument<string>("file") { Description = "DOT pipeline file ('-' reads standard input)" };
         var json = new Option<bool>("--json") { Description = "Print diagnostics as JSON" };
         var noColor = new Option<bool>("--no-color") { Description = "Disable colored output" };
-        var command = new Command("validate", "Parse and lint a pipeline without running it") { file, json, noColor };
+        var simulate = new Option<bool>("--simulate") { Description = "Also fly the happy path in the wind tunnel (every stage succeeds): every flight must land" };
+        var command = new Command("validate", "Parse and lint a pipeline without running it") { file, json, noColor, simulate };
         command.SetAction(async (result, cancellationToken) =>
         {
             string source;
@@ -268,11 +302,14 @@ internal static class PipelineCommands
                 return ExitCodes.InvalidInput;
             }
 
+            var happyPath = result.GetValue(simulate) && !prepared.HasErrors
+                ? await SimulateCommand.CheckHappyPathAsync(prepared.Graph, cancellationToken).ConfigureAwait(false)
+                : null;
             if (result.GetValue(json))
             {
-                Console.WriteLine(new JsonObject
+                var report = new JsonObject
                 {
-                    ["valid"] = !prepared.HasErrors,
+                    ["valid"] = !prepared.HasErrors && happyPath?.Passed != false,
                     ["name"] = prepared.Graph.Name,
                     ["nodes"] = prepared.Graph.Nodes.Count,
                     ["edges"] = prepared.Graph.Edges.Count,
@@ -284,7 +321,13 @@ internal static class PipelineCommands
                         ["node_id"] = d.NodeId,
                         ["fix"] = d.Fix,
                     }).ToArray()),
-                }.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+                };
+                if (happyPath is not null)
+                {
+                    report["simulation"] = happyPath.ToJson();
+                }
+
+                Console.WriteLine(report.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
             }
             else
             {
@@ -294,23 +337,45 @@ internal static class PipelineCommands
                 {
                     Console.WriteLine($"✔ {prepared.Graph.Name}: {prepared.Graph.Nodes.Count} nodes, {prepared.Graph.Edges.Count} edges — valid");
                 }
+
+                if (happyPath is not null)
+                {
+                    Console.WriteLine(happyPath.Describe(result.GetValue(file)!));
+                }
             }
 
-            return prepared.HasErrors ? ExitCodes.InvalidInput : ExitCodes.Success;
+            return prepared.HasErrors || happyPath is { Passed: false } ? ExitCodes.InvalidInput : ExitCodes.Success;
         });
         return command;
     }
 
     public static Command Render()
     {
-        var file = new Argument<string>("file") { Description = "DOT pipeline file" };
+        var file = new Argument<string>("file") { Description = "DOT pipeline file ('-' reads standard input)" };
         var output = new Option<string?>("--output", "-o") { Description = "Output file (default: <file>.<format>; '-' for stdout)" };
-        var format = new Option<string>("--format", "-f") { Description = "svg, png, pdf, or dot", DefaultValueFactory = _ => "svg" };
-        var run = new Option<string?>("--run") { Description = "Color stages by status from this run directory's checkpoint" };
+        var format = new Option<string?>("--format", "-f")
+        {
+            Description = "svg, png, pdf, jpg, gif, json (any Graphviz output format), or dot for the display DOT without Graphviz " +
+                "(default: from the --output extension, else svg)",
+        };
+        var run = new Option<string?>("--run") { Description = "Color stages by status from this run directory: finished stages from its checkpoint and events, running stages from events.jsonl" };
         var command = new Command("render", "Render a pipeline graph with Graphviz") { file, output, format, run };
         command.SetAction(async (result, cancellationToken) =>
         {
             var path = result.GetValue(file)!;
+            if (!RenderFormat.TryResolve(result.GetValue(format), result.GetValue(output), out var fmt, out var formatError))
+            {
+                await Console.Error.WriteLineAsync("✖ " + formatError).ConfigureAwait(false);
+                return ExitCodes.InvalidInput;
+            }
+
+            var target = result.GetValue(output) ?? (path == "-" ? "-" : RenderFormat.DefaultOutput(path, fmt));
+            if (target != "-" && path != "-" && string.Equals(Path.GetFullPath(target), Path.GetFullPath(path), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            {
+                await Console.Error.WriteLineAsync($"✖ Refusing to overwrite the pipeline file {Path.GetFullPath(path)} with its rendering; choose another --output.").ConfigureAwait(false);
+                return ExitCodes.InvalidInput;
+            }
+
             Graph graph;
             try
             {
@@ -322,18 +387,21 @@ internal static class PipelineCommands
                 return ExitCodes.InvalidInput;
             }
 
-            IReadOnlyDictionary<string, string>? statuses = null;
-            string? current = null;
+            RunProgress? progress = null;
             if (result.GetValue(run) is { } runDir)
             {
-                var checkpoint = Checkpoint.Load(Path.Combine(Path.GetFullPath(runDir), "checkpoint.json"));
-                statuses = GraphRenderer.StatusesFrom(checkpoint.NodeOutcomes);
-                current = checkpoint.FinalStatus is null ? checkpoint.CurrentNode : null;
+                try
+                {
+                    progress = RunProgress.Load(Path.GetFullPath(runDir));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or InvalidDataException or InvalidOperationException)
+                {
+                    await Console.Error.WriteLineAsync("✖ " + ex.Message).ConfigureAwait(false);
+                    return ExitCodes.InvalidInput;
+                }
             }
 
-            var dot = GraphRenderer.ToDisplayDot(graph, statuses, current);
-            var fmt = result.GetValue(format)!.ToLowerInvariant();
-            var target = result.GetValue(output) ?? (path == "-" ? "-" : Path.ChangeExtension(path, fmt == "dot" ? ".rendered.dot" : "." + fmt));
+            var dot = GraphRenderer.ToDisplayDot(graph, progress?.Statuses, progress?.Running);
             byte[] bytes;
             try
             {
@@ -341,7 +409,8 @@ internal static class PipelineCommands
             }
             catch (GraphvizException ex)
             {
-                await Console.Error.WriteLineAsync(ex.Message).ConfigureAwait(false);
+                var hint = ex.InnerException is System.ComponentModel.Win32Exception ? " (--format dot writes the display DOT without Graphviz.)" : "";
+                await Console.Error.WriteLineAsync($"✖ {ex.Message}{hint}").ConfigureAwait(false);
                 return ExitCodes.Configuration;
             }
 
@@ -352,14 +421,28 @@ internal static class PipelineCommands
             }
             else
             {
-                await File.WriteAllBytesAsync(target, bytes, cancellationToken).ConfigureAwait(false);
-                Console.WriteLine($"Wrote {Path.GetFullPath(target)}");
+                try
+                {
+                    await File.WriteAllBytesAsync(target, bytes, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    await Console.Error.WriteLineAsync("✖ " + ex.Message).ConfigureAwait(false);
+                    return ExitCodes.InvalidInput;
+                }
+
+                Console.WriteLine($"Wrote {Path.GetFullPath(target)} ({fmt}" + (progress is null ? ")" : $", {Describe(progress)})"));
             }
 
             return ExitCodes.Success;
         });
         return command;
     }
+
+    /// <summary>A one-line summary of a run's progress for <c>reactor render --run</c>.</summary>
+    private static string Describe(RunProgress progress) =>
+        $"{progress.Statuses.Count.ToString(CultureInfo.InvariantCulture)} stage(s) finished, " +
+        (progress.Running.Count > 0 ? "running: " + string.Join(", ", progress.Running) : progress.Finished ? "run ended" : "none running");
 
     /// <summary>Shared run/resume flow: compose backends, run, report, and map the result to an exit code.</summary>
     private static async Task<int> ExecuteAsync(
@@ -401,12 +484,14 @@ internal static class PipelineCommands
         await using (selection.ConfigureAwait(false))
         {
             reporter.Info($"backend: {selection.Description}");
-            EnsureRunsDirectory(workDir);
             var runner = new PipelineRunner(new PipelineRunnerOptions
             {
                 Backend = selection.Backend,
                 Interviewer = options.Interviewer(result),
                 LogsBaseDirectory = RunsDirectory(workDir),
+
+                // Tool stages change files for real even with the simulate backend.
+                RealWorkspace = true,
             });
             var runOptions = new RunOptions
             {
@@ -414,6 +499,11 @@ internal static class PipelineCommands
                 InitialContext = initialContext,
                 OnEvent = reporter.OnEvent,
                 MaxSteps = Math.Max(0, result.GetValue(options.MaxSteps)),
+                MaxCostUsd = result.GetValue(options.MaxCost),
+                TrackWorkspaceChanges = result.GetValue(options.NoTrackChanges) ? false : null,
+
+                // A snapshot after each stage lets the Studio re-fly (fork) CLI runs from any stage.
+                KeepCheckpointHistory = true,
             };
 
             PipelineResult? outcome;
@@ -484,7 +574,16 @@ internal static class PipelineCommands
         return await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
     }
 
-    internal static string RunsDirectory(string workDir) => Path.Combine(workDir, ".reactor", "runs");
+    internal static string ReactorDirectory(string workDir) => Path.Combine(workDir, ".reactor");
+
+    internal static string RunsDirectory(string workDir) => Path.Combine(ReactorDirectory(workDir), "runs");
+
+    /// <summary>
+    /// The default run directory name: <c>{UTC timestamp yyyyMMdd-HHmmss}-{graph}</c>. The timestamp is UTC, like the
+    /// names the engine and the server give their runs, so CLI and server runs sharing a runs folder sort by start time.
+    /// </summary>
+    internal static string RunDirectoryName(string graphName, DateTime utcNow) =>
+        $"{(utcNow.Kind == DateTimeKind.Local ? utcNow.ToUniversalTime() : utcNow).ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}-{Sanitize(graphName)}";
 
     /// <summary><paramref name="name"/> under <paramref name="parent"/>, suffixed (-2, -3, …) if that run directory exists.</summary>
     internal static string UniqueRunDirectory(string parent, string name)
@@ -498,16 +597,30 @@ internal static class PipelineCommands
         return path;
     }
 
-    /// <summary>Creates <c>.reactor/</c> with a <c>.gitignore</c> so run logs never end up in commits.</summary>
+    /// <summary>Creates <c>.reactor/runs/</c> (and <c>.reactor/.gitignore</c>) in <paramref name="workDir"/>.</summary>
     internal static void EnsureRunsDirectory(string workDir)
     {
-        var root = Path.Combine(workDir, ".reactor");
-        Directory.CreateDirectory(Path.Combine(root, "runs"));
+        EnsureReactorDirectory(workDir);
+        Directory.CreateDirectory(RunsDirectory(workDir));
+    }
+
+    /// <summary>Creates <c>.reactor/</c> with a <c>.gitignore</c> so run logs never end up in commits.</summary>
+    internal static void EnsureReactorDirectory(string workDir)
+    {
+        var root = ReactorDirectory(workDir);
+        Directory.CreateDirectory(root);
         var ignore = Path.Combine(root, ".gitignore");
         if (!File.Exists(ignore))
         {
             File.WriteAllText(ignore, "# Reactor run logs and checkpoints\n*\n");
         }
+    }
+
+    /// <summary>True when <paramref name="path"/> is <paramref name="directory"/> or below it (both full paths).</summary>
+    internal static bool IsInside(string path, string directory)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return relative == "." || (!Path.IsPathRooted(relative) && relative != ".." && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal));
     }
 
     internal static string Sanitize(string name)

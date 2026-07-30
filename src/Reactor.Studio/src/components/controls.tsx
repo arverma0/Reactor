@@ -408,6 +408,102 @@ export function Dropdown<T extends string>({
   );
 }
 
+export interface ComboOption {
+  value: string;
+  group?: string;
+  detail?: ReactNode;
+}
+
+/**
+ * A free-text input with suggestions: typing filters them, arrow keys and Enter pick one, and any other text is kept as
+ * typed. Suggestions show while the input has focus (all of them when the text is already one of them).
+ */
+export function ComboInput({
+  value,
+  onChange,
+  options,
+  placeholder,
+  className,
+  invalid,
+  title,
+  width = 260,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: ComboOption[];
+  placeholder?: string;
+  className?: string;
+  invalid?: boolean;
+  title?: string;
+  width?: number;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const filtered = useMemo(() => {
+    const q = value.trim().toLowerCase();
+    if (!q || options.some((o) => o.value === value)) return options;
+    return options.filter((o) => o.value.toLowerCase().includes(q));
+  }, [options, value]);
+  const choose = (v: string) => {
+    onChange(v);
+    setOpen(false);
+    setActive(-1);
+  };
+  return (
+    <>
+      <input
+        ref={ref}
+        className={cx(className, invalid && "is-invalid")}
+        value={value}
+        placeholder={placeholder}
+        title={title}
+        spellCheck={false}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+          setActive(-1);
+        }}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setOpen(true);
+            setActive((a) => Math.min(a + 1, filtered.length - 1));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActive((a) => Math.max(a - 1, 0));
+          } else if (e.key === "Enter" && open && filtered[active]) {
+            e.preventDefault();
+            choose(filtered[active].value);
+          } else if (e.key === "Escape") setOpen(false);
+        }}
+      />
+      <Popover anchor={ref.current} open={open && filtered.length > 0} onClose={() => setOpen(false)} width={width}>
+        <div className="rs-pop__list">
+          {filtered.map((option, i) => (
+            <div key={option.value}>
+              {option.group && (i === 0 || filtered[i - 1].group !== option.group) ? <div className="rs-pop__group">{option.group}</div> : null}
+              <button
+                type="button"
+                className={cx("rs-pop__item", option.value === value && "is-selected", i === active && "is-active")}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => choose(option.value)}
+              >
+                <span className="rs-pop__label mono">{option.value}</span>
+                {option.detail ? <span className="rs-pop__detail">{option.detail}</span> : null}
+              </button>
+            </div>
+          ))}
+        </div>
+      </Popover>
+    </>
+  );
+}
+
 export function Menu({ items, onClose }: { items: ({ label: ReactNode; icon?: string; hint?: ReactNode; danger?: boolean; disabled?: boolean; run: () => void } | "divider")[]; onClose: () => void }) {
   return (
     <div className="rs-menu" role="menu">

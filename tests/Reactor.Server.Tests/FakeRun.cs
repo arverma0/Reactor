@@ -77,6 +77,31 @@ internal sealed class FakeRun
     public FakeRun Edge(string from, string to) =>
         Event("EdgeSelected", new JsonObject { ["from"] = from, ["to"] = to, ["reason"] = "unconditional", ["label"] = "" });
 
+    /// <summary>A <c>MetricsRecorded</c> event: the outcome metrics a stage's visit reported.</summary>
+    public FakeRun Metrics(string node, params (string Name, double Value)[] metrics)
+    {
+        var values = new JsonObject();
+        foreach (var (name, value) in metrics)
+        {
+            values[name] = value;
+        }
+
+        return Event("MetricsRecorded", new JsonObject { ["node_id"] = node, ["metrics"] = values });
+    }
+
+    /// <summary>A <c>FailedStageContinued</c> event: a failure that flowed onward along an unconditional edge.</summary>
+    public FakeRun Continued(string node, string to, string reason = "it broke") =>
+        Event("FailedStageContinued", new JsonObject { ["node_id"] = node, ["to"] = to, ["failure_reason"] = reason });
+
+    /// <summary>A <c>VisitLimitReached</c> event and the <c>max_visits</c> hop that follows it.</summary>
+    public FakeRun VisitLimit(string node, int max, string target) =>
+        Event("VisitLimitReached", new JsonObject { ["node_id"] = node, ["max_visits"] = max, ["target"] = target })
+            .Event("EdgeSelected", new JsonObject { ["from"] = node, ["to"] = target, ["reason"] = "max_visits", ["label"] = "" });
+
+    /// <summary>A <c>BudgetExceeded</c> event.</summary>
+    public FakeRun Budget(double spent, double limit, string next) =>
+        Event("BudgetExceeded", new JsonObject { ["spent_usd"] = spent, ["limit_usd"] = limit, ["next_node_id"] = next });
+
     /// <summary>Writes <c>backend.json</c> for the latest visit of a stage, or for <c>history/visit-N</c>.</summary>
     public FakeRun Backend(string node, JsonObject metadata, int? visit = null) =>
         File(visit is { } n ? Path.Combine(node, "history", $"visit-{n}", "backend.json") : Path.Combine(node, "backend.json"), metadata.ToJsonString());

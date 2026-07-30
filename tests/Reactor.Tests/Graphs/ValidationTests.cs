@@ -159,6 +159,23 @@ public class ValidationTests
         Assert.Equal("ERROR [reachability] node 'x': Node 'x' is unreachable. (fix: connect it)", text);
     }
 
+    [Fact]
+    public void Tool_color_must_be_a_boolean()
+    {
+        var diagnostics = Lint("""
+            digraph G {
+                start [shape=Mdiamond] exit [shape=Msquare]
+                good [shape=parallelogram, tool_command="npm test", tool_color=true]
+                bad [shape=parallelogram, tool_command="npm test", tool_color="sometimes"]
+                start -> good -> bad -> exit
+            }
+            """);
+
+        var diagnostic = Assert.Single(diagnostics, d => d.Rule == "attribute_types");
+        Assert.Equal("bad", diagnostic.NodeId);
+        Assert.Contains("tool_color='sometimes'", diagnostic.Message, StringComparison.Ordinal);
+    }
+
     private sealed class NoWorkRule : ILintRule
     {
         public string Name => "no_work";

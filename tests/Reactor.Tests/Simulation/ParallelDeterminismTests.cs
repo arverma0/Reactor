@@ -4,6 +4,7 @@ using Reactor.Simulation;
 namespace Reactor.Tests.Simulation;
 
 /// <summary>Simulation results must not depend on how parallel branches are scheduled.</summary>
+[Collection(Sim.Collection)]
 public sealed class ParallelDeterminismTests
 {
     private const string FirstSuccess = """

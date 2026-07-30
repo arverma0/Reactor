@@ -112,6 +112,7 @@ public static class StudioApi
             name = "Reactor",
             version = PipelineRunner.Version,
             working_directory = Path.GetFullPath(options.WorkingDirectory),
+            allow_client_working_directory = options.AllowClientWorkingDirectory,
             runs_directory = manager.Runner.Options.LogsBaseDirectory,
             backend = new
             {

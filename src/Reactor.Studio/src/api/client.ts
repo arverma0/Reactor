@@ -1,4 +1,5 @@
 import type {
+  ForkRequest,
   ForkResponse,
   HistoryDetail,
   HistorySummary,
@@ -10,6 +11,7 @@ import type {
   RunDetail,
   RunSummary,
   ServerInfo,
+  StageVisits,
   Telemetry,
   WorkspaceDocument,
   WorkspaceFile,
@@ -74,6 +76,8 @@ export interface StartRunBody {
   context?: Record<string, unknown>;
   studio?: Record<string, unknown>;
   simulation?: Record<string, unknown>;
+  /** The run's cost budget in US dollars (default: the server's, else the pipeline's `max_cost`). */
+  max_cost?: number;
 }
 
 export interface StartRunResponse {
@@ -97,7 +101,9 @@ export const api = {
   runs: () => request<RunSummary[]>("GET", "/pipelines"),
   run: (id: string) => request<RunDetail>("GET", `/pipelines/${encodeURIComponent(id)}`),
   cancel: (id: string) => request<unknown>("POST", `/pipelines/${encodeURIComponent(id)}/cancel`),
-  resume: (id: string) => request<RunDetail>("POST", `/pipelines/${encodeURIComponent(id)}/resume`),
+  /** Resumes a stopped run from its checkpoint; `maxCost` sets a new budget (to go on after a budget stop). */
+  resume: (id: string, maxCost?: number) =>
+    request<RunDetail>("POST", `/pipelines/${encodeURIComponent(id)}/resume`, maxCost !== undefined ? { max_cost: maxCost } : undefined),
   questions: (id: string) => request<PendingQuestion[]>("GET", `/pipelines/${encodeURIComponent(id)}/questions`),
   answer: (id: string, questionId: string, value?: string, text?: string) =>
     request<unknown>("POST", `/pipelines/${encodeURIComponent(id)}/questions/${encodeURIComponent(questionId)}/answer`, { value, text }),
@@ -113,14 +119,17 @@ export const api = {
   historyRun: (dir: string) => request<HistoryDetail>("GET", `/studio/api/runs/${encodeURIComponent(dir)}`),
   historyEvents: (dir: string, since = 0, limit = 20000) =>
     request<{ events: PipelineEventJson[]; next: number; done: boolean }>("GET", `/studio/api/runs/${encodeURIComponent(dir)}/events?since=${since}&limit=${limit}`),
-  historyFile: (dir: string, node: string, name: string, visit?: number) =>
-    request<string | object>(
+  historyFile: (dir: string, node: string, name: string, visit?: number, attempt?: number) => {
+    const query = [visit !== undefined ? `visit=${visit}` : "", attempt !== undefined ? `attempt=${attempt}` : ""].filter(Boolean).join("&");
+    return request<string | object>(
       "GET",
-      `/studio/api/runs/${encodeURIComponent(dir)}/stages/${encodeURIComponent(node)}/files/${encodeURIComponent(name)}${visit !== undefined ? `?visit=${visit}` : ""}`,
-    ),
+      `/studio/api/runs/${encodeURIComponent(dir)}/stages/${encodeURIComponent(node)}/files/${encodeURIComponent(name)}${query ? `?${query}` : ""}`,
+    );
+  },
+  /** Every visit of a stage in a run directory, with its files and its retried attempts. */
+  stageVisits: (dir: string, node: string) => request<StageVisits>("GET", `/studio/api/runs/${encodeURIComponent(dir)}/stages/${encodeURIComponent(node)}/visits`),
   telemetry: (name: string, limit = 50) => request<Telemetry>("GET", `/studio/api/telemetry?name=${encodeURIComponent(name)}&limit=${limit}`),
-  fork: (dir: string, body: { checkpoint: string; dot?: string; context?: Record<string, unknown> }) =>
-    request<ForkResponse>("POST", `/studio/api/runs/${encodeURIComponent(dir)}/fork`, body),
+  fork: (dir: string, body: ForkRequest) => request<ForkResponse>("POST", `/studio/api/runs/${encodeURIComponent(dir)}/fork`, body),
   steer: (id: string, message: string, node?: string) =>
     request<{ status: string; node: string; path: string }>("POST", `/studio/api/pipelines/${encodeURIComponent(id)}/steer`, { message, node }),
   get: <T>(path: string) => request<T>("GET", path),

@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
-import { Elapsed } from "../../canvas/Elapsed";
+import { Elapsed, formatDuration } from "../../canvas/Elapsed";
 import { Button, Dropdown, Segmented, Spinner, TextArea, cx } from "../../components/controls";
 import { Glyph } from "../../components/Glyph";
 import { Markdown } from "../../components/Markdown";
+import { modelPriceText, modelPriceTitle } from "../../model/cost";
 import type { DocDiff } from "../../model/diff";
 import { findNode, nodeLabel } from "../../model/doc";
 import type { StudioDoc } from "../../model/types";
 import { useStudio } from "../../state/store";
 import { pct, useTelemetry } from "../../state/telemetry";
+import { DURATION_PRIORS, formatUsd } from "../tunnel/scenario";
 import type { ForecastCompare, ForecastSide } from "./forecast";
+import { FINDING_LABEL, findingSummary, parseFinding, reviewVerdict } from "./findings";
 import {
   acceptProposal,
   cancelArchitect,
@@ -73,7 +76,21 @@ function Forecast({ forecast }: { forecast: ForecastCompare }) {
   const rows: { label: string; now?: string; next: string; delta?: number; better?: "up" | "down"; format: (d: number) => string }[] = [];
   const side = (s: ForecastSide | null | undefined, f: (x: ForecastSide) => number | undefined) => (s ? f(s) : undefined);
   const landed = { now: side(forecast.current, (s) => s.rate), next: forecast.proposal.rate };
-  rows.push({ label: "lands", now: landed.now !== undefined ? pct(landed.now) : undefined, next: pct(landed.next), delta: landed.now !== undefined ? landed.next - landed.now : undefined, better: "up", format: (d) => `${d > 0 ? "+" : "−"}${Math.abs(d * 100).toFixed(0)} pts` });
+  rows.push({ label: "lands clean", now: landed.now !== undefined ? pct(landed.now) : undefined, next: pct(landed.next), delta: landed.now !== undefined ? landed.next - landed.now : undefined, better: "up", format: (d) => `${d > 0 ? "+" : "−"}${Math.abs(d * 100).toFixed(0)} pts` });
+  const dirtyNow = side(forecast.current, (s) => s.dirty);
+  if (forecast.proposal.dirty > 0 || (dirtyNow ?? 0) > 0) {
+    rows.push({ label: "lands, failed stages", now: dirtyNow !== undefined ? pct(dirtyNow) : undefined, next: pct(forecast.proposal.dirty), delta: dirtyNow !== undefined ? forecast.proposal.dirty - dirtyNow : undefined, better: "down", format: (d) => `${d > 0 ? "+" : "−"}${Math.abs(d * 100).toFixed(0)} pts` });
+  }
+  if (forecast.proposal.durationMs) {
+    const now = side(forecast.current, (s) => s.durationMs?.mean);
+    const next = forecast.proposal.durationMs;
+    rows.push({ label: `time / flight (p90 ${formatDuration(next.p90)})`, now: now !== undefined ? formatDuration(now) : undefined, next: formatDuration(next.mean), delta: now !== undefined ? next.mean - now : undefined, better: "down", format: (d) => `${d > 0 ? "+" : "−"}${formatDuration(Math.abs(d))}` });
+  }
+  if (forecast.proposal.costUsd) {
+    const now = side(forecast.current, (s) => s.costUsd?.mean);
+    const next = forecast.proposal.costUsd;
+    rows.push({ label: "$ / flight", now: now !== undefined ? formatUsd(now) : undefined, next: formatUsd(next.mean), delta: now !== undefined ? next.mean - now : undefined, better: "down", format: (d) => `${d > 0 ? "+" : "−"}${formatUsd(Math.abs(d))}` });
+  }
   if (forecast.proposal.cost !== undefined) {
     const now = side(forecast.current, (s) => s.cost);
     rows.push({ label: "AIU / flight", now: now?.toFixed(1), next: forecast.proposal.cost.toFixed(1), delta: now !== undefined ? forecast.proposal.cost - now : undefined, better: "down", format: (d) => `${d > 0 ? "+" : "−"}${Math.abs(d).toFixed(1)}` });
@@ -107,6 +124,9 @@ function Forecast({ forecast }: { forecast: ForecastCompare }) {
       <p className="faint">
         {forecast.currentError ? `The current design could not be flown (${forecast.currentError}), so there is nothing to compare against. ` : ""}
         {forecast.runs.toLocaleString()} simulated flights each{forecast.current ? ", same dice for both designs, so the difference is the design" : ""}.
+        {forecast.basis === "realistic" && forecast.proposal.durationMs
+          ? ` Time assumes typical stage durations (agent stages ${formatDuration(DURATION_PRIORS.codergen ?? 0)}, tools ${formatDuration(DURATION_PRIORS.tool ?? 0)}) until the pipeline has a flight record.`
+          : ""}
       </p>
     </div>
   );
@@ -154,6 +174,82 @@ function Changes({ diff, base, proposal }: { diff: DocDiff; base: StudioDoc; pro
   );
 }
 
+/** Backtick-quoted parts of a finding (paths, attributes) as code. */
+function InlineCode({ text }: { text: string }) {
+  const parts = text.split(/`([^`]+)`/);
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <code key={i} className="mono">
+            {part}
+          </code>
+        ) : (
+          <span key={i}>{part}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/**
+ * The checker's findings on a draft, by kind: design rules (with the stage and the fix), contract findings (the brief's
+ * paths the draft contradicts), forecast findings (the brief's time budget), wind tunnel findings, and the self-review's
+ * unapplied changes.
+ */
+function Findings({ items, tone, doc }: { items: string[]; tone: "problem" | "warning"; doc: StudioDoc }) {
+  const findings = useMemo(() => items.map(parseFinding), [items]);
+  const label = (id: string) => {
+    const node = findNode(doc, id);
+    return node ? nodeLabel(doc, node) : id;
+  };
+  return (
+    <div className={cx("rs-findings", tone === "problem" && "is-problems")}>
+      <div className="label">{tone === "problem" ? "Must fix" : "Warnings"}</div>
+      {findings.map((f, i) => (
+        <div key={i} className={cx("rs-finding", `is-${f.kind}`)}>
+          <div className="rs-finding__head">
+            <span className="rs-finding__kind">{FINDING_LABEL[f.kind]}</span>
+            {f.rule ? <span className="rs-finding__rule mono">{f.rule}</span> : null}
+            {f.node ? (
+              <span className="rs-chip" title={f.node}>
+                {label(f.node)}
+              </span>
+            ) : null}
+            {f.edge ? <span className="rs-chip mono">{f.edge}</span> : null}
+          </div>
+          <div className="rs-finding__text">
+            <InlineCode text={f.text} />
+          </div>
+          {f.fix ? (
+            <div className="rs-finding__fix">
+              <span className="faint">fix:</span> <InlineCode text={f.fix} />
+            </div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const VERDICT_TEXT = { pass: "passed", revise: "asked for changes", skipped: "did not run" } as const;
+
+/** The drafting model's review of its own draft against the brief: its verdict, and its reasoning. */
+function SelfReview({ review }: { review: string }) {
+  const verdict = reviewVerdict(review) ?? "pass";
+  const [open, setOpen] = useState(verdict !== "pass");
+  return (
+    <div className={cx("rs-selfreview", `is-${verdict}`)}>
+      <button type="button" className="rs-selfreview__head" onClick={() => setOpen(!open)}>
+        <Glyph name={open ? "chevronDown" : "chevronRight"} size={11} />
+        <span className="label">Self-review</span>
+        <span className={cx("rs-selfreview__verdict", `is-${verdict}`)}>{VERDICT_TEXT[verdict]}</span>
+      </button>
+      {open ? <Markdown text={review.replace(/^\s*\**`*VERDICT:\s*PASS`*\**\s*$/im, "").trim() || "No changes needed."} className="rs-selfreview__body" /> : null}
+    </div>
+  );
+}
+
 function Job() {
   const job = useArchitect((s) => s.job)!;
   const proposalDoc = useArchitect((s) => s.proposalDoc);
@@ -181,7 +277,7 @@ function Job() {
             <li key={d.attempt} className={cx("rs-draft", d.passed ? "is-passed" : "is-failed")}>
               <span className="rs-draft__mark">{d.passed ? <Glyph name="check" size={12} /> : <Glyph name="cross" size={12} />}</span>
               <span className="rs-draft__title">Draft {d.attempt}</span>
-              <span className="rs-draft__text">{d.passed ? "passed the checks" : `${d.problems.length} finding${d.problems.length === 1 ? "" : "s"}: ${d.problems[0] ?? ""}`}</span>
+              <span className="rs-draft__text">{d.passed ? "passed the checks" : `${d.problems.length} finding${d.problems.length === 1 ? "" : "s"}: ${d.problems[0] ? findingSummary(d.problems[0]) : ""}`}</span>
             </li>
           ))}
           {running ? (
@@ -224,20 +320,9 @@ function Job() {
           ) : null}
           {diff && job.base ? <Changes diff={diff} base={job.base} proposal={proposalDoc} /> : null}
           {state?.rationale ? <Markdown text={state.rationale} className="rs-proposal__rationale" /> : null}
-          {proposal.problems.length > 0 ? (
-            <div className="rs-proposal__issues is-problems">
-              {proposal.problems.map((p, i) => (
-                <div key={i}>{p}</div>
-              ))}
-            </div>
-          ) : null}
-          {proposal.warnings.length > 0 ? (
-            <div className="rs-proposal__issues">
-              {proposal.warnings.map((w, i) => (
-                <div key={i}>{w}</div>
-              ))}
-            </div>
-          ) : null}
+          {state?.review ? <SelfReview review={state.review} /> : null}
+          {proposal.problems.length > 0 ? <Findings items={proposal.problems} tone="problem" doc={proposalDoc} /> : null}
+          {proposal.warnings.length > 0 ? <Findings items={proposal.warnings} tone="warning" doc={proposalDoc} /> : null}
           <div className="rs-proposal__actions">
             <Button icon="eye" active={preview} onClick={() => togglePreview()}>
               {preview ? "Back to design" : "Preview"}
@@ -272,7 +357,7 @@ export function ArchitectPanel() {
     () =>
       models
         .filter((m) => m.available)
-        .map((m) => ({ value: m.id, label: m.display_name ?? m.id, text: `${m.id} ${m.display_name ?? ""}`, detail: m.billing_multiplier != null ? `${m.billing_multiplier}×` : undefined, group: m.provider })),
+        .map((m) => ({ value: m.id, label: <span title={modelPriceTitle(m)}>{m.display_name ?? m.id}</span>, text: `${m.id} ${m.display_name ?? ""}`, detail: modelPriceText(m), group: m.provider })),
     [models],
   );
   const empty = doc.nodes.length <= 2;

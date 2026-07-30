@@ -3,12 +3,15 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using Reactor.Processes;
 
 namespace Reactor.Agent.Environments;
 
 /// <summary>
 /// Runs a shell process with captured output, a timeout, cancellation, and process-tree termination
-/// (graceful signal, a 2 second grace period, then a forced kill).
+/// (graceful signal, a 2 second grace period, then a forced kill). On Windows the process tree is held in a job object
+/// (<see cref="ProcessTreeGuard"/>), so termination also reaches descendants whose parent already exited; on Unix the
+/// shell leads its own process group when started through <c>setsid</c>.
 /// </summary>
 internal static class ProcessRunner
 {
@@ -50,9 +53,10 @@ internal static class ProcessRunner
             throw new InvalidOperationException($"Failed to start '{startInfo.FileName}': {ex.Message}", ex);
         }
 
+        var tree = ProcessTreeGuard.Attach(process, ownsProcessGroup);
         var capture = new OutputCapture(onOutput);
         capture.Start(process.StandardOutput, process.StandardError);
-        var running = new RunningProcess(process, ownsProcessGroup, capture.Completion);
+        var running = new RunningProcess(process, ownsProcessGroup, capture.Completion, tree);
         tracker.Add(running);
         try
         {
@@ -95,8 +99,13 @@ internal static class ProcessRunner
             // CleanupAsync may still be terminating the tree; release the process object only once both are done.
             var termination = running.MarkFinished();
             _ = Task.WhenAll(capture.Completion, termination).ContinueWith(
-                static (_, state) => ((Process)state!).Dispose(),
-                process,
+                static (_, state) =>
+                {
+                    var (finished, guard) = ((Process, ProcessTreeGuard))state!;
+                    guard.Dispose();
+                    finished.Dispose();
+                },
+                (process, tree),
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
@@ -289,15 +298,17 @@ internal sealed class RunningProcess
     private readonly Process _process;
     private readonly bool _ownsProcessGroup;
     private readonly Task _outputClosed;
+    private readonly ProcessTreeGuard _tree;
     private readonly object _gate = new();
     private Task? _termination;
     private bool _finished;
 
-    public RunningProcess(Process process, bool ownsProcessGroup, Task outputClosed)
+    public RunningProcess(Process process, bool ownsProcessGroup, Task outputClosed, ProcessTreeGuard tree)
     {
         _process = process;
         _ownsProcessGroup = ownsProcessGroup;
         _outputClosed = outputClosed;
+        _tree = tree;
         Id = process.Id;
     }
 
@@ -351,15 +362,28 @@ internal sealed class RunningProcess
 
     /// <summary>
     /// Marks the run as finished so later termination requests are no-ops; returns any termination still in progress,
-    /// which must complete before the process object is disposed.
+    /// which must complete before the process object is disposed. When nothing terminated the command and it exited on
+    /// its own, the process tree is released: processes it deliberately left running in the background keep running.
     /// </summary>
     public Task MarkFinished()
     {
         lock (_gate)
         {
             _finished = true;
-            return _termination ?? Task.CompletedTask;
+            if (_termination is not null)
+            {
+                return _termination;
+            }
+
+            if (!HasExited)
+            {
+                // Only reached when the run ended abnormally while the command was still running.
+                return _termination = Task.Run(TerminateCoreAsync);
+            }
         }
+
+        _tree.Release();
+        return Task.CompletedTask;
     }
 
     private async Task TerminateCoreAsync()
@@ -367,6 +391,9 @@ internal sealed class RunningProcess
         if (OperatingSystem.IsWindows())
         {
             await SignalWindowsTreeAsync().ConfigureAwait(false);
+
+            // The job object reaches descendants whose parent already exited, which the tree walk cannot find.
+            await _tree.TerminateAsync(TimeSpan.Zero).ConfigureAwait(false);
         }
         else
         {
@@ -475,118 +502,9 @@ internal sealed class RunningProcess
         }
     }
 
-    // POSIX spelling "kill -s SIG -- -PGID", run through the shell's builtin to avoid differences between kill binaries.
-    private static Task SendSignalAsync(string signal, IReadOnlyList<string> targets) =>
-        targets.Count == 0
-            ? Task.CompletedTask
-            : HelperProcess.RunAsync("/bin/sh", ["-c", $"kill -s {signal} -- {string.Join(' ', targets)}"]);
+    private static Task SendSignalAsync(string signal, IReadOnlyList<string> targets) => PosixProcesses.SignalAsync(signal, targets);
 
-    private static async Task<IReadOnlyList<string>> GetDescendantsAsync(int rootPid)
-    {
-        var (exitCode, output) = await HelperProcess.RunAsync("ps", ["-A", "-o", "pid=", "-o", "ppid="]).ConfigureAwait(false);
-        if (exitCode != 0)
-        {
-            return [];
-        }
-
-        var children = new Dictionary<int, List<int>>();
-        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 2 &&
-                int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var pid) &&
-                int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var parent))
-            {
-                if (!children.TryGetValue(parent, out var list))
-                {
-                    children[parent] = list = [];
-                }
-
-                list.Add(pid);
-            }
-        }
-
-        var result = new List<string>();
-        var queue = new Queue<int>();
-        queue.Enqueue(rootPid);
-        var seen = new HashSet<int> { rootPid };
-        while (queue.Count > 0)
-        {
-            if (!children.TryGetValue(queue.Dequeue(), out var list))
-            {
-                continue;
-            }
-
-            foreach (var child in list)
-            {
-                if (seen.Add(child))
-                {
-                    result.Add(child.ToString(CultureInfo.InvariantCulture));
-                    queue.Enqueue(child);
-                }
-            }
-        }
-
-        return result;
-    }
-}
-
-/// <summary>Runs short helper commands (taskkill, kill, ps) quietly with a bounded wait.</summary>
-internal static class HelperProcess
-{
-    public static async Task<(int? ExitCode, string Output)> RunAsync(string fileName, IReadOnlyList<string> arguments)
-    {
-        var startInfo = new ProcessStartInfo(fileName)
-        {
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
-
-        try
-        {
-            using var process = Process.Start(startInfo);
-            if (process is null)
-            {
-                return (null, "");
-            }
-
-            process.StandardInput.Close();
-            var stdout = process.StandardOutput.ReadToEndAsync();
-            var stderr = process.StandardError.ReadToEndAsync();
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            try
-            {
-                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-                await Task.WhenAll(stdout, stderr).WaitAsync(timeout.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
-                {
-                    // Best effort.
-                }
-
-                return (null, "");
-            }
-
-            return (process.ExitCode, await stdout.ConfigureAwait(false));
-        }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or IOException)
-        {
-            return (null, "");
-        }
-    }
+    private static Task<IReadOnlyList<string>> GetDescendantsAsync(int rootPid) => PosixProcesses.GetDescendantsAsync(rootPid);
 }
 
 /// <summary>The set of commands currently running in an environment, so cleanup can terminate them.</summary>

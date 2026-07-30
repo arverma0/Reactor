@@ -1,7 +1,7 @@
 import { BaseEdge, EdgeLabelRenderer, useInternalNode, type Edge, type EdgeProps } from "@xyflow/react";
 import { memo } from "react";
 import { cx } from "../components/controls";
-import type { CableData, DataEdgeData } from "./build";
+import type { CableData, DataEdgeData, RerouteData } from "./build";
 
 interface Geometry {
   path: string;
@@ -112,5 +112,49 @@ function DataEdgeImpl({ id, source, target, sourceX, sourceY, targetX, targetY, 
   );
 }
 
+/**
+ * A stage's visit-limit reroute (`on_max_visits`): not a route the stage picks, but where the run goes instead once the
+ * stage has run `max_visits` times — drawn dashed, from the stage's "after N visits" port.
+ */
+function RerouteEdgeImpl({ id, source, target, sourceX, sourceY, targetX, targetY, data, selected }: EdgeProps<Edge<RerouteData>>) {
+  const geometry = useGeometry(source, target, sourceX, sourceY, targetX, targetY, data?.lane ?? 0);
+  if (!data) return null;
+  const overlay = data.overlay;
+  const flowWidth = overlay?.flow !== undefined ? 1.25 + Math.sqrt(Math.max(0, overlay.flow)) * 7 : undefined;
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        path={geometry.path}
+        interactionWidth={18}
+        className={cx(
+          "rs-cable rs-cable--reroute",
+          selected && "is-selected",
+          overlay?.state && `is-${overlay.state}`,
+          data.overlayKind && `overlay-${data.overlayKind}`,
+          data.overlayKind && !overlay && "is-untraveled",
+        )}
+        style={flowWidth ? { strokeWidth: flowWidth } : undefined}
+      />
+      {overlay?.pulse ? (
+        <circle key={overlay.pulse} r={4} className="rs-comet">
+          <animateMotion dur="0.85s" path={geometry.path} fill="freeze" calcMode="spline" keyTimes="0;1" keySplines="0.3 0 0.2 1" />
+        </circle>
+      ) : null}
+      <EdgeLabelRenderer>
+        <div
+          className={cx("rs-edge-chip rs-edge-chip--reroute", selected && "is-selected", overlay?.state && `is-${overlay.state}`)}
+          style={{ transform: `translate(-50%, -50%) translate(${geometry.labelX}px, ${geometry.labelY}px)` }}
+          title={`After ${data.max} visit${data.max === 1 ? "" : "s"} of ${data.node}, the run goes here instead (max_visits / on_max_visits)`}
+        >
+          <span className="rs-edge-chip__text">⟲ after {data.max} visit{data.max === 1 ? "" : "s"}</span>
+          {overlay?.text ? <span className="rs-edge-chip__metric num">{overlay.text}</span> : null}
+        </div>
+      </EdgeLabelRenderer>
+    </>
+  );
+}
+
 export const CableEdge = memo(CableEdgeImpl);
 export const DataEdge = memo(DataEdgeImpl);
+export const RerouteEdge = memo(RerouteEdgeImpl);

@@ -29,7 +29,7 @@ import { applyDoc, emptySelection, select, toast, useStudio } from "../state/sto
 import { setDesignLens, useTelemetry } from "../state/telemetry";
 import { canvasActions } from "./actions";
 import { buildEdges, buildFrames, buildStageData, buildStageNode, frameAt, type Box, type CanvasOverlay, type NoteData } from "./build";
-import { CableEdge, DataEdge } from "./edges";
+import { CableEdge, DataEdge, RerouteEdge } from "./edges";
 import { FrameNode } from "./FrameNode";
 import { NoteNode } from "./NoteNode";
 import { StageNode } from "./StageNode";
@@ -37,7 +37,10 @@ import { insertPattern, PATTERNS } from "../model/patterns";
 import { deleteSelection, duplicateSelection } from "../state/editing";
 
 const nodeTypes = { stage: StageNode, frame: FrameNode, note: NoteNode };
-const edgeTypes = { cable: CableEdge, data: DataEdge };
+const edgeTypes = { cable: CableEdge, data: DataEdge, reroute: RerouteEdge };
+
+/** The `out:` handle of a stage's visit-limit port (its connection sets `on_max_visits`, not an edge). */
+const REROUTE_HANDLE = "out:max_visits";
 
 interface PendingConnection {
   source: string;
@@ -347,6 +350,14 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
     for (const change of changes) {
       if (change.type !== "select") continue;
       if (change.id.startsWith("data:")) continue;
+      if (change.id.startsWith("reroute:")) {
+        // A visit-limit reroute belongs to its stage: selecting it shows the stage (its Flow control settings).
+        if (change.selected) {
+          next = { ...emptySelection, nodes: [change.id.slice(8)] };
+          changed = true;
+        }
+        continue;
+      }
       changed = true;
       const set = new Set(next.edges);
       if (change.selected) set.add(change.id);
@@ -368,6 +379,9 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
     const source = findNode(d, connection.source);
     const target = findNode(d, connection.target);
     if (!source || !target) return false;
+    if (sourceHandle === REROUTE_HANDLE) {
+      return targetHandle === "in" && handlerOf(d, target) !== "start" && target.id !== source.id;
+    }
     if (sourceHandle.startsWith("out:")) {
       return targetHandle === "in" && handlerOf(d, target) !== "start";
     }
@@ -388,6 +402,11 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
       if (inputs.includes(name)) return;
       applyDoc((x) => setNodeAttr(x, target, "inputs", formatInputs([...inputs, name])), { select: { nodes: [target] } });
       toast(`“${target}” now reads ${name}.`, "info", undefined, 2000);
+      return;
+    }
+    if (handle === REROUTE_HANDLE) {
+      applyDoc((x) => setNodeAttr(x, source, "on_max_visits", target));
+      toast(`After its last allowed visit, “${source}” now hands over to “${target}”.`, "info", undefined, 2400);
       return;
     }
     const routeKey = handle.slice(4);
@@ -424,6 +443,7 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
       const node = newNodeOfKind(d, kind);
       created = node.id;
       const placed = addNode(d, node, { x: Math.round(pending.flow.x), y: Math.round(pending.flow.y - 30) });
+      if (pending.handle === REROUTE_HANDLE) return setNodeAttr(placed, pending.source, "on_max_visits", node.id);
       const source = findNode(placed, pending.source)!;
       const attrs = attrsForRoute(placed, source, pending.handle.slice(4), node, placed.edges.filter((e) => e.from === pending.source));
       return addEdge(placed, pending.source, node.id, attrs).doc;
@@ -475,6 +495,7 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
   const onEdgeContextMenu: EdgeMouseHandler = (event, edge) => {
     event.preventDefault();
     if (edge.type === "cable") select({ edges: [edge.id] });
+    else if (edge.type === "reroute") select({ nodes: [edge.source] });
     setMenu({ x: event.clientX, y: event.clientY, kind: "edge", id: edge.id });
   };
   const onPaneContextMenu = (event: ReactMouseEvent | MouseEvent) => {
@@ -535,6 +556,13 @@ export function Canvas({ overlay, readOnly: readOnlyProp = false, doc: docProp, 
       ];
     }
     if (menu.kind === "edge") {
+      if (menu.id?.startsWith("reroute:")) {
+        const node = menu.id.slice(8);
+        return [
+          { label: "Inspect the visit limit", icon: "sliders", run: () => useStudio.setState({ inspectorOpen: true, selection: { ...emptySelection, nodes: [node] } }) },
+          { label: "Remove the reroute (fail at the limit)", icon: "trash", danger: true, run: () => applyDoc((d) => setNodeAttr(d, node, "on_max_visits", undefined)) },
+        ];
+      }
       return [{ label: "Delete connection", icon: "trash", danger: true, hint: "Del", run: () => deleteSelection() }];
     }
     return [

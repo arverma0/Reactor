@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Reactor.Conditions;
 using Reactor.Events;
 using Reactor.Graphs;
 using Reactor.Handlers;
@@ -16,7 +17,7 @@ namespace Reactor.Execution;
 /// Traversal is single-threaded; parallelism happens inside the parallel handler, whose branches run on isolated
 /// context clones through <see cref="IBranchExecutor"/>.
 /// </summary>
-public sealed class PipelineRunner
+public sealed partial class PipelineRunner
 {
     private readonly List<IGraphTransform> _transforms = [];
     private readonly List<ILintRule> _lintRules = [];
@@ -104,7 +105,14 @@ public sealed class PipelineRunner
         }
 
         var execution = new PipelineExecution(this, prepared.Graph, options ?? new RunOptions(), prepared.Diagnostics);
-        return await execution.RunAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await execution.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await execution.ReleaseWorkspaceAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -131,13 +139,20 @@ public sealed class PipelineRunner
 
         var runOptions = (options ?? new RunOptions()) with { LogsRoot = logsRoot, RunId = checkpoint.RunId.Length > 0 ? checkpoint.RunId : options?.RunId };
         var execution = new PipelineExecution(this, prepared.Graph, runOptions, prepared.Diagnostics);
-        return await execution.ResumeAsync(checkpoint, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await execution.ResumeAsync(checkpoint, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await execution.ReleaseWorkspaceAsync().ConfigureAwait(false);
+        }
     }
 
     internal void RaiseEvent(PipelineEvent pipelineEvent) => OnEvent?.Invoke(pipelineEvent);
 
     /// <summary>One execution of a pipeline (including loop restarts). Also serves as the branch executor.</summary>
-    private sealed class PipelineExecution : IBranchExecutor, IPipelineEventSink, IChildPipelineLauncher
+    private sealed partial class PipelineExecution : IBranchExecutor, IPipelineEventSink, IChildPipelineLauncher
     {
         internal const string GraphFileName = "graph.dot";
         private const string ResultFileName = "result.json";
@@ -166,6 +181,8 @@ public sealed class PipelineRunner
         private string? _lastThreadId;
         private string? _previousNodeId;
         private bool _degradeNextFidelity;
+        private readonly UsageLedger _usage = new();
+        private bool _unpricedWarned;
 
         public PipelineExecution(PipelineRunner runner, Graph graph, RunOptions options, IReadOnlyList<Diagnostic> diagnostics)
         {
@@ -176,13 +193,16 @@ public sealed class PipelineRunner
             _runId = options.RunId ?? Guid.NewGuid().ToString("N")[..12];
             _baseLogsRoot = Path.GetFullPath(options.LogsRoot ?? Path.Combine(
                 runner.Options.LogsBaseDirectory,
-                $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{SafeName(graph.Name)}-{_runId}"));
+                $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture)}-{SafeName(graph.Name)}-{_runId}"));
             _logsRoot = _baseLogsRoot;
         }
 
         private ICodergenBackend? Backend => _options.Backend ?? _runner.Options.Backend;
 
         private bool Persist => _runner.Options.PersistRunState;
+
+        /// <summary>The run's budget in US dollars: <see cref="RunOptions.MaxCostUsd"/>, else the graph's <c>max_cost</c>; 0 = none.</summary>
+        private double MaxCostUsd => _options.MaxCostUsd ?? (double.TryParse(_graph[AttrKeys.MaxCost]?.Trim().TrimStart('$'), NumberStyles.Float, CultureInfo.InvariantCulture, out var max) ? max : 0);
 
         public async Task<PipelineResult> RunAsync(CancellationToken cancellationToken)
         {
@@ -209,6 +229,7 @@ public sealed class PipelineRunner
             _outcomes = new Dictionary<string, Outcome>(checkpoint.NodeOutcomes, StringComparer.Ordinal);
             _retries = new Dictionary<string, int>(checkpoint.NodeRetries, StringComparer.Ordinal);
             _history = checkpoint.History.ToList();
+            _usage.Restore(checkpoint.Usage);
             _loopRestarts = checkpoint.LoopRestarts;
             _lastFidelity = checkpoint.LastFidelity;
             _lastThreadId = checkpoint.LastThreadId;
@@ -292,6 +313,7 @@ public sealed class PipelineRunner
         private async Task<PipelineResult> LoopAsync(string currentId, Edge? incoming, CancellationToken cancellationToken, bool restart = false)
         {
             var steps = 0;
+            var redirects = 0;
             while (true)
             {
                 if (restart)
@@ -320,6 +342,32 @@ public sealed class PipelineRunner
                 if (node is null)
                 {
                     return Finish(Outcome.Fail($"Node '{currentId}' does not exist."));
+                }
+
+                if (!Graph.IsExitNode(node))
+                {
+                    if (CheckVisitLimit(node, _context, emitEdge: true) is { } limit)
+                    {
+                        if (limit.Target is null)
+                        {
+                            return Finish(Outcome.Fail(limit.Reason));
+                        }
+
+                        // Stages whose on_max_visits targets are all used up would bounce between each other forever.
+                        if (++redirects > _graph.Nodes.Count)
+                        {
+                            return Finish(Outcome.Fail($"Visit limits redirect in a cycle without running a stage (last: '{node.Id}' -> '{limit.Target}')."));
+                        }
+
+                        currentId = limit.Target;
+                        incoming = null;
+                        continue;
+                    }
+
+                    if (StopIfOverBudget(node) is { } stopped)
+                    {
+                        return stopped;
+                    }
                 }
 
                 if (Graph.IsExitNode(node))
@@ -354,6 +402,7 @@ public sealed class PipelineRunner
                         : Finish(Outcome.Success("Pipeline completed."));
                 }
 
+                redirects = 0;
                 Outcome outcome;
                 try
                 {
@@ -380,6 +429,11 @@ public sealed class PipelineRunner
                         break;
                     case TransitionKind.Edge:
                         var edge = transition.Edge!;
+                        if (FlowsOnwardSilently(outcome, transition))
+                        {
+                            Emit(new FailedStageContinued(node.Id, edge.To, outcome.FailureReason));
+                        }
+
                         Emit(new EdgeSelected(node.Id, edge.To, transition.Reason, edge.Label));
                         currentId = edge.To;
                         incoming = edge;
@@ -403,12 +457,13 @@ public sealed class PipelineRunner
                 ? FidelityResolver.ResolveThread(incoming, node, _graph, _previousNodeId, _lastThreadId)
                 : null;
 
-            var (outcome, attempts) = await RunNodeAsync(node, _context, fidelity, threadId, index, cancellationToken).ConfigureAwait(false);
+            var (outcome, attempts) = await RunTrackedNodeAsync(node, _context, fidelity, threadId, index, cancellationToken).ConfigureAwait(false);
             Record(node, outcome, attempts, _context, topLevel: true);
             _lastFidelity = fidelity;
             _lastThreadId = threadId;
             _previousNodeId = node.Id;
             SaveCheckpoint(node.Id, finalStatus: null, snapshotIndex: index);
+            await RecordCheckpointWorkspaceAsync(node, index, cancellationToken).ConfigureAwait(false);
             return outcome;
         }
 
@@ -455,11 +510,14 @@ public sealed class PipelineRunner
             }
 
             var stageDir = _services.StageDirectory(node.Id);
-            PrepareStageDirectory(node.Id, stageDir);
+            var visit = PrepareStageDirectory(node.Id, stageDir);
+            SetVisitCount(node.Id, visit, context);
             var policy = handler is ISingleExecutionHandler
                 ? new NodeRetryPolicy { MaxAttempts = 1 }
                 : NodeRetryPolicy.For(node, _graph, _options.Backoff);
-            var applyNodeTimeout = handler is not ISelfTimedHandler;
+            var timing = StageTiming.For(node, handler, handlerType, Backend);
+            var previousKey = PreviousAttempt.ContextKey(node.Id);
+            context.Remove(previousKey);
 
             for (var attempt = 1; ; attempt++)
             {
@@ -468,18 +526,20 @@ public sealed class PipelineRunner
                 if (Persist)
                 {
                     DeleteFile(Path.Combine(stageDir, "status.json"));
+                    DeleteFile(Path.Combine(stageDir, StageMetrics.FileName));
                 }
 
+                var attemptStartUtc = DateTime.UtcNow.AddSeconds(-1);
                 var stopwatch = Stopwatch.StartNew();
                 Outcome? outcome = null;
                 Exception? error = null;
+                var timedOut = false;
                 using (var nodeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                using (var timersCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    if (applyNodeTimeout && node.Timeout is { } timeout && timeout > TimeSpan.Zero)
-                    {
-                        nodeCts.CancelAfter(timeout);
-                    }
-
+                    var timers = timing.HardTimeout is null
+                        ? Task.CompletedTask
+                        : RunStageTimersAsync(node, stageDir, timing, () => timedOut = true, nodeCts, timersCts.Token);
                     try
                     {
                         outcome = await handler.ExecuteAsync(node, context, _graph, _logsRoot, nodeCts.Token).ConfigureAwait(false);
@@ -488,28 +548,37 @@ public sealed class PipelineRunner
                     {
                         throw;
                     }
-                    catch (OperationCanceledException ex) when (nodeCts.IsCancellationRequested)
+                    catch (Exception ex) when (timedOut)
                     {
-                        error = new TimeoutException($"Stage '{node.Id}' timed out after {AttributeValues.FormatDuration(node.Timeout!.Value)}.", ex);
+                        // The engine stopped the stage at its time limit (whatever the handler threw while being stopped).
+                        error = new TimeoutException($"Stage '{node.Id}' timed out after {AttributeValues.FormatDuration(timing.HardTimeout!.Value)}.", ex);
                     }
                     catch (Exception ex)
                     {
                         error = ex;
                     }
+                    finally
+                    {
+                        await timersCts.CancelAsync().ConfigureAwait(false);
+                        await timers.ConfigureAwait(false);
+                    }
                 }
 
+                RecordUsage(node, stageDir, attemptStartUtc, timedOut ? timing.HardTimeout : null);
                 var willRetry = attempt < policy.MaxAttempts;
                 if (error is not null)
                 {
-                    var retryable = policy.ShouldRetry(error);
+                    var retryable = policy.ShouldRetry(error) && !(timedOut && timing.OnTimeout == StageTiming.OnTimeoutFail);
                     var message = DescribeError(error);
                     Emit(new StageFailed(node.Id, index, message, retryable && willRetry));
                     if (retryable && willRetry)
                     {
+                        PrepareRetry(node, context, stageDir, attempt, policy, timedOut ? AttemptEndings.Timeout : AttemptEndings.Error, message, stopwatch.Elapsed);
                         await DelayBeforeRetryAsync(node, index, attempt, policy, cancellationToken).ConfigureAwait(false);
                         continue;
                     }
 
+                    context.Remove(previousKey);
                     var failed = Outcome.Fail(message);
                     EnsureStatusFile(stageDir, failed);
                     Emit(new StageCompleted(node.Id, index, stopwatch.Elapsed, failed.Status.ToWire(), ""));
@@ -517,6 +586,7 @@ public sealed class PipelineRunner
                 }
 
                 outcome ??= ReadStatusFileOrDefault(node, stageDir);
+                outcome = WithFileMetrics(node, outcome, context, stageDir, attemptStartUtc);
                 switch (outcome.Status)
                 {
                     case StageStatus.Success:
@@ -527,6 +597,7 @@ public sealed class PipelineRunner
                             SetRetryCount(node.Id, 0, context);
                         }
 
+                        context.Remove(previousKey);
                         EnsureStatusFile(stageDir, outcome);
                         Emit(new StageCompleted(node.Id, index, stopwatch.Elapsed, outcome.Status.ToWire(), outcome.Notes));
                         return (outcome, attempt);
@@ -535,30 +606,183 @@ public sealed class PipelineRunner
                         if (willRetry)
                         {
                             Emit(new StageFailed(node.Id, index, DescribeOutcome(outcome, "requested retry"), WillRetry: true));
+                            PrepareRetry(node, context, stageDir, attempt, policy, AttemptEndings.Retry, outcome.FailureReason.Length > 0 ? outcome.FailureReason : outcome.Notes, stopwatch.Elapsed);
                             await DelayBeforeRetryAsync(node, index, attempt, policy, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
+                        context.Remove(previousKey);
                         var exhausted = node.AllowPartial
-                            ? Outcome.PartialSuccess("retries exhausted, partial accepted", outcome.ContextUpdates) with { PreferredLabel = outcome.PreferredLabel, SuggestedNextIds = outcome.SuggestedNextIds }
-                            : Outcome.Fail("max retries exceeded" + (outcome.FailureReason.Length > 0 ? $": {outcome.FailureReason}" : ""), outcome.ContextUpdates);
+                            ? Outcome.PartialSuccess("retries exhausted, partial accepted", outcome.ContextUpdates) with { PreferredLabel = outcome.PreferredLabel, SuggestedNextIds = outcome.SuggestedNextIds, Metrics = outcome.Metrics }
+                            : Outcome.Fail("max retries exceeded" + (outcome.FailureReason.Length > 0 ? $": {outcome.FailureReason}" : ""), outcome.ContextUpdates) with { Metrics = outcome.Metrics };
                         EnsureStatusFile(stageDir, exhausted, overwrite: true);
                         Emit(new StageCompleted(node.Id, index, stopwatch.Elapsed, exhausted.Status.ToWire(), exhausted.Notes));
                         return (exhausted, attempt);
 
                     default:
-                        if (willRetry)
+                        // A tool stage enforces its own time limit and reports it as a failure: it is still a timeout.
+                        var toolTimedOut = outcome.ContextUpdates.TryGetValue(ToolHandler.TimedOutKey, out var timedOutFlag) && timedOutFlag is true;
+                        if (willRetry && !(toolTimedOut && timing.OnTimeout == StageTiming.OnTimeoutFail))
                         {
                             Emit(new StageFailed(node.Id, index, DescribeOutcome(outcome, "stage failed"), WillRetry: true));
+                            PrepareRetry(node, context, stageDir, attempt, policy, toolTimedOut ? AttemptEndings.Timeout : AttemptEndings.Fail, outcome.FailureReason, stopwatch.Elapsed);
                             await DelayBeforeRetryAsync(node, index, attempt, policy, cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
+                        context.Remove(previousKey);
                         EnsureStatusFile(stageDir, outcome);
                         Emit(new StageFailed(node.Id, index, DescribeOutcome(outcome, "stage failed"), WillRetry: false));
                         Emit(new StageCompleted(node.Id, index, stopwatch.Elapsed, outcome.Status.ToWire(), outcome.Notes));
                         return (outcome, attempt);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Archives the attempt's stage files (so the next attempt starts fresh and the record of each attempt is kept) and
+        /// records how it ended for the next attempt's hand-off (see <see cref="PreviousAttempt"/>).
+        /// </summary>
+        private void PrepareRetry(Node node, PipelineContext context, string stageDir, int attempt, NodeRetryPolicy policy, string ending, string reason, TimeSpan elapsed)
+        {
+            var archive = Persist ? StageAttemptArchive.Archive(stageDir, attempt) : null;
+            var previous = new PreviousAttempt(attempt, policy.MaxAttempts, ending, reason, (long)elapsed.TotalMilliseconds, archive);
+            context.Set(PreviousAttempt.ContextKey(node.Id), previous.ToContextValue());
+        }
+
+        /// <summary>
+        /// The stage's time limits: the soft-deadline reminder, the hard timeout, and (for <c>on_timeout=wrap_up</c>) a final
+        /// "time is up" message followed by a grace period. Sets <paramref name="markTimedOut"/> before cancelling the stage.
+        /// </summary>
+        private async Task RunStageTimersAsync(Node node, string stageDir, StageTiming timing, Action markTimedOut, CancellationTokenSource stage, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var started = Stopwatch.StartNew();
+                var hard = timing.HardTimeout!.Value;
+                if (timing.SoftDeadline is { } soft && soft < hard)
+                {
+                    await Task.Delay(soft, cancellationToken).ConfigureAwait(false);
+                    var left = hard - started.Elapsed;
+                    await SteerAsync(node, stageDir, StageTiming.SoftDeadlineMessage(left, hard), $"soft deadline: about {AttributeValues.FormatDuration(RoundMinutes(left))} left; reminded the agent to wrap up").ConfigureAwait(false);
+                }
+
+                var remaining = hard - started.Elapsed;
+                if (remaining > TimeSpan.Zero)
+                {
+                    await Task.Delay(remaining, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (timing.WrapUpGrace is { } grace)
+                {
+                    await SteerAsync(node, stageDir, StageTiming.TimeIsUpMessage(grace), $"time limit reached; told the agent to stop and summarize within {AttributeValues.FormatDuration(grace)}").ConfigureAwait(false);
+                    await Task.Delay(grace, cancellationToken).ConfigureAwait(false);
+                }
+
+                markTimedOut();
+                await stage.CancelAsync().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The stage finished (or the run was cancelled) first.
+            }
+        }
+
+        private async Task SteerAsync(Node node, string stageDir, string message, string logLine)
+        {
+            try
+            {
+                await SteeringMessages.AppendAsync(stageDir, message).ConfigureAwait(false);
+                _services.Log(node.Id, logLine, "info");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _services.Log(node.Id, $"could not deliver a time reminder: {ex.Message}", "warn");
+            }
+        }
+
+        private static TimeSpan RoundMinutes(TimeSpan span) => span >= TimeSpan.FromMinutes(2)
+            ? TimeSpan.FromMinutes(Math.Round(span.TotalMinutes))
+            : TimeSpan.FromSeconds(Math.Max(0, Math.Round(span.TotalSeconds)));
+
+        /// <summary>
+        /// Adds the attempt's <c>backend.json</c> (if it wrote one) to the run's usage totals; for an attempt stopped at its
+        /// time limit, marks the record's <c>outcome</c> as <c>timeout</c>. Warns once when a budget is set but a stage
+        /// reports no <c>cost_usd</c>.
+        /// </summary>
+        private JsonObject? RecordUsage(Node node, string stageDir, DateTime attemptStartUtc, TimeSpan? timedOutAfter)
+        {
+            var path = Path.Combine(stageDir, "backend.json");
+            var metadata = _usage.TryAddFile(path, attemptStartUtc);
+            if (metadata is null)
+            {
+                return null;
+            }
+
+            if (timedOutAfter is { } limit && Persist)
+            {
+                try
+                {
+                    metadata["outcome"] = "timeout";
+                    metadata["timeout_ms"] = (long)limit.TotalMilliseconds;
+                    File.WriteAllText(path, metadata.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+
+            if (MaxCostUsd > 0 && metadata["cost_usd"] is null && !_unpricedWarned)
+            {
+                _unpricedWarned = true;
+                _services.Log(node.Id, "max_cost is set, but this stage's backend reported no cost_usd; stages without a price are not counted against the budget", "warn");
+            }
+
+            return metadata;
+        }
+
+        /// <summary>Merges metrics from <c>{stage}/metrics.json</c> and the node's <c>metrics_file</c> (status.json metrics win).</summary>
+        private Outcome WithFileMetrics(Node node, Outcome outcome, PipelineContext context, string stageDir, DateTime attemptStartUtc)
+        {
+            if (outcome.Status == StageStatus.Skipped)
+            {
+                return outcome;
+            }
+
+            IReadOnlyDictionary<string, double> fromFiles = new Dictionary<string, double>(StringComparer.Ordinal);
+            var stageFile = Path.Combine(stageDir, StageMetrics.FileName);
+            if (File.Exists(stageFile) && File.GetLastWriteTimeUtc(stageFile) >= attemptStartUtc)
+            {
+                fromFiles = ReadMetricsFile(node, stageFile, fromFiles);
+            }
+
+            if (node[AttrKeys.MetricsFile] is { Length: > 0 } relative && !string.IsNullOrWhiteSpace(relative))
+            {
+                var path = Path.GetFullPath(Path.Combine(context.WorkingDirectory, relative.Trim()));
+                if (File.Exists(path))
+                {
+                    fromFiles = ReadMetricsFile(node, path, fromFiles);
+                }
+                else if ((_services.Backend is not null || Persist) && outcome.Status is not (StageStatus.Fail or StageStatus.Retry))
+                {
+                    // A failed attempt may well have stopped before writing its report; its failure says more.
+                    _services.Log(node.Id, $"metrics_file '{relative}' does not exist; no metrics recorded from it", "warn");
+                }
+            }
+
+            return fromFiles.Count == 0 ? outcome : outcome with { Metrics = StageMetrics.Merge(fromFiles, outcome.Metrics) };
+        }
+
+        private IReadOnlyDictionary<string, double> ReadMetricsFile(Node node, string path, IReadOnlyDictionary<string, double> merged)
+        {
+            try
+            {
+                return StageMetrics.Merge(merged, StageMetrics.ReadFile(path));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                _services.Log(node.Id, $"could not read metrics from '{path}': {ex.Message}", "warn");
+                return merged;
             }
         }
 
@@ -610,7 +834,7 @@ public sealed class PipelineRunner
                     _outcomes[node.Id] = outcome;
                 }
 
-                var record = new StageRecord(node.Id, node.Label, outcome.Status, outcome.Notes, outcome.FailureReason, DateTimeOffset.UtcNow, attempts);
+                var record = new StageRecord(node.Id, node.Label, outcome.Status, outcome.Notes, outcome.FailureReason, DateTimeOffset.UtcNow, attempts, outcome.Metrics.Count > 0 ? outcome.Metrics : null);
                 _history.Add(record);
                 if (topLevel)
                 {
@@ -620,6 +844,17 @@ public sealed class PipelineRunner
 
             context.ApplyUpdates(outcome.ContextUpdates);
             context.Set("outcome", outcome.Status.ToWire());
+
+            // Reactor extension: outcome metrics become metrics.<name> context values (routable with numeric conditions).
+            if (outcome.Metrics.Count > 0)
+            {
+                foreach (var (name, value) in outcome.Metrics)
+                {
+                    context.Set(Outcome.MetricsContextPrefix + name, value);
+                }
+
+                Emit(new MetricsRecorded(node.Id, outcome.Metrics));
+            }
 
             // Artifact records are announced only once they are part of the context (never for retried attempts).
             foreach (var artifact in outcome.Artifacts)
@@ -651,9 +886,17 @@ public sealed class PipelineRunner
                 // Nodes whose edges are alternatives rather than a "next step" only follow explicit routing
                 // (conditions/labels/suggestions) on failure: a fan-in's edges lead onward as if it had succeeded,
                 // a parallel node's edges are its branches, and a human gate's edges are the human's choices.
+                // Reactor extension: with on_fail=stop (or default_on_fail=stop) an unconditional edge is not followed after a
+                // failure either — except into a diamond, which inspects the outcome, or a fan-in, which receives the failed
+                // branch as its result.
                 var resolvedHandler = _runner.Handlers.TryResolve(node, out var nodeType);
                 var explicitOnly = resolvedHandler is not null && nodeType is HandlerTypes.FanIn or HandlerTypes.Parallel or HandlerTypes.WaitHuman;
                 var failRoute = EdgeSelector.Select(node, outcome, context, _graph, explicitRoutingOnly: explicitOnly);
+                if (failRoute is { Reason: EdgeSelector.ByWeight } && StopsOnFailure(node, _graph) && !ReceivesFailures(failRoute.Edge.To))
+                {
+                    failRoute = null;
+                }
+
                 if (failRoute is not null)
                 {
                     return Transition.Follow(failRoute.Edge, failRoute.Reason);
@@ -679,6 +922,87 @@ public sealed class PipelineRunner
             return _graph.OutgoingEdges(node.Id).Count == 0
                 ? Transition.CompleteRun()
                 : Transition.Fail($"No eligible outgoing edge from '{node.Id}' for outcome '{outcome.Status.ToWire()}' (no condition matched and no unconditional edge).");
+        }
+
+        /// <summary>
+        /// True when a failed stage's failure is carried on implicitly: edge selection fell through to an unconditional edge
+        /// by weight (no condition, label, suggestion, or retry target handled it), and the target neither inspects the failure
+        /// (a conditional/diamond node re-emits it for its own edges) nor receives it as a result (a fan-in node ends the
+        /// branch, whose result records the failure).
+        /// </summary>
+        private bool FlowsOnwardSilently(Outcome outcome, Transition transition) =>
+            outcome.Status == StageStatus.Fail &&
+            transition is { Kind: TransitionKind.Edge, Reason: EdgeSelector.ByWeight, Edge: { } edge } &&
+            !ReceivesFailures(edge.To);
+
+        /// <summary>True for diamonds (which route on the failed outcome they re-emit) and fan-ins (which take the failed branch as a result).</summary>
+        private bool ReceivesFailures(string nodeId) =>
+            _graph.GetNode(nodeId) is { } target && _runner.Handlers.TryResolve(target, out var type) is not null &&
+            type is HandlerTypes.Conditional or HandlerTypes.FanIn;
+
+        /// <summary>
+        /// Reactor extension: true when a failure of <paramref name="node"/> must be routed explicitly — its <c>on_fail</c> (or
+        /// the graph's <c>default_on_fail</c>) is <c>stop</c> — so unconditional edges are not followed after a failure.
+        /// </summary>
+        internal static bool StopsOnFailure(Node node, Graph graph) =>
+            string.Equals((node[AttrKeys.OnFail] ?? graph[AttrKeys.DefaultOnFail] ?? "").Trim(), "stop", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Reactor extension (<c>max_visits</c>): when <paramref name="node"/> has already run its maximum number of times, emits
+        /// <see cref="VisitLimitReached"/> and returns where to go instead (<c>on_max_visits</c>; null target = fail with the
+        /// reason). Null when the node may run.
+        /// </summary>
+        private (string? Target, string Reason)? CheckVisitLimit(Node node, PipelineContext context, bool emitEdge)
+        {
+            if (node.MaxVisits is not { } max)
+            {
+                return null;
+            }
+
+            int visits;
+            lock (_stateLock)
+            {
+                visits = _visits.GetValueOrDefault(node.Id);
+            }
+
+            if (visits < max)
+            {
+                return null;
+            }
+
+            var target = node.OnMaxVisits.Length > 0 && node.OnMaxVisits != node.Id && _graph.ContainsNode(node.OnMaxVisits) ? node.OnMaxVisits : null;
+            Emit(new VisitLimitReached(node.Id, max, target));
+            if (target is null)
+            {
+                return (null, $"Stage '{node.Id}' reached its visit limit (max_visits={max.ToString(CultureInfo.InvariantCulture)}) and has no on_max_visits target.");
+            }
+
+            context.AppendLog($"{node.Id} reached its visit limit ({max.ToString(CultureInfo.InvariantCulture)}); continuing at '{target}'.");
+            if (emitEdge)
+            {
+                Emit(new EdgeSelected(node.Id, target, "max_visits", ""));
+            }
+
+            return (target, "");
+        }
+
+        /// <summary>
+        /// Reactor extension (<c>max_cost</c>): stops the run before <paramref name="next"/> once its recorded cost reached the
+        /// budget. The last checkpoint is kept unfinished, so resuming (with a higher budget) continues at <paramref name="next"/>.
+        /// </summary>
+        private PipelineResult? StopIfOverBudget(Node next)
+        {
+            var limit = MaxCostUsd;
+            var spent = _usage.CostUsd;
+            if (limit <= 0 || spent < limit)
+            {
+                return null;
+            }
+
+            Emit(new BudgetExceeded(spent, limit, next.Id));
+            var reason = $"Budget exceeded: {UsageLedger.FormatUsd(spent)} spent, max_cost is {UsageLedger.FormatUsd(limit)}. Resume with a higher budget to continue at '{next.Id}'.";
+            _context.AppendLog(reason);
+            return Finish(Outcome.Fail(reason), saveCheckpoint: false, budgetExceeded: true);
         }
 
         private (Node Node, Outcome Outcome)? CheckGoalGates()
@@ -780,10 +1104,22 @@ public sealed class PipelineRunner
                     return Result(last.Status == StageStatus.Skipped ? StageStatus.Success : last.Status, node.Id, last.Notes, last.FailureReason);
                 }
 
+                if (CheckVisitLimit(node, branchContext, emitEdge: false) is { } limit)
+                {
+                    if (limit.Target is null)
+                    {
+                        return Result(StageStatus.Fail, null, last.Notes, limit.Reason);
+                    }
+
+                    incoming = null;
+                    current = limit.Target;
+                    continue;
+                }
+
                 var fidelity = FidelityResolver.Resolve(incoming, node, _graph);
                 var thread = fidelity == FidelityModes.Full ? FidelityResolver.ResolveThread(incoming, node, _graph, previous, previousThread) : null;
                 var index = Interlocked.Increment(ref _stageIndex);
-                var (outcome, attempts) = await RunNodeAsync(node, branchContext, fidelity, thread, index, cancellationToken).ConfigureAwait(false);
+                var (outcome, attempts) = await RunTrackedNodeAsync(node, branchContext, fidelity, thread, index, cancellationToken).ConfigureAwait(false);
                 Record(node, outcome, attempts, branchContext, topLevel: false);
                 completed.Add(node.Id);
                 last = outcome;
@@ -794,6 +1130,11 @@ public sealed class PipelineRunner
                 switch (transition.Kind)
                 {
                     case TransitionKind.Edge:
+                        if (FlowsOnwardSilently(outcome, transition))
+                        {
+                            Emit(new FailedStageContinued(node.Id, transition.Edge!.To, outcome.FailureReason));
+                        }
+
                         incoming = transition.Edge;
                         current = transition.Edge!.To;
                         break;
@@ -874,6 +1215,7 @@ public sealed class PipelineRunner
                 BranchExecutor = this,
                 ChildLauncher = this,
                 WorkingDirectory = WorkingDirectory,
+                Workspace = WorkspaceService,
                 Options = _options,
                 RunnerOptions = _runner.Options,
                 HistoryList = _history.ToList(),
@@ -937,7 +1279,8 @@ public sealed class PipelineRunner
             Emit(new LoopRestarted(targetNodeId, _loopRestarts, _logsRoot));
         }
 
-        private void PrepareStageDirectory(string nodeId, string stageDir)
+        /// <summary>Counts a visit of <paramref name="nodeId"/> (archiving the previous visit's files) and returns its number.</summary>
+        private int PrepareStageDirectory(string nodeId, string stageDir)
         {
             int visit;
             lock (_stateLock)
@@ -948,27 +1291,56 @@ public sealed class PipelineRunner
 
             if (!Persist)
             {
-                return;
+                return visit;
             }
 
             Directory.CreateDirectory(stageDir);
             if (visit <= 1)
             {
-                return;
+                return visit;
             }
 
-            // Re-entering a node (loops, retries via routing): archive the previous visit's files.
+            // Re-entering a node (loops, retries via routing): archive the previous visit's files and attempt archives.
             var archive = Path.Combine(stageDir, "history", $"visit-{(visit - 1).ToString(CultureInfo.InvariantCulture)}");
             var files = Directory.GetFiles(stageDir);
-            if (files.Length == 0)
+            var attempts = Path.Combine(stageDir, StageAttemptArchive.DirectoryName);
+            if (files.Length == 0 && !Directory.Exists(attempts))
             {
-                return;
+                return visit;
             }
 
             Directory.CreateDirectory(archive);
             foreach (var file in files)
             {
                 File.Move(file, Path.Combine(archive, Path.GetFileName(file)), overwrite: true);
+            }
+
+            if (Directory.Exists(attempts))
+            {
+                try
+                {
+                    Directory.Move(attempts, Path.Combine(archive, StageAttemptArchive.DirectoryName));
+                }
+                catch (IOException)
+                {
+                    // An archive from an earlier, interrupted visit already exists there; keep both by leaving this one in place.
+                }
+            }
+
+            return visit;
+        }
+
+        /// <summary>
+        /// Records the node's visit count as <c>internal.visits.&lt;node&gt;</c> (read by <c>visits.&lt;node&gt;</c> conditions) in
+        /// the executing context and, for stages inside parallel branches, in the run's context too.
+        /// </summary>
+        private void SetVisitCount(string nodeId, int visit, PipelineContext context)
+        {
+            var key = ConditionEvaluator.VisitsContextPrefix + nodeId;
+            context.Set(key, visit);
+            if (!ReferenceEquals(context, _context))
+            {
+                _context.Set(key, visit);
             }
         }
 
@@ -1025,6 +1397,7 @@ public sealed class PipelineRunner
                     LoopRestarts = _loopRestarts,
                     History = _history.ToList(),
                     FinalStatus = finalStatus,
+                    Usage = new Dictionary<string, double>(_usage.Snapshot(), StringComparer.Ordinal),
                 };
             }
 
@@ -1055,7 +1428,7 @@ public sealed class PipelineRunner
             return Finish(outcome, cancelled: true, saveCheckpoint: false);
         }
 
-        private PipelineResult Finish(Outcome outcome, bool cancelled = false, bool saveCheckpoint = true)
+        private PipelineResult Finish(Outcome outcome, bool cancelled = false, bool saveCheckpoint = true, bool budgetExceeded = false)
         {
             _stopwatch.Stop();
             var status = outcome.Status == StageStatus.Fail ? StageStatus.Fail : StageStatus.Success;
@@ -1080,6 +1453,8 @@ public sealed class PipelineRunner
                     LoopRestarts = _loopRestarts,
                     Cancelled = cancelled,
                     Diagnostics = _diagnostics,
+                    Usage = _usage.Snapshot(),
+                    BudgetExceeded = budgetExceeded,
                 };
             }
 
@@ -1128,6 +1503,11 @@ public sealed class PipelineRunner
 
         public void Emit(PipelineEvent pipelineEvent)
         {
+            if (_workspace?.Hold(pipelineEvent) == true)
+            {
+                return;
+            }
+
             var stamped = pipelineEvent.RunId.Length == 0 ? pipelineEvent with { RunId = _runId } : pipelineEvent;
             _eventLog?.Emit(stamped);
             _runner.RaiseEvent(stamped);

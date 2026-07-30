@@ -72,7 +72,7 @@ public sealed class SimulationApiTests
         var edge = report["edges"]!.AsArray().Single(e => e!["from"]!.GetValue<string>() == "test" && e["to"]!.GetValue<string>() == "fix")!;
         Assert.Equal("edge", edge["kind"]!.GetValue<string>());
         Assert.True(edge["count"]!.GetValue<int>() >= edge["runs"]!.GetValue<int>());
-        Assert.Equal(["first_failure", "longest", "typical"], report["samples"]!.AsObject().Select(kv => kv.Key));
+        Assert.Equal(["first_failure", "first_failed_stage_landing", "longest", "typical"], report["samples"]!.AsObject().Select(kv => kv.Key));
         Assert.Equal("start", report["samples"]!["typical"]!["path"]![0]!.GetValue<string>());
         Assert.NotNull(report["failures"]!.AsArray());
         Assert.Empty(report["warnings"]!.AsArray());
@@ -153,6 +153,68 @@ public sealed class SimulationApiTests
             Assert.Equal(HttpStatusCode.BadRequest, response.Status);
             Assert.False(string.IsNullOrEmpty(response.Body["error"]?.GetValue<string>()), response.Body.ToJsonString());
         }
+    }
+
+    [Fact]
+    public async Task Simulate_accepts_preset_names_and_lists_the_presets()
+    {
+        await using var server = await ServerHarness.StartAsync();
+
+        var presets = await server.GetJsonAsync("/studio/api/simulate/presets");
+        Assert.True(JsonNode.DeepEquals(Reactor.Simulation.SimulationPreset.CatalogJson(), presets), presets.ToJsonString());
+
+        var response = await server.Client.PostAsJsonAsync("/studio/api/simulate", new { dot = Loop, scenario = "realistic", runs = 200, seed = 5 });
+        var report = await ServerHarness.ReadJsonAsync(response);
+        Assert.True(response.IsSuccessStatusCode, report.ToJsonString());
+        Assert.InRange(report["clean_success_rate"]!.GetValue<double>(), 0.5, report["success_rate"]!.GetValue<double>());
+        Assert.Equal(2, report["clean_success_ci"]!.AsArray().Count);
+        Assert.True(report["failed_stage_landings"]!.GetValue<int>() > 0, "implement's failures flow on to test");
+        Assert.True(report["nodes"]!["implement"]!["failed_stage_landings"]!.GetValue<int>() > 0);
+        Assert.True(report["simulated_duration_ms"]!["mean"]!.GetValue<double>() >= 660_000, "the preset's duration priors apply");
+        Assert.Equal(0, report["simulated_cost_usd"]!["max"]!.GetValue<double>());
+        Assert.NotNull(report["landed_metrics"]!.AsObject());
+        Assert.All(report["failures"]!.AsArray(), f => Assert.NotNull(f!["nodes"]!.AsObject()));
+
+        var extended = await server.Client.PostAsJsonAsync("/studio/api/simulate", new
+        {
+            dot = Loop,
+            runs = 50,
+            scenario = JsonNode.Parse("""{"preset": "happy", "nodes": {"implement": {"cost": 0.5, "metrics": {"score": 4}}}}"""),
+        });
+        var extendedReport = await ServerHarness.ReadJsonAsync(extended);
+        Assert.True(extended.IsSuccessStatusCode, extendedReport.ToJsonString());
+        Assert.Equal(1.0, extendedReport["clean_success_rate"]!.GetValue<double>());
+        Assert.Equal(0.5, extendedReport["simulated_cost_usd"]!["mean"]!.GetValue<double>());
+        Assert.Equal(50, extendedReport["landed_metrics"]!["score"]!["values"]!["4"]!.GetValue<int>());
+
+        var unknown = await PostAsync(server, "/studio/api/simulate", new { dot = Loop, scenario = "realistc" });
+        Assert.Equal(HttpStatusCode.BadRequest, unknown.Status);
+        Assert.StartsWith("Unknown preset 'realistc'", unknown.Body["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        var badPreset = await PostAsync(server, "/studio/api/simulate", new { dot = Loop, scenario = new { preset = "calm" } });
+        Assert.Equal(HttpStatusCode.BadRequest, badPreset.Status);
+        Assert.StartsWith("preset: unknown preset", badPreset.Body["diagnostics"]![0]!["message"]!.GetValue<string>(), StringComparison.Ordinal);
+
+        var trace = await ServerHarness.ReadJsonAsync(await server.Client.PostAsJsonAsync("/studio/api/simulate/trace", new { dot = Loop, scenario = "happy", seed = 3 }));
+        Assert.Equal(["start", "implement", "test", "exit"], trace["path"]!.AsArray().Select(p => p!.GetValue<string>()));
+        Assert.Empty(trace["failed_stages"]!.AsArray());
+        Assert.Equal(660_000, trace["simulated_duration_ms"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public async Task Managed_simulated_runs_ignore_duration_priors()
+    {
+        await using var server = await ServerHarness.StartAsync();
+        var stopwatch = Stopwatch.StartNew();
+        var created = await StartSimulationAsync(server, Loop, new
+        {
+            mode = "stochastic",
+            scenario = JsonNode.Parse("""{"preset": "happy"}"""),
+        });
+
+        var detail = await server.WaitForStatusAsync(created["id"]!.GetValue<string>(), "success", "fail", "error");
+
+        Assert.Equal("success", detail["status"]!.GetValue<string>());
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(30), "a managed run must not wait out minutes of duration priors");
     }
 
     [Fact]
@@ -350,7 +412,7 @@ public sealed class SimulationApiTests
 
         var failed = await server.WaitForStatusAsync(id, "fail", "error", "success");
         Assert.Equal("fail", failed["status"]!.GetValue<string>());
-        Assert.Equal("[Simulated] failure", failed["result"]!["failure_reason"]!.GetValue<string>());
+        Assert.Equal("[Simulated] failure at implement", failed["result"]!["failure_reason"]!.GetValue<string>());
 
         var resume = await server.Client.PostAsync($"/pipelines/{id}/resume", null);
         Assert.Equal(HttpStatusCode.Accepted, resume.StatusCode);

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { Button, Dialog, Field, Segmented, TextArea, TextInput, cx } from "../components/controls";
 import { Glyph } from "../components/Glyph";
+import { parseUsd } from "../model/attributes";
 import { writeDot } from "../model/dot";
 import { setMode, toast, useStudio } from "../state/store";
 import { refreshRuns, rememberRunSource, selectRun } from "./flights/store";
@@ -25,6 +26,9 @@ function RunDialogBody({ onClose }: { onClose: () => void }) {
   const simulation = info?.features.includes("simulation") ?? false;
   const [mode, setLaunchMode] = useState<LaunchMode>("real");
   const [busy, setBusy] = useState(false);
+  const [budget, setBudget] = useState("");
+  const budgetUsd = budget.trim() ? parseUsd(budget) : null;
+  const budgetInvalid = mode === "real" && !!budget.trim() && budgetUsd === null;
   const errors = analysis.diagnostics.filter((d) => d.severity === "error");
   const blocked = !!analysis.parseError || errors.length > 0;
 
@@ -52,6 +56,7 @@ function RunDialogBody({ onClose }: { onClose: () => void }) {
         context: Object.keys(context).length ? context : undefined,
         studio: { source_path: file.path, layout: runDoc.layout },
         simulation: mode === "real" ? undefined : { mode },
+        max_cost: mode === "real" && budgetUsd !== null ? budgetUsd : undefined,
       });
       rememberRunSource(started.id, { dot, layout: runDoc.layout, sourcePath: file.path });
       onClose();
@@ -81,7 +86,7 @@ function RunDialogBody({ onClose }: { onClose: () => void }) {
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" icon="play" onClick={() => void launch()} disabled={busy || blocked}>
+          <Button variant="primary" icon="play" onClick={() => void launch()} disabled={busy || blocked || budgetInvalid}>
             {mode === "real" ? "Run" : mode === "interactive" ? "Walk through" : "Simulate"}
           </Button>
         </>
@@ -108,6 +113,18 @@ function RunDialogBody({ onClose }: { onClose: () => void }) {
       <Field label="Goal for this run" hint="$goal in prompts expands to this. Changing it here does not edit the pipeline.">
         <TextArea value={goal} onChange={setGoal} minRows={2} />
       </Field>
+      {mode === "real" ? (
+        <Field
+          label="Budget for this run (US dollars)"
+          hint={
+            budget && budgetUsd === null
+              ? "A non-negative number of US dollars, e.g. 25 or 7.5."
+              : "The run stops, resumably, before its next stage once its recorded cost reaches this; resume it with a higher budget to go on. Empty: the server's default, else the pipeline's max_cost."
+          }
+        >
+          <TextInput value={budget} onChange={setBudget} mono placeholder={doc.graphAttrs.max_cost ? `pipeline · $${doc.graphAttrs.max_cost.replace(/^\$/, "")}` : "no limit"} invalid={!!budget && budgetUsd === null} />
+        </Field>
+      ) : null}
       <Field label="Context" hint="Seed values into the run context (like reactor run --set key=value). JSON-looking values are parsed.">
         <div className="rs-run__ctx">
           {rows.map((row, i) => (

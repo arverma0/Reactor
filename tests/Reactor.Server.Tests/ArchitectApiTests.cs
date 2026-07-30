@@ -11,6 +11,22 @@ public sealed class ArchitectApiTests
 {
     private const string Valid = """
         digraph feature {
+            graph [goal="Add a feature", default_on_fail="stop"]
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            implement [label="Implement", prompt="Implement $goal"]
+            test [label="Run tests", shape=parallelogram, tool_command="python -m pytest -q", outputs="test_report", goal_gate=true]
+            fix [label="Fix", prompt="Fix the failing tests", inputs="test_report", max_visits=3]
+            start -> implement -> test
+            test -> exit [condition="outcome=success"]
+            test -> fix [condition="outcome=fail"]
+            fix -> test
+        }
+        """;
+
+    /// <summary>Valid and lands, but implement's failures flow on and the fix loop has no bound: the checker sends it back.</summary>
+    private const string Sloppy = """
+        digraph feature {
             graph [goal="Add a feature"]
             start [shape=Mdiamond]
             exit [shape=Msquare]
@@ -80,7 +96,7 @@ public sealed class ArchitectApiTests
                 lock (prompts)
                 {
                     prompts.Add(node.Prompt);
-                    return Answer(prompts.Count == 1 ? Broken : Valid);
+                    return Answer(prompts.Count switch { 1 => Broken, 2 => Sloppy, _ => Valid });
                 }
             },
         };
@@ -90,15 +106,27 @@ public sealed class ArchitectApiTests
         var state = await WaitForArchitectAsync(server, id);
 
         Assert.True(state["status"]!.GetValue<string>() == "success", state.ToJsonString());
-        Assert.Equal(2, state["attempt"]!.GetValue<int>());
+        Assert.Equal(3, state["attempt"]!.GetValue<int>());
         var proposal = state["proposal"]!;
         Assert.True(proposal["valid"]!.GetValue<bool>(), state.ToJsonString());
         Assert.Equal(Valid.Trim(), proposal["dot"]!.GetValue<string>());
         Assert.Equal(1.0, proposal["forecast"]!["happy_path"]!.GetValue<double>());
         Assert.True(proposal["forecast"]!["realistic"]!.GetValue<double>() > 0.5);
+        var forecast = proposal["forecast"]!;
+        Assert.Equal(0, forecast["failed_stage_landings"]!.GetValue<double>());
+        Assert.True(forecast["mean_duration_ms"]!.GetValue<long>() >= 660_000, "the realistic preset's duration priors give a time forecast");
+        Assert.True(forecast["p90_duration_ms"]!.GetValue<long>() >= forecast["mean_duration_ms"]!.GetValue<long>() / 2);
         Assert.Equal("- Implement, then test; failures loop through Fix.", state["rationale"]!.GetValue<string>());
 
-        Assert.Equal(2, prompts.Count);
+        // Draft 2 was valid DOT that lands, but the design rules sent it back: failures flowing on, an unbounded loop.
+        Assert.Contains("[fail_flows_onward] stage 'implement'", prompts[2], StringComparison.Ordinal);
+        Assert.Contains("[unbounded_loop]", prompts[2], StringComparison.Ordinal);
+
+        // After the checks pass, the model reviews its draft against the brief (no verdict reads as a pass).
+        Assert.Equal(4, prompts.Count);
+        Assert.StartsWith("You are reviewing a Reactor pipeline", prompts[3], StringComparison.Ordinal);
+        Assert.Contains("## Brief\nAdd a feature with tests", prompts[3], StringComparison.Ordinal);
+        Assert.NotNull(state["review"]);
         Assert.Contains("You are the Architect in Reactor Studio", prompts[0], StringComparison.Ordinal);
         Assert.Contains("Use `$goal` for the goal.", prompts[0], StringComparison.Ordinal);
         Assert.DoesNotContain("Reporting the stage outcome", prompts[0], StringComparison.Ordinal);
@@ -114,7 +142,152 @@ public sealed class ArchitectApiTests
         Assert.Contains($"{Path.DirectorySeparatorChar}.reactor{Path.DirectorySeparatorChar}studio{Path.DirectorySeparatorChar}architect{Path.DirectorySeparatorChar}", run["working_directory"]!.GetValue<string>(), StringComparison.Ordinal);
         Assert.Equal("claude-sonnet-5", server.Manager.Get(id)!.Graph.Nodes["design"].LlmModel);
         var check = File.ReadAllText(Path.Combine(run["logs_root"]!.GetValue<string>(), "check", "check.md"));
-        Assert.StartsWith("# Draft 2: passed", check, StringComparison.Ordinal);
+        Assert.StartsWith("# Draft 3: passed", check, StringComparison.Ordinal);
+        Assert.Equal("claude-sonnet-5", server.Manager.Get(id)!.Graph.Nodes["review"].LlmModel);
+    }
+
+    [Fact]
+    public async Task Sloppy_drafts_are_judged_on_clean_landings_and_the_design_rules()
+    {
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = new ControllableBackend() });
+
+        var result = await ArchitectApi.CheckAsync(server.Manager, Sloppy, "draft", "", TestContext.Current.CancellationToken, "Add a feature");
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Problems, p => p.StartsWith("[fail_flows_onward] stage 'implement'", StringComparison.Ordinal));
+        Assert.Contains(result.Problems, p => p.StartsWith("[unbounded_loop]", StringComparison.Ordinal));
+        var forecast = result.Forecast!;
+        Assert.True((double)forecast["realistic"]! < (double)forecast["realistic_landed"]!);
+        Assert.Contains("implement", ((List<object?>)forecast["failed_stages"]!).Cast<string>());
+        Assert.Contains(result.Warnings, w => w.Contains("land with a failed stage behind them", StringComparison.Ordinal) && w.Contains("'implement'", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_self_review_that_asks_for_changes_sends_the_draft_back_once_more()
+    {
+        var reviews = 0;
+        var designs = new List<string>();
+        var backend = new ControllableBackend
+        {
+            Respond = node =>
+            {
+                if (node.Prompt.StartsWith("You are reviewing", StringComparison.Ordinal))
+                {
+                    return CodergenResult.FromText(Interlocked.Increment(ref reviews) == 1
+                        ? "The brief asks for screenshots.\n\n**VERDICT: REVISE**\n1. Add a screenshot stage."
+                        : "VERDICT: PASS");
+                }
+
+                lock (designs)
+                {
+                    designs.Add(node.Prompt);
+                }
+
+                return Answer(Valid);
+            },
+        };
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend });
+
+        var state = await WaitForArchitectAsync(server, await StartAsync(server, new { mode = "draft", brief = "Add a feature with screenshots" }));
+
+        Assert.True(state["status"]!.GetValue<string>() == "success", state.ToJsonString());
+        Assert.Equal(2, reviews);
+        Assert.Equal(2, state["attempt"]!.GetValue<int>());
+        Assert.Contains("## What the checker found\nThe self-review against the brief asks for these changes:\n1. Add a screenshot stage.", designs[1], StringComparison.Ordinal);
+        Assert.Equal("VERDICT: PASS", state["review"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task A_revision_the_self_review_asked_for_that_cannot_pass_keeps_the_checked_draft()
+    {
+        var reviews = 0;
+        var designs = 0;
+        var backend = new ControllableBackend
+        {
+            Respond = node =>
+            {
+                if (node.Prompt.StartsWith("You are reviewing", StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref reviews);
+                    return CodergenResult.FromText("**VERDICT:** REVISE\n1. Add a screenshot stage.");
+                }
+
+                return Answer(Interlocked.Increment(ref designs) == 1 ? Valid : Broken);
+            },
+        };
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend });
+
+        var state = await WaitForArchitectAsync(server, await StartAsync(server, new { mode = "draft", brief = "Add a feature with screenshots" }));
+
+        Assert.True(state["status"]!.GetValue<string>() == "success", state.ToJsonString());
+        Assert.Equal(3, designs);
+        Assert.Equal(1, reviews);
+        var proposal = state["proposal"]!;
+        Assert.Equal(Valid.Trim(), proposal["dot"]!.GetValue<string>());
+        Assert.True(proposal["valid"]!.GetValue<bool>());
+        Assert.Empty(proposal["problems"]!.AsArray());
+        Assert.Contains(proposal["warnings"]!.AsArray(), w => w!.GetValue<string>().StartsWith("Self-review (not applied: draft 3", StringComparison.Ordinal)
+                                                              && w.GetValue<string>().EndsWith("1. Add a screenshot stage.", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_forecast_over_a_budget_read_from_the_brief_is_a_warning_for_the_self_review()
+    {
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = new ControllableBackend() });
+
+        var result = await ArchitectApi.CheckAsync(server.Manager, Valid, "draft", "", TestContext.Current.CancellationToken, "Add a feature; finish within 5 minutes.");
+
+        Assert.True(result.Passed, string.Join("\n", result.Problems));
+        Assert.Contains(result.Warnings, w => w.StartsWith("Forecast: a typical flight takes", StringComparison.Ordinal) && w.Contains("\"within 5 minutes\"", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("Keep the whole thing to a few hours at most.", 3.0, true)]
+    [InlineData("It must finish within 90 minutes.", 1.5, false)]
+    [InlineData("Budget: at most 2.5 hours of wall time.", 2.5, false)]
+    [InlineData("Ship in 2 days.", 48.0, false)]
+    [InlineData("Write the docs; retry at most 3 times.", null, false)]
+    [InlineData("A test suite that runs in 5 minutes.", null, false)]
+    [InlineData("Sessions expire in 30 minutes; send a reminder email in 2 days.", null, false)]
+    public void Time_budgets_are_read_from_the_brief(string brief, double? hours, bool approximate)
+    {
+        var budget = ArchitectApi.BriefBudgetHours(brief);
+        Assert.Equal(hours, budget?.Hours);
+        if (budget is { } found)
+        {
+            Assert.Equal(approximate, found.Approximate);
+        }
+    }
+
+    [Fact]
+    public void Prompts_that_contradict_paths_the_brief_names_are_flagged()
+    {
+        const string brief = "Screenshots go to `qa/shots/` and the report to qa/report.json. See https://example.com/a/b.html.";
+        var draft = Reactor.Graphs.DotParser.Parse("""
+            digraph g {
+              capture [prompt="Save screenshots under qa/screenshots/ and write qa/report.json"]
+              review [prompt="Look at every image in qa\\screenshots\\"]
+            }
+            """);
+
+        var finding = Assert.Single(ArchitectApi.ContractFindings(brief, draft));
+        Assert.Contains("`qa/shots/`", finding, StringComparison.Ordinal);
+        Assert.Contains("`qa/screenshots/` (capture, review)", finding, StringComparison.Ordinal);
+
+        var faithful = Reactor.Graphs.DotParser.Parse("""digraph g { capture [prompt="Save screenshots under qa/shots/ and write qa/report.json"] }""");
+        Assert.Empty(ArchitectApi.ContractFindings(brief, faithful));
+        Assert.Empty(ArchitectApi.ContractFindings("", draft));
+    }
+
+    [Fact]
+    public void Review_answers_parse_to_pass_or_revise()
+    {
+        Assert.Equal((false, ""), ArchitectApi.ParseReview("Looks good.\nVERDICT: PASS"));
+        Assert.Equal((false, ""), ArchitectApi.ParseReview("No verdict at all."));
+        Assert.Equal((true, "1. Bound the loop.\n2. Rename qa/screenshots/."), ArchitectApi.ParseReview("`VERDICT: REVISE`\n1. Bound the loop.\n2. Rename qa/screenshots/."));
+        Assert.Equal((true, "1. Bound the loop."), ArchitectApi.ParseReview("Close.\n**VERDICT:** REVISE\n1. Bound the loop."));
+        Assert.Equal((true, "1. Bound the loop."), ArchitectApi.ParseReview("**VERDICT**: REVISE\n1. Bound the loop."));
+        Assert.Equal((false, ""), ArchitectApi.ParseReview("## Verdict: pass"));
     }
 
     [Fact]

@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
 using Reactor.Agent;
 using Reactor.Agent.Environments;
 using Reactor.Backends;
@@ -28,24 +30,32 @@ internal static class HostCommands
         var maxRuns = new Option<int>("--max-concurrent") { Description = "Runs executing at once (others queue)", DefaultValueFactory = _ => 4 };
         var allowWorkdir = new Option<bool>("--allow-client-workdir") { Description = "Let API clients choose a run's working directory" };
         var noBrowser = new Option<bool>("--no-browser") { Description = "Do not open the Studio in a browser" };
+        var maxSteps = new Option<int>("--max-steps")
+        {
+            Description = "Fail a run after this many stage executions, a guard against runaway loops (0 = unlimited)",
+            DefaultValueFactory = _ => new ReactorServerOptions().MaxStepsPerRun,
+        };
         var options = new RunOptionSet();
         var command = new Command(name, description) { urls, token, maxRuns, allowWorkdir };
+        options.MaxCost.Description = "Default cost budget per run in US dollars: a run stops, resumably, before its next stage once its recorded cost reaches it (requests may set their own max_cost)";
         if (openBrowser)
         {
             command.Options.Add(noBrowser);
         }
 
-        foreach (var option in new Option[] { options.Backend, options.Model, options.Provider, options.WorkingDirectory, options.CopilotRuntime, options.CopilotCli, options.ClaudeCli })
+        // The options `reactor run` shares with the server, so scripts can pass the same flags to both.
+        foreach (var option in new Option[] { options.Backend, options.Model, options.Provider, options.MaxTokens, options.WorkingDirectory, maxSteps, options.MaxCost, options.NoColor, options.CopilotRuntime, options.CopilotCli, options.ClaudeCli })
         {
             command.Options.Add(option);
         }
 
-        options.Backend.AcceptOnlyFromAmong(BackendFactory.Kinds);
+        options.AddValidators();
         command.SetAction(async (result, cancellationToken) =>
         {
             var workDir = options.WorkDir(result);
             var authToken = result.GetValue(token) ?? Environment.GetEnvironmentVariable("REACTOR_SERVER_TOKEN");
             var listen = result.GetValue(urls)!;
+            var color = ConsoleReporter.ColorSupported(result.GetValue(options.NoColor));
             if (string.IsNullOrEmpty(authToken) && !IsLoopbackOnly(listen))
             {
                 await Console.Error.WriteLineAsync(
@@ -75,13 +85,22 @@ internal static class HostCommands
                         LogsBaseDirectory = PipelineCommands.RunsDirectory(workDir),
                         AuthToken = string.IsNullOrEmpty(authToken) ? null : authToken,
                         MaxConcurrentRuns = result.GetValue(maxRuns),
+                        MaxStepsPerRun = Math.Max(0, result.GetValue(maxSteps)),
+                        MaxCostPerRunUsd = result.GetValue(options.MaxCost),
                         AllowClientWorkingDirectory = result.GetValue(allowWorkdir),
                         BackendKind = selection.Kind,
                         BackendDescription = selection.Description,
                         BackendRoutes = selection.Routes,
                         ListModels = StudioModels.Lister(selection),
                     },
-                    configure: builder => builder.WebHost.UseUrls(listen.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)));
+                    configure: builder =>
+                    {
+                        builder.WebHost.UseUrls(listen.Split([';', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                        if (!color)
+                        {
+                            builder.Logging.AddSimpleConsole(console => console.ColorBehavior = LoggerColorBehavior.Disabled);
+                        }
+                    });
                 await using (app.ConfigureAwait(false))
                 {
                     var consoleUrl = listen.Split([';', ','])[0].Trim();
@@ -129,7 +148,8 @@ internal static class HostCommands
         var maxRounds = new Option<int>("--max-tool-rounds") { Description = "Tool rounds per input (0 = unlimited)", DefaultValueFactory = _ => 0 };
         var maxTokens = new Option<int?>("--max-tokens") { Description = "Output token limit per LLM response (default: the provider's)" };
         maxTokens.Validators.Add(RunOptionSet.PositiveIfSet);
-        var command = new Command("agent", "Run the coding agent loop directly (interactive or one-shot)") { prompt, provider, model, workdir, effort, maxRounds, maxTokens };
+        var noColor = new Option<bool>("--no-color") { Description = "Disable colored output" };
+        var command = new Command("agent", "Run the coding agent loop directly (interactive or one-shot)") { prompt, provider, model, workdir, effort, maxRounds, maxTokens, noColor };
         command.SetAction(async (result, cancellationToken) =>
         {
             await using var client = Client.FromEnv(timeout: BackendFactory.AgentTimeouts);
@@ -163,7 +183,7 @@ internal static class HostCommands
                 MaxTokens = result.GetValue(maxTokens),
             };
             await using var session = new Session(profile, new LocalExecutionEnvironment(new LocalEnvironmentOptions { WorkingDirectory = dir }), client, config);
-            var color = ConsoleReporter.ColorSupported(false);
+            var color = ConsoleReporter.ColorSupported(result.GetValue(noColor));
             session.Events.Subscribe(evt => RenderAgentEvent(evt, color));
             Console.WriteLine($"⚛ agent: {resolved.Provider}/{resolved.Model} in {dir}");
 
@@ -229,13 +249,16 @@ internal static class HostCommands
                 return ExitCodes.Success;
             }
 
-            Console.WriteLine($"{"MODEL",-34} {"PROVIDER",-18} {"CONTEXT",9}  CAPABILITIES");
+            Console.WriteLine($"{"MODEL",-34} {"PROVIDER",-18} {"CONTEXT",9}  {"COST",-12} CAPABILITIES");
             foreach (var model in models)
             {
                 var caps = string.Join(",", new[] { model.SupportsTools ? "tools" : null, model.SupportsVision ? "vision" : null, model.SupportsReasoning ? "reasoning" : null }.Where(c => c is not null));
-                Console.WriteLine($"{model.Id,-34} {model.Provider,-18} {model.ContextWindow,9}  {caps}");
+                var cost = Llm.ModelPrice.FromCatalog(model)?.RateText() ?? "-";
+                Console.WriteLine($"{model.Id,-34} {model.Provider,-18} {model.ContextWindow,9}  {cost,-12} {caps}");
             }
 
+            Console.WriteLine();
+            Console.WriteLine("COST $in/$out: USD per 1M input / output tokens, from the model catalog (REACTOR_MODEL_CATALOG overrides it).");
             return ExitCodes.Success;
         });
         return command;
@@ -255,17 +278,52 @@ internal static class HostCommands
             return ExitCodes.Configuration;
         }
 
+        var prices = Llm.PriceTable.Copilot;
         if (json)
         {
-            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(models, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            var listing = models.Select(m => new
+            {
+                m.Id,
+                m.Name,
+                m.PolicyState,
+                m.BillingMultiplier,
+                m.ContextWindow,
+                m.ReasoningEfforts,
+                m.Enabled,
+                Price = prices.Find(m.Id),
+            });
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(listing, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
             return ExitCodes.Success;
         }
 
-        Console.WriteLine($"{"MODEL",-28} {"COST",6} {"CONTEXT",9}  {"POLICY",-9} REASONING EFFORTS");
+        // COST: the runtime's billing multiplier when it reports one, else the price table's USD per 1M input/output tokens.
+        Console.WriteLine($"{"MODEL",-28} {"COST",-14} {"CONTEXT",9}  {"POLICY",-9} REASONING EFFORTS");
+        var priced = false;
         foreach (var model in models.OrderBy(m => m.Id, StringComparer.Ordinal))
         {
-            var cost = model.BillingMultiplier is { } multiplier ? multiplier.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "x" : "-";
-            Console.WriteLine($"{model.Id,-28} {cost,6} {model.ContextWindow,9}  {model.PolicyState ?? "-",-9} {string.Join(",", model.ReasoningEfforts)}");
+            var rates = prices.Find(model.Id)?.RateText();
+            priced |= rates is not null;
+            var cost = model.BillingMultiplier is { } multiplier
+                ? multiplier.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "x" + (rates is null ? "" : " " + rates)
+                : rates ?? "-";
+            Console.WriteLine($"{model.Id,-28} {cost,-14} {model.ContextWindow,9}  {model.PolicyState ?? "-",-9} {string.Join(",", model.ReasoningEfforts)}");
+        }
+
+        if (priced)
+        {
+            var source = prices.Sources.FirstOrDefault();
+            Console.WriteLine();
+            Console.WriteLine("COST $in/$out: USD per 1M uncached input / output tokens; cached input is cheaper (--json shows all rates).");
+            Console.WriteLine($"Usage is billed in AI credits (${prices.AiCreditUsd.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)} each); override the table with {Llm.PriceTable.OverrideVariable}.");
+            if (source is not null)
+            {
+                Console.WriteLine($"Source: {source.Url}" + (source.Retrieved is null ? "" : $" (retrieved {source.Retrieved})"));
+            }
+        }
+
+        if (prices.LoadError is { } error)
+        {
+            await Console.Error.WriteLineAsync("⚠ " + error).ConfigureAwait(false);
         }
 
         return ExitCodes.Success;

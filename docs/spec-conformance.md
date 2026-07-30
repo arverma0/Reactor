@@ -60,7 +60,9 @@ validated against real agents.
   the spec's section 3.2 pseudocode), then `retry_target`, `fallback_retry_target`, else the run fails. Human gates,
   parallel, and fan-in nodes follow only explicit routes when they fail, so a skipped gate cannot loop forever.
 - *Final status*: as specified, reaching the exit with goal gates satisfied is success even if earlier stages failed
-  and were routed onward; `reactor run` lists such stages.
+  and were routed onward; `reactor run` lists such stages, the engine emits `FailedStageContinued` for each, and the
+  `fail_flows_onward` lint warns about stages whose failures nothing routes. The opt-in `default_on_fail="stop"` /
+  `on_fail="stop"` (an extension) ends the run at such a failure instead.
 - *Retries* apply to `retry` and `fail` outcomes (DoD 11.5) and to exceptions whose `Retryable` is true.
 - *Conditional nodes* pass the previous stage's outcome through and never retry.
 - *Dead ends*: a node with outgoing edges but none eligible fails the run with a clear reason; a node with no
@@ -77,7 +79,7 @@ validated against real agents.
 - *Parallel*: branches run on cloned contexts until they reach a fan-in, the exit, or a dead end; the parallel
   outcome always jumps to the join (fan-in decides how to treat failures); `first_success` cancels the rest. Branch
   context changes are not merged back, except Reactor's artifact records (`artifacts.*`), which are merged in branch
-  declaration order.
+  declaration order, and outcome metrics (`metrics.*`).
 - *Human gates*: `human.timeout` (else the node timeout) and `human.default_choice` (matched against target id,
   accelerator key, or label); `human.input="freeform"` stores text in `human.gate.text`.
 - *Codergen*: non-`full` fidelity prepends a context preamble; agent backends get the status-file protocol appended;
@@ -107,7 +109,7 @@ validated against real agents.
 **Additions beyond the specs**
 
 - Backends for the GitHub Copilot SDK, the Copilot CLI, and Claude Code; a per-node `backend` attribute and router.
-- Artifact pins: `inputs`/`outputs` node attributes declare the artifacts a codergen or tool stage reads and produces
+- Artifact pins: `inputs`/`outputs` node attributes declare the artifacts a codergen, tool, or LLM-judged fan-in stage reads and produces
   (text, or files relative to the working directory). Prompts list them, a successful stage that did not write a
   declared file fails (and is retried and routed like any failure), produced artifacts are recorded as versioned
   `artifacts.<name>` context values with an `ArtifactProduced` event, and four lint rules (`artifact_syntax`,
@@ -115,14 +117,26 @@ validated against real agents.
   stdout (a failing test report reaches the fixer), and artifact records made in parallel branches are merged back
   into the parent context at the join, in branch declaration order. See
   [pipelines.md](pipelines.md#artifacts-reactor-extension). (Unrelated to the spec's `ArtifactStore`.)
+- Flow control (see [pipelines.md](pipelines.md#flow-control-reactor-extensions)): numeric condition operators
+  (`<`, `<=`, `>`, `>=`), `visits.<node>` and `metrics.<name>` condition keys, `max_visits`/`on_max_visits` loop
+  bounds, `on_fail`/`default_on_fail`, and lint rules `fail_flows_onward`, `default_route`, `unbounded_loop`,
+  `visit_limits`. A node reached only through `on_max_visits` counts as reachable.
+- Timeouts and retries: per-attempt stage archives (`attempts/attempt-N/`), a "Previous attempt" hand-off in the
+  retry's prompt, the time limit stated in codergen prompts, soft-deadline steering, and `on_timeout`
+  (`retry`/`fail`/`wrap_up`). Backends attach their usage to exceptions, so failed and timed-out attempts still write
+  `backend.json`.
+- Outcome metrics (`status.json` `metrics`, `<stage>/metrics.json`, `metrics_file`) recorded as `metrics.<name>` and
+  `MetricsRecorded` events; run usage totals (`PipelineResult.Usage`, saved in checkpoints) and a resumable cost budget
+  (`max_cost`).
 - A default budget of 500 (CLI) / 1000 (server) stage executions per run against runaway loops, and 200 tool rounds
   per stage on the `agent` backend (the session-level default stays unlimited, as specified).
 - Copilot model verification against the account's model list (the runtime otherwise substitutes models silently).
 - `reactor doctor`, `reactor render` with status colors, the web console, stage artifact endpoints.
 - Per-stage checkpoint snapshots (`RunOptions.KeepCheckpointHistory`, `checkpoints/{index}-{node}.json`; on for
   server runs) and forks: a new run that resumes from any snapshot, optionally with an edited pipeline
-  (`POST /studio/api/runs/{id}/fork`). The fork continues after the snapshot's stage; the working directory is not
-  rewound.
+  (`POST /studio/api/runs/{id}/fork`). The fork continues after the snapshot's stage, in the source run's working
+  directory; in git work trees it can first rewind that directory to the snapshot's workspace state
+  (`restore_workspace`, with an undo commit).
 - A disk-backed run history (server and CLI runs, loop restarts folded in), event replay, telemetry aggregated per
   stage across runs, and user steering of a running agent stage (`agent` and `copilot` backends) — the Studio
   "flights" API in [http-api.md](http-api.md).

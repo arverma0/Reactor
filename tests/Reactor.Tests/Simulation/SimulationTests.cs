@@ -8,6 +8,7 @@ using Reactor.Tests.Support;
 
 namespace Reactor.Tests.Simulation;
 
+[Collection(Sim.Collection)]
 public sealed class SimulationTests
 {
     [Fact]

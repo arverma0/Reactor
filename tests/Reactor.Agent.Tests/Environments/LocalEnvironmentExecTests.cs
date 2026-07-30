@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using Reactor.Agent.Environments;
+using Reactor.Tests.Support;
 
 namespace Reactor.Agent.Tests.Environments;
 
@@ -218,6 +219,51 @@ public class LocalEnvironmentExecTests
             () => ws.Environment.ExecCommandAsync("echo x> ran.txt", 10_000, cancellationToken: new CancellationToken(true)));
 
         Assert.False(ws.Exists("ran.txt"));
+    }
+
+    [Fact]
+    public async Task Cancellation_terminates_grandchildren_whose_parent_already_exited()
+    {
+        Assert.SkipUnless(OrphanedGrandchild.Supported, "Containing orphaned processes needs Windows job objects or setsid.");
+        await using var ws = new TestWorkspace();
+        var pidFile = ws.PathOf("grandchild.pid");
+        using var cts = new CancellationTokenSource();
+        try
+        {
+            var running = ws.Environment.ExecCommandAsync(OrphanedGrandchild.ShellCommand(pidFile), 120_000, cancellationToken: cts.Token);
+            var pid = await OrphanedGrandchild.WaitForPidAsync(pidFile, running);
+
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+            Assert.True(await OrphanedGrandchild.WaitUntilGoneAsync(pid, TimeSpan.FromSeconds(5)), "the orphaned grandchild outlived the cancelled command");
+        }
+        finally
+        {
+            OrphanedGrandchild.Kill(pidFile);
+        }
+    }
+
+    [Fact]
+    public async Task Processes_a_command_leaves_running_survive_its_normal_exit()
+    {
+        Assert.SkipUnless(OrphanedGrandchild.Supported, "Containing orphaned processes needs Windows job objects or setsid.");
+        await using var ws = new TestWorkspace();
+        var pidFile = ws.PathOf("background.pid");
+        try
+        {
+            var result = await ws.Environment.ExecCommandAsync(OrphanedGrandchild.ShellCommand(pidFile, keepRunningSeconds: 0), 120_000);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.False(result.TimedOut);
+            var pid = await OrphanedGrandchild.WaitForPidAsync(pidFile, Task.Delay(Timeout.Infinite));
+            await Task.Delay(500);
+            Assert.True(OrphanedGrandchild.IsAlive(pid), "a process the command started in the background was killed when it exited");
+        }
+        finally
+        {
+            OrphanedGrandchild.Kill(pidFile);
+        }
     }
 
     [Fact]

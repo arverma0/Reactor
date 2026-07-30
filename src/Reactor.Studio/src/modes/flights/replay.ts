@@ -1,6 +1,8 @@
 import type { PendingQuestion, PipelineEventJson, QuestionOption } from "../../api/types";
 import { edgeKey, type CanvasOverlay, type EdgeOverlay, type NodeOverlay, type NodeState } from "../../canvas/build";
 import { formatDuration } from "../../canvas/Elapsed";
+import { stripAnsi } from "../../model/ansi";
+import { formatUsd } from "../../model/cost";
 
 export interface StageExecution {
   node: string;
@@ -20,6 +22,42 @@ export interface StageExecution {
   status?: string;
   notes?: string;
   error?: string;
+  /** The execution failed and the run went on along an unconditional edge to this stage anyway (`FailedStageContinued`). */
+  continuedTo?: string;
+  /** Outcome metrics this execution reported (`MetricsRecorded`). */
+  metrics?: Record<string, number>;
+}
+
+/** A failure that flowed onward: nothing routed it, so an unconditional edge took the run on as if the stage had succeeded. */
+export interface ContinuedFailure {
+  node: string;
+  to: string;
+  at: number;
+  reason?: string;
+}
+
+/** Outcome metrics one visit of a stage reported; `visit` counts the stage's visits across the run (from 1). */
+export interface MetricRecord {
+  node: string;
+  at: number;
+  visit: number;
+  metrics: Record<string, number>;
+}
+
+/** A stage's `max_visits` was used up and the run went to `target` instead (or failed, without one). */
+export interface VisitLimitRecord {
+  node: string;
+  max: number;
+  target: string | null;
+  at: number;
+}
+
+/** The run stopped before `next` because its recorded cost reached its budget (`BudgetExceeded`). */
+export interface BudgetRecord {
+  spent: number;
+  limit: number;
+  next: string | null;
+  at: number;
 }
 
 export interface Traversal {
@@ -59,6 +97,16 @@ export interface ArtifactRecord {
   kind?: string;
 }
 
+/** A WorkspaceChanged event: what one stage visit changed in its working directory. */
+export interface WorkspaceChangeRecord {
+  node: string;
+  at: number;
+  added: number;
+  modified: number;
+  deleted: number;
+  outOfScope: number;
+}
+
 export interface RunReplay {
   startedAt: number | null;
   endedAt: number | null;
@@ -69,6 +117,12 @@ export interface RunReplay {
   logs: LogLine[];
   questions: QuestionRecord[];
   artifacts: ArtifactRecord[];
+  changes: WorkspaceChangeRecord[];
+  continued: ContinuedFailure[];
+  metrics: MetricRecord[];
+  visitLimits: VisitLimitRecord[];
+  /** Set while the run's latest stop is its cost budget (a resume clears it). */
+  budget: BudgetRecord | null;
   restarts: number;
   events: number;
 }
@@ -85,10 +139,47 @@ export function parseDuration(value: unknown): number | undefined {
 
 const time = (e: PipelineEventJson) => Date.parse(e.timestamp);
 
-/** Folds an event stream into stage executions, traversals, logs, questions, and artifacts. */
+const finite = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+
+/** The numeric entries of an event's `metrics` object. */
+function numbers(value: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [name, v] of Object.entries(value as Record<string, unknown>)) {
+      const n = finite(v);
+      if (n !== undefined) out[name] = n;
+    }
+  }
+  return out;
+}
+
+/** The latest execution of a node that started at or before `at`. */
+function lastExecution(executions: StageExecution[], node: string, at: number): StageExecution | undefined {
+  for (let i = executions.length - 1; i >= 0; i--) if (executions[i].node === node && executions[i].start <= at) return executions[i];
+  return undefined;
+}
+
+/** Folds an event stream into stage executions, traversals, logs, questions, artifacts, and flow-control records. */
 export function digest(events: PipelineEventJson[]): RunReplay {
-  const replay: RunReplay = { startedAt: null, endedAt: null, outcome: "running", executions: [], traversals: [], logs: [], questions: [], artifacts: [], restarts: 0, events: events.length };
+  const replay: RunReplay = {
+    startedAt: null,
+    endedAt: null,
+    outcome: "running",
+    executions: [],
+    traversals: [],
+    logs: [],
+    questions: [],
+    artifacts: [],
+    changes: [],
+    continued: [],
+    metrics: [],
+    visitLimits: [],
+    budget: null,
+    restarts: 0,
+    events: events.length,
+  };
   const open = new Map<string, StageExecution>();
+  const visits = new Map<string, number>();
   let seq = 0;
   for (const e of events) {
     seq = e.seq ?? seq + 1;
@@ -98,6 +189,7 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         if (replay.startedAt === null) replay.startedAt = at;
         replay.endedAt = null;
         replay.outcome = "running";
+        replay.budget = null;
         // A resume: stages the stopped run left open never completed, and nothing runs inside them now.
         open.clear();
         break;
@@ -108,7 +200,7 @@ export function digest(events: PipelineEventJson[]): RunReplay {
       case "PipelineFailed":
         replay.endedAt = at;
         replay.outcome = "fail";
-        replay.failureReason = e.error;
+        replay.failureReason = e.error === undefined ? undefined : stripAnsi(e.error);
         break;
       case "StageStarted": {
         // Top-level stages run one at a time, so a stage that starts while another is open runs inside it (a branch
@@ -126,6 +218,7 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         };
         open.set(exec.node, exec);
         replay.executions.push(exec);
+        if (exec.attempt === 1) visits.set(exec.node, (visits.get(exec.node) ?? 0) + 1);
         break;
       }
       case "StageCompleted": {
@@ -141,7 +234,7 @@ export function digest(events: PipelineEventJson[]): RunReplay {
       case "StageFailed": {
         const exec = open.get(e.node_id!);
         if (exec) {
-          exec.error = e.error;
+          exec.error = e.error === undefined ? undefined : stripAnsi(e.error);
           if (e.will_retry) {
             exec.end = at;
             exec.status = "retry";
@@ -151,7 +244,8 @@ export function digest(events: PipelineEventJson[]): RunReplay {
         break;
       }
       case "StageLog":
-        replay.logs.push({ node: e.node_id ?? "", at, text: e.message ?? "", level: e.level ?? "info" });
+        // Agent and tool output often carries terminal escape sequences.
+        replay.logs.push({ node: e.node_id ?? "", at, text: stripAnsi(e.message), level: e.level ?? "info" });
         break;
       case "EdgeSelected":
         replay.traversals.push({ from: e.from!, to: e.to!, at, seq, reason: e.reason, label: e.label });
@@ -182,10 +276,61 @@ export function digest(events: PipelineEventJson[]): RunReplay {
       case "LoopRestarted":
         replay.restarts++;
         break;
+      case "WorkspaceChanged":
+        replay.changes.push({
+          node: e.node_id ?? "",
+          at,
+          added: Number(e.added ?? 0),
+          modified: Number(e.modified ?? 0),
+          deleted: Number(e.deleted ?? 0),
+          outOfScope: Array.isArray(e.out_of_scope) ? e.out_of_scope.length : 0,
+        });
+        break;
+      case "FailedStageContinued": {
+        const node = e.node_id ?? "";
+        const to = String(e.to ?? "");
+        const reason = typeof e.failure_reason === "string" && e.failure_reason ? stripAnsi(e.failure_reason) : undefined;
+        replay.continued.push({ node, to, at, reason });
+        const exec = lastExecution(replay.executions, node, at);
+        if (exec) exec.continuedTo = to;
+        break;
+      }
+      case "MetricsRecorded": {
+        const node = e.node_id ?? "";
+        const metrics = numbers(e.metrics);
+        if (Object.keys(metrics).length === 0) break;
+        replay.metrics.push({ node, at, visit: Math.max(1, visits.get(node) ?? 1), metrics });
+        const exec = lastExecution(replay.executions, node, at);
+        if (exec) exec.metrics = { ...exec.metrics, ...metrics };
+        break;
+      }
+      case "VisitLimitReached":
+        replay.visitLimits.push({ node: e.node_id ?? "", max: finite(e.max_visits) ?? 0, target: typeof e.target === "string" && e.target ? e.target : null, at });
+        break;
+      case "BudgetExceeded":
+        replay.budget = { spent: finite(e.spent_usd) ?? 0, limit: finite(e.limit_usd) ?? 0, next: typeof e.next_node_id === "string" ? e.next_node_id : null, at };
+        break;
     }
   }
   return replay;
 }
+
+/**
+ * Stages the run carries as failed: their last failure flowed onward along an unconditional edge, and no later execution
+ * of them succeeded (as the wind tunnel counts "landed with failed stages").
+ */
+export function failedStagesBehind(replay: RunReplay): string[] {
+  const behind: string[] = [];
+  for (const node of new Set(replay.continued.map((c) => c.node))) {
+    const last = replay.continued.filter((c) => c.node === node).at(-1)!;
+    const redeemed = replay.executions.some((x) => x.node === node && x.start > last.at && (x.status === "success" || x.status === "partial_success"));
+    if (!redeemed) behind.push(node);
+  }
+  return behind;
+}
+
+/** A metric value for readouts: whole numbers as is, others to at most two decimals. */
+export const metricText = (n: number) => (Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100));
 
 export interface OverlayOptions {
   /** Instant to show (ms epoch); null = latest. */
@@ -229,6 +374,15 @@ export function overlayAt(replay: RunReplay, options: OverlayOptions): CanvasOve
     // A stage the run stopped in (killed or cancelled) never completed: its time is unknown.
     if (state !== "running") readouts.push(finished ? { label: visits > 1 ? "total" : "time", value: formatDuration(total) } : { label: "run", value: "stopped here", tone: "fail" });
     if (last.attempt > 1) readouts.push({ label: "attempt", value: String(last.attempt), tone: "warn" });
+    // The files the latest finished visit changed (stages that changed nothing emit no WorkspaceChanged).
+    const changed = finished ? replay.changes.findLast((c) => c.node === node && c.at >= last.start && c.at <= t) : undefined;
+    if (changed) readouts.push({ label: "files", value: `+${changed.added} ~${changed.modified} −${changed.deleted}`, tone: changed.outOfScope > 0 ? "fail" : undefined });
+    const went = replay.continued.filter((c) => c.node === node && c.at >= last.start && c.at <= t).at(-1);
+    if (went) readouts.push({ label: "failed, went on", value: `→ ${went.to}`, tone: "fail" });
+    const reported = replay.metrics.filter((m) => m.node === node && m.at <= t).at(-1);
+    if (reported) for (const [name, value] of Object.entries(reported.metrics).slice(0, 3)) readouts.push({ label: name, value: metricText(value) });
+    const limited = replay.visitLimits.filter((v) => v.node === node && v.at <= t).at(-1);
+    if (limited) readouts.push({ label: "visit limit", value: `${limited.max} → ${limited.target ?? "fail"}`, tone: "warn" });
     for (const r of options.readouts?.[node] ?? []) readouts.push(r);
     const lines = replay.logs
       .filter((l) => l.node === node && l.at <= t && l.at >= last.start)
@@ -254,6 +408,13 @@ export function overlayAt(replay: RunReplay, options: OverlayOptions): CanvasOve
     for (const p of options.pending ?? []) {
       if (!nodes[p.stage]?.question) nodes[p.stage] = { ...(nodes[p.stage] ?? {}), state: "waiting", question: p };
     }
+  }
+
+  // A budget stop: the run halted before this stage, which never ran.
+  const budget = replay.budget;
+  if (budget && budget.at <= t && budget.next && nodes[budget.next]) {
+    const readouts = [...(nodes[budget.next].readouts ?? []), { label: "budget stop", value: `${formatUsd(budget.spent)} of ${formatUsd(budget.limit)}`, tone: "fail" as const }];
+    nodes[budget.next] = { ...nodes[budget.next], state: "stopped", readouts };
   }
 
   const edges: Record<string, EdgeOverlay> = {};

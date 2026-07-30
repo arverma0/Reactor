@@ -4,8 +4,10 @@ namespace Reactor.Server.Studio;
 
 /// <summary>
 /// Aggregates run records into per-pipeline telemetry: outcomes, durations, and costs per run, and per node (stage)
-/// visits, outcomes, retries, durations, cost per visit, models, and top failure reasons; selected edges; and a per-run
-/// series for sparklines. Values that no run reported are omitted rather than shown as zero.
+/// visits, outcomes, retries, durations, cost per visit, models, and top failure reasons; outcome metrics (per run, their
+/// final values; per node, every reported value); failures that flowed onward and the landings they made dirty; budget
+/// stops; selected edges; and a per-run series for sparklines. Values that no run reported are omitted rather than shown
+/// as zero.
 /// </summary>
 internal static class RunTelemetry
 {
@@ -49,15 +51,57 @@ internal static class RunTelemetry
         }
 
         json["cost"] = cost;
+        json["failed_stage_landings"] = runs.Count(r => r.LandedWithFailedStages);
+        json["budget_stops"] = runs.Count(r => r.Budget is not null);
+        json["metrics"] = RunMetrics(oldestFirst);
         json["nodes"] = Nodes(oldestFirst);
         json["edges"] = Edges(oldestFirst);
         json["series"] = new JsonArray(oldestFirst.Select(r => (JsonNode?)SeriesPoint(r)).ToArray());
         return json;
     }
 
+    /// <summary>Per outcome metric, statistics of its final value over the runs that reported it (oldest first, so <c>last</c> is the newest).</summary>
+    private static JsonObject RunMetrics(IReadOnlyList<RunRecord> runs)
+    {
+        var values = new OrderedDictionary<string, List<double>>(StringComparer.Ordinal);
+        foreach (var run in runs)
+        {
+            foreach (var (name, value) in run.Metrics)
+            {
+                if (!values.TryGetValue(name, out var list))
+                {
+                    values[name] = list = [];
+                }
+
+                list.Add(value);
+            }
+        }
+
+        var json = new JsonObject();
+        foreach (var (name, list) in values)
+        {
+            var stats = MetricStats(list);
+            stats["runs"] = list.Count;
+            stats.Remove("count");
+            json[name] = stats;
+        }
+
+        return json;
+    }
+
+    /// <summary><c>count</c>, <c>mean</c>, <c>min</c>, <c>max</c>, and <c>last</c> of values in recorded order.</summary>
+    private static JsonObject MetricStats(IReadOnlyList<double> values) => new()
+    {
+        ["count"] = values.Count,
+        ["mean"] = Number(values.Average(), 6),
+        ["min"] = Number(values.Min(), 6),
+        ["max"] = Number(values.Max(), 6),
+        ["last"] = Number(values[^1], 6),
+    };
+
     private static JsonObject Nodes(IReadOnlyList<RunRecord> runs)
     {
-        var nodes = new OrderedDictionary<string, List<NodeStats>>(StringComparer.Ordinal);
+        var nodes = new OrderedDictionary<string, List<(RunRecord Run, NodeStats Stats)>>(StringComparer.Ordinal);
         foreach (var run in runs)
         {
             foreach (var (id, stats) in run.Nodes)
@@ -72,13 +116,14 @@ internal static class RunTelemetry
                     nodes[id] = list = [];
                 }
 
-                list.Add(stats);
+                list.Add((run, stats));
             }
         }
 
         var json = new JsonObject();
-        foreach (var (id, perRun) in nodes)
+        foreach (var (id, entries) in nodes)
         {
+            var perRun = entries.Select(e => e.Stats).ToList();
             var visits = perRun.Sum(s => s.Visits);
             var outcomes = new JsonObject();
             foreach (var group in perRun.SelectMany(s => s.Statuses).Where(s => s.Length > 0).GroupBy(s => s, StringComparer.Ordinal).OrderBy(g => g.Key, StringComparer.Ordinal))
@@ -136,6 +181,17 @@ internal static class RunTelemetry
                 .Take(TopFailures)
                 .Select(f => (JsonNode?)new JsonObject { ["reason"] = f.Key, ["count"] = f.Value })
                 .ToArray());
+            node["failures_continued"] = perRun.Sum(s => s.FailuresContinued);
+            node["failed_stage_landings"] = entries.Count(e => e.Stats.FailedBehind && e.Run.LandedWithFailedStages);
+            node["visit_limits"] = perRun.Sum(s => s.VisitLimits);
+            var metrics = new JsonObject();
+            foreach (var name in perRun.SelectMany(s => s.Metrics).SelectMany(m => m.Values.Keys).Distinct(StringComparer.Ordinal).ToList())
+            {
+                var values = perRun.SelectMany(s => s.Metrics).Where(m => m.Values.ContainsKey(name)).Select(m => m.Values[name]).ToList();
+                metrics[name] = MetricStats(values);
+            }
+
+            node["metrics"] = metrics;
             json[id] = node;
         }
 
@@ -180,6 +236,26 @@ internal static class RunTelemetry
             {
                 point[field] = CostTotals.Number(value);
             }
+        }
+
+        if (run.Metrics.Count > 0)
+        {
+            point["metrics"] = FlightsEndpoints.Numbers(run.Metrics);
+        }
+
+        if (run.FailuresContinued > 0)
+        {
+            point["failures_continued"] = run.FailuresContinued;
+        }
+
+        if (run.FailedStages is { Count: > 0 } failed)
+        {
+            point["failed_stages"] = new JsonArray(failed.Select(s => (JsonNode?)s).ToArray());
+        }
+
+        if (run.Budget is not null)
+        {
+            point["budget_exceeded"] = true;
         }
 
         return point;

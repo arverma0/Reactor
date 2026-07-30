@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="Catalog\models.json" LogicalName="Reactor.Llm.models.json" />
+    <EmbeddedResource Include="Catalog\copilot-prices.json" LogicalName="Reactor.Llm.copilot-prices.json" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Llm.Tests" />

@@ -33,6 +33,17 @@ public sealed class FlightsApiTests
 
     private static DateTimeOffset At(string iso) => DateTimeOffset.Parse(iso, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
 
+    /// <summary>A pipeline whose tool stage prints the directory it runs in (into <c>where/stdout.txt</c>).</summary>
+    private static readonly string Workdir = $$"""
+        digraph Workdir {
+          start [shape=Mdiamond]
+          exit [shape=Msquare]
+          plan [prompt="Plan"]
+          where [shape=parallelogram, tool_command="{{(OperatingSystem.IsWindows() ? "cd" : "pwd")}}"]
+          start -> plan -> where -> exit
+        }
+        """;
+
     private static string RunsDir(ServerHarness server) => Path.Combine(server.Dir.Path, ".reactor", "runs");
 
     private static List<string> Strings(JsonNode? array) => array!.AsArray().Select(n => n!.GetValue<string>()).ToList();
@@ -49,6 +60,24 @@ public sealed class FlightsApiTests
         (await server.GetJsonAsync("/studio/api/runs" + query))["runs"]!.AsArray();
 
     private static string DirName(JsonObject created) => Path.GetFileName(created["logs_root"]!.GetValue<string>());
+
+    private static async Task<(HttpStatusCode Status, JsonObject Body)> ForkAsync(ServerHarness server, string run, object body)
+    {
+        var response = await server.Client.PostAsJsonAsync($"/studio/api/runs/{run}/fork", body);
+        return (response.StatusCode, await ServerHarness.ReadJsonAsync(response));
+    }
+
+    /// <summary>The directory the fork's (or run's) tool stage ran in, as it printed it.</summary>
+    private static string WhereItRan(JsonObject run) => File.ReadAllText(Path.Combine(run["logs_root"]!.GetValue<string>(), "where", "stdout.txt")).Trim();
+
+    /// <summary>Starts a <see cref="Workdir"/> run in <paramref name="workingDirectory"/> and waits for it to land; returns its run directory name.</summary>
+    private static async Task<string> FlyInAsync(ServerHarness server, string workingDirectory)
+    {
+        var created = await StartJsonAsync(server, new { dot = Workdir, working_directory = workingDirectory });
+        await server.WaitForStatusAsync(created["id"]!.GetValue<string>(), "success");
+        Assert.EndsWith(Path.GetFileName(workingDirectory), WhereItRan(created), StringComparison.OrdinalIgnoreCase);
+        return DirName(created);
+    }
 
     private static async Task WaitUntilAsync(Func<Task<bool>> condition)
     {
@@ -225,6 +254,29 @@ public sealed class FlightsApiTests
         Assert.Equal(HttpStatusCode.NotFound, (await server.Client.GetAsync($"/studio/api/runs/{factory1.Id}/stages/plan/files/missing.md")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await server.Client.GetAsync("/studio/api/runs/20210104-100000-nomanifest")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await server.Client.GetAsync("/studio/api/runs/nope")).StatusCode);
+    }
+
+    [Fact]
+    public async Task Run_detail_summarizes_what_each_stage_changed_in_the_workspace()
+    {
+        await using var server = await ServerHarness.StartAsync();
+        var run = FakeRun.Create(RunsDir(server), "20210106-100000-changes", "changes", At("2021-01-06T10:00:00Z"))
+            .Started("build").Completed("build", "success", 100)
+            .File(Path.Combine("build", "changes.json"), """
+                {"node":"build","mode":"git","summary":{"added":2,"modified":1,"deleted":0,"total":3},"changes":[],
+                 "concurrent":true,"truncated":false,"write_scope":{"patterns":["src/**"],"enforced":false,"violations":["README.md"]}}
+                """)
+            .Save();
+
+        var detail = await server.GetJsonAsync($"/studio/api/runs/{run.Id}");
+
+        var build = detail["stages"]!.AsArray().Single(s => s!["node"]!.GetValue<string>() == "build")!;
+        var changes = build["changes"]!;
+        Assert.Equal((2, 1, 0, 1), (changes["added"]!.GetValue<int>(), changes["modified"]!.GetValue<int>(), changes["deleted"]!.GetValue<int>(), changes["out_of_scope"]!.GetValue<int>()));
+        Assert.Equal("git", changes["mode"]!.GetValue<string>());
+        Assert.True(changes["concurrent"]!.GetValue<bool>());
+        Assert.Contains("changes.json", Strings(build["files"]));
+        Assert.Contains("README.md", await server.Client.GetStringAsync($"/studio/api/runs/{run.Id}/stages/build/files/changes.json"));
     }
 
     [Theory]
@@ -582,6 +634,333 @@ public sealed class FlightsApiTests
         Assert.Equal(HttpStatusCode.BadRequest, (await server.Client.PostAsJsonAsync($"/studio/api/runs/{source}/fork", new { })).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await server.Client.PostAsJsonAsync("/studio/api/runs/nope/fork", new { checkpoint = "0002-a" })).StatusCode);
         Assert.Equal(runsBefore, Directory.GetDirectories(RunsDir(server)).Length);
+    }
+
+    [Fact]
+    public async Task Fork_continues_in_the_working_directory_of_a_run_in_a_client_chosen_directory()
+    {
+        using var project = new TempDir();
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, AllowClientWorkingDirectory = true });
+        Assert.True((await server.GetJsonAsync("/studio/api/info"))["allow_client_working_directory"]!.GetValue<bool>());
+        var source = await FlyInAsync(server, project.Path);
+        var summary = (await RunsAsync(server)).Single(r => r!["id"]!.GetValue<string>() == source)!;
+        Assert.Equal(project.Path, summary["working_directory"]!.GetValue<string>());
+        Assert.Equal(project.Path, (await server.GetJsonAsync($"/studio/api/runs/{source}"))["summary"]!["working_directory"]!.GetValue<string>());
+        var live = JsonNode.Parse(await server.Client.GetStringAsync("/pipelines"))!.AsArray().Single()!;
+        Assert.Equal(project.Path, live["working_directory"]!.GetValue<string>());
+
+        var (status, fork) = await ForkAsync(server, source, new { checkpoint = "0002-plan" });
+
+        Assert.True(status == HttpStatusCode.Created, fork.ToJsonString());
+        Assert.Equal(project.Path, fork["working_directory"]!.GetValue<string>());
+        Assert.Equal("source_run", fork["working_directory_source"]!.GetValue<string>());
+        Assert.Equal(project.Path, fork["source_working_directory"]!.GetValue<string>());
+        Assert.Null(fork["working_directory_note"]);
+        var detail = await server.WaitForStatusAsync(fork["id"]!.GetValue<string>(), "success");
+        Assert.Equal(project.Path, detail["working_directory"]!.GetValue<string>());
+        Assert.EndsWith(Path.GetFileName(project.Path), WhereItRan(fork), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(project.Path, JsonNode.Parse(File.ReadAllText(Path.Combine(fork["logs_root"]!.GetValue<string>(), "manifest.json")))!["working_directory"]!.GetValue<string>());
+        Assert.Equal(project.Path, (await RunsAsync(server)).Single(r => r!["id"]!.GetValue<string>() == DirName(fork))!["working_directory"]!.GetValue<string>());
+
+        // A fork of the fork stays there too; naming the source run's directory explicitly needs no confirmation.
+        var sameDirectory = OperatingSystem.IsWindows() ? project.Path.ToUpperInvariant() : project.Path;
+        var (again, refork) = await ForkAsync(server, DirName(fork), new { checkpoint = "0003-where", working_directory = sameDirectory });
+        Assert.True(again == HttpStatusCode.Created, refork.ToJsonString());
+        Assert.Equal("request", refork["working_directory_source"]!.GetValue<string>());
+        await server.WaitForStatusAsync(refork["id"]!.GetValue<string>(), "success");
+    }
+
+    [Fact]
+    public async Task Forking_into_another_directory_than_the_source_runs_needs_confirmation()
+    {
+        using var project = new TempDir();
+        using var elsewhere = new TempDir();
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, AllowClientWorkingDirectory = true });
+        var source = await FlyInAsync(server, project.Path);
+        var runsBefore = Directory.GetDirectories(RunsDir(server)).Length;
+
+        var (status, refused) = await ForkAsync(server, source, new { checkpoint = "0002-plan", working_directory = elsewhere.Path });
+        Assert.Equal(HttpStatusCode.Conflict, status);
+        Assert.Equal("working_directory_confirmation_required", refused["code"]!.GetValue<string>());
+        Assert.Equal(elsewhere.Path, refused["working_directory"]!.GetValue<string>());
+        Assert.Equal(project.Path, refused["source_working_directory"]!.GetValue<string>());
+        Assert.Contains(project.Path, refused["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("confirm_working_directory", refused["error"]!.GetValue<string>(), StringComparison.Ordinal);
+
+        // The server's own directory is another directory too.
+        var (toServer, refusedServer) = await ForkAsync(server, source, new { checkpoint = "0002-plan", working_directory = server.Dir.Path, confirm_working_directory = false });
+        Assert.Equal(HttpStatusCode.Conflict, toServer);
+        Assert.Equal("working_directory_confirmation_required", refusedServer["code"]!.GetValue<string>());
+        Assert.Equal(runsBefore, Directory.GetDirectories(RunsDir(server)).Length);
+
+        var (confirmed, fork) = await ForkAsync(server, source, new { checkpoint = "0002-plan", working_directory = elsewhere.Path, confirm_working_directory = true });
+        Assert.True(confirmed == HttpStatusCode.Created, fork.ToJsonString());
+        Assert.Equal(elsewhere.Path, fork["working_directory"]!.GetValue<string>());
+        Assert.Equal("request", fork["working_directory_source"]!.GetValue<string>());
+        Assert.Equal(project.Path, fork["source_working_directory"]!.GetValue<string>());
+        await server.WaitForStatusAsync(fork["id"]!.GetValue<string>(), "success");
+        Assert.EndsWith(Path.GetFileName(elsewhere.Path), WhereItRan(fork), StringComparison.OrdinalIgnoreCase);
+
+        var (missing, gone) = await ForkAsync(server, source, new { checkpoint = "0002-plan", working_directory = Path.Combine(elsewhere.Path, "nope"), confirm_working_directory = true });
+        Assert.Equal(HttpStatusCode.Conflict, missing);
+        Assert.Equal("working_directory_missing", gone["code"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Fork_refuses_a_source_directory_the_server_may_not_use_instead_of_using_its_own()
+    {
+        using var shared = new TempDir();
+        using var project = new TempDir();
+        var scratch = Path.Combine(shared.Path, ".reactor", "studio", "architect", "20260101-000000-abc123");
+        Directory.CreateDirectory(scratch);
+        string inProject, inScratch;
+
+        // Runs in other directories, like `reactor run -C <dir>` runs or runs of a server that allowed client directories.
+        await using (var first = await ServerHarness.StartAsync(_ => new ReactorServerOptions { WorkingDirectory = shared.Path, AllowClientWorkingDirectory = true }))
+        {
+            inProject = await FlyInAsync(first, project.Path);
+            inScratch = await FlyInAsync(first, scratch);
+        }
+
+        await using var server = await ServerHarness.StartAsync(_ => new ReactorServerOptions { WorkingDirectory = shared.Path });
+        Assert.False((await server.GetJsonAsync("/studio/api/info"))["allow_client_working_directory"]!.GetValue<bool>());
+        Assert.Equal(project.Path, (await RunsAsync(server)).Single(r => r!["id"]!.GetValue<string>() == inProject)!["working_directory"]!.GetValue<string>());
+        var runsDir = Path.Combine(shared.Path, ".reactor", "runs");
+        var runsBefore = Directory.GetDirectories(runsDir).Length;
+
+        var (status, refused) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan" });
+        Assert.Equal(HttpStatusCode.Forbidden, status);
+        Assert.Equal("working_directory_not_allowed", refused["code"]!.GetValue<string>());
+        Assert.Equal(project.Path, refused["working_directory"]!.GetValue<string>());
+        Assert.Equal(project.Path, refused["source_working_directory"]!.GetValue<string>());
+        Assert.Equal(shared.Path, refused["server_working_directory"]!.GetValue<string>());
+        var error = refused["error"]!.GetValue<string>();
+        Assert.Contains(project.Path, error, StringComparison.Ordinal);
+        Assert.Contains("--allow-client-workdir", error, StringComparison.Ordinal);
+        Assert.Contains(shared.Path, error, StringComparison.Ordinal);
+
+        var (explicitly, refusedExplicit) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan", working_directory = project.Path, confirm_working_directory = true });
+        Assert.Equal(HttpStatusCode.Forbidden, explicitly);
+        Assert.Equal("working_directory_not_allowed", refusedExplicit["code"]!.GetValue<string>());
+
+        // Requested directories are refused before they are looked at (missing or not).
+        var (probe, refusedProbe) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan", working_directory = Path.Combine(project.Path, "nope"), confirm_working_directory = true });
+        Assert.Equal(HttpStatusCode.Forbidden, probe);
+        Assert.Equal("working_directory_not_allowed", refusedProbe["code"]!.GetValue<string>());
+        Assert.Equal(runsBefore, Directory.GetDirectories(runsDir).Length);
+        Assert.Empty(JsonNode.Parse(await server.Client.GetStringAsync("/pipelines"))!.AsArray());
+
+        // Runs the server itself placed under its .reactor directory (the Architect's scratch directories) may be re-flown.
+        var (scratchStatus, scratchFork) = await ForkAsync(server, inScratch, new { checkpoint = "0002-plan" });
+        Assert.True(scratchStatus == HttpStatusCode.Created, scratchFork.ToJsonString());
+        Assert.Equal(scratch, scratchFork["working_directory"]!.GetValue<string>());
+        await server.WaitForStatusAsync(scratchFork["id"]!.GetValue<string>(), "success");
+
+        // Moving to the server's own directory is the way forward, once confirmed.
+        var (unconfirmed, confirmation) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan", working_directory = shared.Path });
+        Assert.Equal(HttpStatusCode.Conflict, unconfirmed);
+        Assert.Equal("working_directory_confirmation_required", confirmation["code"]!.GetValue<string>());
+        var (moved, fork) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan", working_directory = shared.Path, confirm_working_directory = true });
+        Assert.True(moved == HttpStatusCode.Created, fork.ToJsonString());
+        Assert.Equal(shared.Path, fork["working_directory"]!.GetValue<string>());
+        await server.WaitForStatusAsync(fork["id"]!.GetValue<string>(), "success");
+        Assert.EndsWith(Path.GetFileName(shared.Path), WhereItRan(fork), StringComparison.OrdinalIgnoreCase);
+
+        // Once the source run's directory is gone, that is what the error says (whatever the server allows).
+        Directory.Delete(project.Path, recursive: true);
+        var (missing, gone) = await ForkAsync(server, inProject, new { checkpoint = "0002-plan" });
+        Assert.Equal(HttpStatusCode.Conflict, missing);
+        Assert.Equal("working_directory_missing", gone["code"]!.GetValue<string>());
+        Assert.Contains(project.Path, gone["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("no longer exists", gone["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains(shared.Path, gone["error"]!.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Fork_fails_clearly_when_the_source_runs_working_directory_is_gone()
+    {
+        var project = new TempDir();
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, AllowClientWorkingDirectory = true });
+        var source = await FlyInAsync(server, project.Path);
+        project.Dispose();
+        Assert.False(Directory.Exists(project.Path));
+        var runsBefore = Directory.GetDirectories(RunsDir(server)).Length;
+
+        var (status, refused) = await ForkAsync(server, source, new { checkpoint = "0002-plan" });
+
+        Assert.Equal(HttpStatusCode.Conflict, status);
+        Assert.Equal("working_directory_missing", refused["code"]!.GetValue<string>());
+        Assert.Equal(project.Path, refused["working_directory"]!.GetValue<string>());
+        Assert.Contains(project.Path, refused["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Contains("no longer exists", refused["error"]!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.Equal(runsBefore, Directory.GetDirectories(RunsDir(server)).Length);
+    }
+
+    [Fact]
+    public async Task Fork_of_a_run_that_did_not_record_its_working_directory_uses_the_servers_and_says_so()
+    {
+        using var shared = new TempDir();
+        string source;
+        await using (var first = await ServerHarness.StartAsync(_ => new ReactorServerOptions { WorkingDirectory = shared.Path }))
+        {
+            var created = await first.StartRunAsync(Workdir);
+            await first.WaitForStatusAsync(created["id"]!.GetValue<string>(), "success");
+            source = DirName(created);
+        }
+
+        // Run directories of older versions have no working_directory in their manifest.
+        var manifestPath = Path.Combine(shared.Path, ".reactor", "runs", source, "manifest.json");
+        var manifest = JsonNode.Parse(File.ReadAllText(manifestPath))!.AsObject();
+        Assert.True(manifest.Remove("working_directory"));
+        File.WriteAllText(manifestPath, manifest.ToJsonString());
+
+        await using var server = await ServerHarness.StartAsync(_ => new ReactorServerOptions { WorkingDirectory = shared.Path });
+        Assert.Null((await RunsAsync(server)).Single()!["working_directory"]);
+
+        var (status, fork) = await ForkAsync(server, source, new { checkpoint = "0002-plan" });
+
+        Assert.True(status == HttpStatusCode.Created, fork.ToJsonString());
+        Assert.Equal(shared.Path, fork["working_directory"]!.GetValue<string>());
+        Assert.Equal("server", fork["working_directory_source"]!.GetValue<string>());
+        Assert.Null(fork["source_working_directory"]);
+        Assert.Contains("did not record its working directory", fork["working_directory_note"]!.GetValue<string>(), StringComparison.Ordinal);
+        await server.WaitForStatusAsync(fork["id"]!.GetValue<string>(), "success");
+    }
+
+    /// <summary>A backend whose stages a, b, and c change files in <paramref name="repo"/>.</summary>
+    private static ControllableBackend FileWriter(GitRepo repo) => new()
+    {
+        Respond = node =>
+        {
+            switch (node.Id)
+            {
+                case "a":
+                    repo.Write("app.txt", "v1");
+                    repo.Write("notes/a.txt", "a");
+                    break;
+                case "b":
+                    repo.Write("app.txt", "v2");
+                    File.Delete(repo.Combine("seed.txt"));
+                    repo.Write("b.txt", "b");
+                    break;
+                case "c":
+                    repo.Write("app.txt", "v3");
+                    repo.Write("c.txt", "c");
+                    break;
+            }
+
+            return CodergenResult.FromText("ok:" + node.Id);
+        },
+    };
+
+    [Fact]
+    public async Task Fork_can_rewind_the_working_directory_to_its_checkpoint_and_records_how_to_undo_it()
+    {
+        using var repo = GitRepo.Create(new Dictionary<string, string> { ["seed.txt"] = "seed", [".gitignore"] = "ignored/\n" });
+        var backend = FileWriter(repo);
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend, AllowClientWorkingDirectory = true });
+        var original = await StartJsonAsync(server, new { dot = Forkable, working_directory = repo.Path });
+        await server.WaitForStatusAsync(original["id"]!.GetValue<string>(), "success");
+        var source = DirName(original);
+        var detail = await server.GetJsonAsync($"/studio/api/runs/{source}");
+        Assert.Equal("git", detail["workspace"]!["mode"]!.GetValue<string>());
+        Assert.Equal(["0001-start", "0002-a", "0003-b", "0004-c", "0005-exit"], Strings(detail["workspace_checkpoints"]));
+
+        // Work done by hand since the run: an untracked file, and ignored files the rewind leaves alone.
+        repo.Write("scratch.txt", "mine");
+        repo.Write("ignored/keep.txt", "keep");
+        repo.Write("node_modules/pkg/index.js", "module");
+        var head = repo.Git("rev-parse", "HEAD");
+        var staged = repo.Git("ls-files", "--stage");
+
+        // b, the first stage the fork runs, waits, so the rewound directory can be inspected.
+        backend.Block.Add("b");
+        var (status, fork) = await ForkAsync(server, source, new { checkpoint = "0002-a", restore_workspace = true });
+
+        Assert.True(status == HttpStatusCode.Created, fork.ToJsonString());
+        var restore = fork["workspace_restore"]!.AsObject();
+        Assert.Equal("0002-a", restore["checkpoint"]!.GetValue<string>());
+        Assert.Equal((2, 3), (restore["written"]!.GetValue<int>(), restore["deleted"]!.GetValue<int>()));
+        Assert.Equal(["app.txt", "b.txt", "c.txt", "scratch.txt", "seed.txt"], Strings(restore["paths"]));
+        Assert.Equal("v1", repo.Read("app.txt"));
+        Assert.Equal("a", repo.Read("notes/a.txt"));
+        Assert.Equal("seed", repo.Read("seed.txt"));
+        Assert.False(repo.Exists("b.txt") || repo.Exists("c.txt") || repo.Exists("scratch.txt"));
+        Assert.Equal("keep", repo.Read("ignored/keep.txt"));
+        Assert.Equal("module", repo.Read("node_modules/pkg/index.js"));
+        Assert.Equal(head, repo.Git("rev-parse", "HEAD"));
+        Assert.Equal(staged, repo.Git("ls-files", "--stage"));
+
+        // The state before the rewind is a commit on the fork's ref, recorded with the fork.
+        var forkId = fork["id"]!.GetValue<string>();
+        var undo = restore["undo_commit"]!.GetValue<string>();
+        Assert.Equal($"refs/reactor/runs/{forkId}/before-rewind", restore["undo_ref"]!.GetValue<string>());
+        Assert.Equal(undo, repo.Git("rev-parse", $"refs/reactor/runs/{forkId}/before-rewind"));
+        Assert.Equal("mine", repo.Git("show", $"{undo}:scratch.txt"));
+        Assert.Contains(undo, restore["undo_command"]!.GetValue<string>(), StringComparison.Ordinal);
+        var forkDetail = await server.GetJsonAsync($"/studio/api/runs/{DirName(fork)}");
+        Assert.Equal(undo, forkDetail["manifest"]!["workspace_restore"]!["undo_commit"]!.GetValue<string>());
+        Assert.Equal(undo, forkDetail["studio"]!["workspace_restore"]!["undo_commit"]!.GetValue<string>());
+
+        backend.Release.TrySetResult();
+        await server.WaitForStatusAsync(forkId, "success");
+        Assert.Equal("v3", repo.Read("app.txt"));
+        Assert.False(repo.Exists("seed.txt"));
+
+        // The documented undo brings the hand-made state back; a fork of the fork does not inherit the restore record.
+        repo.Git("restore", "--source", undo, "--worktree", "--", ".");
+        Assert.Equal("mine", repo.Read("scratch.txt"));
+        var (again, refork) = await ForkAsync(server, DirName(fork), new { checkpoint = "0004-c" });
+        Assert.True(again == HttpStatusCode.Created, refork.ToJsonString());
+        Assert.Null(refork["workspace_restore"]);
+        Assert.Null((await server.WaitForStatusAsync(refork["id"]!.GetValue<string>(), "success"))["studio"]?["workspace_restore"]);
+    }
+
+    [Fact]
+    public async Task Fork_refuses_to_rewind_without_a_git_snapshot_into_another_directory_or_while_a_run_works_there()
+    {
+        using var repo = GitRepo.Create(new Dictionary<string, string> { ["seed.txt"] = "seed", ["sub/x.txt"] = "x" });
+        using var plain = new TempDir();
+        var backend = new ControllableBackend();
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend, AllowClientWorkingDirectory = true });
+        var inRepo = await StartJsonAsync(server, new { dot = Forkable, working_directory = repo.Path });
+        await server.WaitForStatusAsync(inRepo["id"]!.GetValue<string>(), "success");
+        var inPlain = await StartJsonAsync(server, new { dot = Forkable, working_directory = plain.Path });
+        await server.WaitForStatusAsync(inPlain["id"]!.GetValue<string>(), "success");
+        var runsBefore = Directory.GetDirectories(RunsDir(server)).Length;
+
+        async Task<JsonObject> RefusedAsync(string run, object body, string code)
+        {
+            var (status, refused) = await ForkAsync(server, run, body);
+            Assert.True(status == HttpStatusCode.Conflict, refused.ToJsonString());
+            Assert.Equal(code, refused["code"]!.GetValue<string>());
+            return refused;
+        }
+
+        // Outside git the workspace is recorded with a file walk, which keeps no contents to go back to.
+        var plainDetail = await server.GetJsonAsync($"/studio/api/runs/{DirName(inPlain)}");
+        Assert.Equal("walk", plainDetail["workspace"]!["mode"]!.GetValue<string>());
+        Assert.Empty(plainDetail["workspace_checkpoints"]!.AsArray());
+        Assert.Contains("file walk", (await RefusedAsync(DirName(inPlain), new { checkpoint = "0002-a", restore_workspace = true }, "rewind_unavailable"))["error"]!.GetValue<string>(), StringComparison.Ordinal);
+
+        // A checkpoint saved without a workspace snapshot.
+        File.Delete(Path.Combine(inRepo["logs_root"]!.GetValue<string>(), "checkpoints", "0002-a.workspace.json"));
+        await RefusedAsync(DirName(inRepo), new { checkpoint = "0002-a", restore_workspace = true }, "workspace_snapshot_missing");
+
+        // Another directory than the one the snapshot recorded: here a subdirectory of the same repository.
+        var mismatch = await RefusedAsync(DirName(inRepo), new { checkpoint = "0003-b", restore_workspace = true, working_directory = Path.Combine(repo.Path, "sub"), confirm_working_directory = true }, "workspace_mismatch");
+        Assert.Equal(Path.Combine(repo.Path, "sub"), mismatch["working_directory"]!.GetValue<string>());
+
+        // A run still working in the directory.
+        backend.Block.Add("a");
+        var active = await StartJsonAsync(server, new { dot = Forkable, working_directory = repo.Path });
+        await RefusedAsync(DirName(inRepo), new { checkpoint = "0003-b", restore_workspace = true }, "workspace_busy");
+        backend.Release.TrySetResult();
+        await server.WaitForStatusAsync(active["id"]!.GetValue<string>(), "success");
+
+        Assert.Equal(runsBefore + 1, Directory.GetDirectories(RunsDir(server)).Length);
+        Assert.DoesNotContain("before-rewind", repo.Git("for-each-ref", "--format=%(refname)", "refs/reactor/"), StringComparison.Ordinal);
+        Assert.Equal("seed", repo.Read("seed.txt"));
     }
 
     [Fact]

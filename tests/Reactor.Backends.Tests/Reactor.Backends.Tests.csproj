@@ -19,6 +19,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\Reactor.Agent.Tests\Session\SessionTestSupport.cs" Link="Support\SessionTestSupport.cs" />
+    <Compile Include="..\Reactor.Tests\Support\OrphanedGrandchild.cs" Link="Support\OrphanedGrandchild.cs" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />

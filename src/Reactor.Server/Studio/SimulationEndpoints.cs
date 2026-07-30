@@ -11,10 +11,11 @@ namespace Reactor.Server.Studio;
 
 /// <summary>
 /// The Studio's wind tunnel: <c>POST /studio/api/simulate</c> runs a Monte Carlo simulation and returns the
-/// <see cref="SimulationReport"/>; <c>POST /studio/api/simulate/trace</c> replays one sample with its full event list.
-/// Both take JSON with the DOT source (<c>dot</c>) and an optional <c>scenario</c> and <c>context</c> (or a raw DOT body,
-/// which simulates the empty scenario). Animated or step-by-step simulated runs go through <c>POST /pipelines</c> with a
-/// <c>simulation</c> object (see <see cref="RunSimulation"/>).
+/// <see cref="SimulationReport"/>; <c>POST /studio/api/simulate/trace</c> replays one sample with its full event list;
+/// <c>GET /studio/api/simulate/presets</c> lists the scenario presets (<see cref="SimulationPreset"/>).
+/// Both POSTs take JSON with the DOT source (<c>dot</c>) and an optional <c>scenario</c> (an object, or a preset name) and
+/// <c>context</c> (or a raw DOT body, which simulates the empty scenario). Animated or step-by-step simulated runs go
+/// through <c>POST /pipelines</c> with a <c>simulation</c> object (see <see cref="RunSimulation"/>).
 /// </summary>
 public static class SimulationEndpoints
 {
@@ -26,7 +27,48 @@ public static class SimulationEndpoints
         var api = app.MapGroup("/studio/api");
         api.MapPost("/simulate", SimulateAsync);
         api.MapPost("/simulate/trace", TraceAsync);
+        api.MapGet("/simulate/presets", () => JsonResult(SimulationPreset.CatalogJson()));
         return app;
+    }
+
+    /// <summary>
+    /// The report as the simulate API returns it: <see cref="SimulationReport.ToJson"/> plus the pipeline's lint
+    /// <c>diagnostics</c> (shared with <c>reactor simulate --json</c>).
+    /// </summary>
+    public static JsonObject ReportJson(SimulationReport report, PreparedPipeline prepared)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+        ArgumentNullException.ThrowIfNull(prepared);
+        var json = report.ToJson();
+        json["diagnostics"] = StudioGraphJson.Diagnostics(prepared);
+        return json;
+    }
+
+    /// <summary>
+    /// Resolves the <c>scenario</c> of a simulate request (see <see cref="SimulationScenario.TryResolve"/>): null (the empty
+    /// scenario), an object (optionally starting from a <c>"preset"</c>), or a preset name. On failure
+    /// <paramref name="error"/> and <paramref name="diagnostics"/> say why.
+    /// </summary>
+    public static bool TryResolveScenario(JsonNode? json, Graph graph, out SimulationScenario scenario, out string? error, out IReadOnlyList<Diagnostic> diagnostics)
+    {
+        ArgumentNullException.ThrowIfNull(graph);
+        error = null;
+        diagnostics = [];
+        if (json is JsonArray || (json is JsonValue value && value.GetValueKind() != System.Text.Json.JsonValueKind.String))
+        {
+            scenario = SimulationScenario.Empty;
+            error = "'scenario' must be an object or a preset name (" + string.Join(", ", SimulationPreset.All.Select(p => p.Name)) + ").";
+            return false;
+        }
+
+        if (SimulationScenario.TryResolve(json, graph, out scenario, out var errors))
+        {
+            return true;
+        }
+
+        error = json is JsonValue ? errors[0].Message[0..1].ToUpperInvariant() + errors[0].Message[1..] + "." : "The simulation scenario is invalid.";
+        diagnostics = json is JsonValue ? [] : RunSimulation.ToDiagnostics(errors);
+        return false;
     }
 
     private static async Task<IResult> SimulateAsync(HttpContext http, PipelineRunManager manager)
@@ -52,9 +94,7 @@ public static class SimulationEndpoints
             InitialContext = request.Context,
             CustomHandlerTypes = manager.CustomHandlerTypes(),
         }, http.RequestAborted).ConfigureAwait(false);
-        var json = report.ToJson();
-        json["diagnostics"] = StudioGraphJson.Diagnostics(request.Prepared);
-        return JsonResult(json);
+        return JsonResult(ReportJson(report, request.Prepared));
     }
 
     private static async Task<IResult> TraceAsync(HttpContext http, PipelineRunManager manager)
@@ -108,20 +148,9 @@ public static class SimulationEndpoints
             return (null, Invalid("The pipeline has validation errors.", prepared.Diagnostics));
         }
 
-        var scenario = SimulationScenario.Empty;
-        switch (body.Json?["scenario"])
+        if (!TryResolveScenario(body.Json?["scenario"], prepared.Graph, out var scenario, out var scenarioError, out var scenarioDiagnostics))
         {
-            case null:
-                break;
-            case JsonObject scenarioJson:
-                if (!SimulationScenario.TryFromJson(scenarioJson, out scenario, out var errors))
-                {
-                    return (null, Invalid("The simulation scenario is invalid.", RunSimulation.ToDiagnostics(errors)));
-                }
-
-                break;
-            default:
-                return (null, Invalid("'scenario' must be an object.", []));
+            return (null, Invalid(scenarioError!, scenarioDiagnostics));
         }
 
         IReadOnlyDictionary<string, object?>? context = null;

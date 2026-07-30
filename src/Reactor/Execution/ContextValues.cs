@@ -113,6 +113,21 @@ public static class ContextValues
         return node.ToJsonString();
     }
 
+    /// <summary>
+    /// Reads a finite JSON number whatever backs the node — parsed text, or an in-memory <c>long</c>, <c>int</c>, or
+    /// <c>double</c> (<c>JsonValue.GetValue&lt;double&gt;()</c> throws converting between those).
+    /// </summary>
+    public static bool TryGetNumber(JsonNode? node, out double number)
+    {
+        number = 0;
+        if (node is not JsonValue value || value.GetValueKind() != JsonValueKind.Number)
+        {
+            return false;
+        }
+
+        return double.TryParse(value.ToJsonString(), NumberStyles.Float, CultureInfo.InvariantCulture, out number) && double.IsFinite(number);
+    }
+
     /// <summary>Converts a plain value into a JSON node (for checkpoints and status files).</summary>
     public static JsonNode? ToJson(object? value) => value switch
     {

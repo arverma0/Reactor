@@ -488,7 +488,7 @@ public static class StageArtifacts
         return outputs.Where(p => p.Kind == ArtifactKind.File && MissingFile(p, workingDirectory) is not null).ToList();
     }
 
-    private static string WorkingDirectory(PipelineContext context) => context.Run?.WorkingDirectory ?? Directory.GetCurrentDirectory();
+    private static string WorkingDirectory(PipelineContext context) => context.WorkingDirectory;
 
     private static string? MissingFile(ArtifactPin pin, string workingDirectory)
     {

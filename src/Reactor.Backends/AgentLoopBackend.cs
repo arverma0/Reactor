@@ -53,9 +53,11 @@ public sealed record AgentLoopBackendOptions
 /// <summary>
 /// Runs codergen stages with the built-in coding agent loop (Reactor.Agent) — the reference backend. Each stage submits
 /// the prompt to a session whose profile matches the node's <c>llm_provider</c>/<c>llm_model</c>; <c>full</c>-fidelity
-/// stages on the same thread share one session (conversation continuity). The agent can report outcomes through
-/// <c>status.json</c>. Node extension attributes: <c>agent.max_tool_rounds</c>, <c>agent.max_turns</c>,
-/// <c>agent.max_tokens</c>, <c>agent.instructions</c>, <c>agent.shell_timeout</c>.
+/// stages on the same thread share one session (conversation continuity). The stage's standing instructions (see
+/// <see cref="StageInstructions"/>) become the session's user instructions in the system prompt. The agent can report
+/// outcomes through <c>status.json</c> and takes steering from <c>steering.md</c>. Node extension attributes:
+/// <c>agent.max_tool_rounds</c>, <c>agent.max_turns</c>, <c>agent.max_tokens</c>, <c>agent.instructions</c> (legacy,
+/// appended to the standing instructions), <c>agent.shell_timeout</c>.
 /// </summary>
 public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
 {
@@ -69,6 +71,9 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
     }
 
     public bool SupportsStatusFile => true;
+
+    /// <summary>The backend takes <c>steering.md</c> from the stage directory and injects it into the running session.</summary>
+    public bool SupportsSteering => true;
 
     /// <summary>Number of live thread sessions (for diagnostics).</summary>
     public int ThreadSessionCount => _sessions.Count;
@@ -92,7 +97,8 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
             session.Profile.Model = model;
         }
 
-        ConfigureForStage(session.Config, node, stage, model);
+        var instructions = StageInstructions.ResolveAndRecord(node, run?.Graph, stage.StageDirectory, toolUse: true, includeLegacyAgentInstructions: true);
+        ConfigureForStage(session.Config, node, stage, model, instructions);
         holder.Hooks = ToolHookSettings.Resolve(node, run?.Graph, stage, Log);
         if (lease.ContextLost)
         {
@@ -100,6 +106,7 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
         }
 
         using var eventLog = new StageEventLog(stage.StageDirectory);
+        eventLog.WriteAttempt(stage.Attempt);
         var stageStats = new StageStats();
         using var subscription = session.Events.Subscribe(evt => OnSessionEvent(evt, eventLog, stageStats, Log));
         using var steeringCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -108,14 +115,60 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
         var historyBefore = session.History.Count;
         var usageBefore = session.TotalUsage;
         var errorBefore = session.LastError;
+        Dictionary<string, object?> Metadata()
+        {
+            var turns = session.History.Skip(historyBefore).ToList();
+            var usage = Subtract(session.TotalUsage, usageBefore);
+            var metadata = new Dictionary<string, object?>
+            {
+                ["backend"] = "agent",
+                ["provider"] = provider,
+                ["model"] = model,
+                ["session_id"] = session.Id,
+                ["thread_id"] = stage.ThreadId,
+                ["thread_context"] = ThreadContinuity.Describe(stage, lease.IsNew, lease.ContextLost),
+                ["attempt"] = stage.Attempt,
+                ["reasoning_effort"] = session.Config.ReasoningEffort,
+                ["assistant_turns"] = turns.Count(t => t is AssistantTurn),
+                ["tool_calls"] = stageStats.ToolCalls,
+                ["tool_errors"] = stageStats.ToolErrors,
+                ["input_tokens"] = usage.InputTokens,
+                ["output_tokens"] = usage.OutputTokens,
+                ["total_tokens"] = usage.TotalTokens,
+                ["reasoning_tokens"] = usage.ReasoningTokens,
+                ["cache_read_tokens"] = usage.CacheReadTokens,
+                ["cache_write_tokens"] = usage.CacheWriteTokens,
+            };
+
+            // Anthropic reports cache reads and writes apart from its input tokens; the other providers include them.
+            StageCost.AddApi(metadata, model, inputIncludesCache: !string.Equals(provider, "anthropic", StringComparison.OrdinalIgnoreCase));
+            return metadata;
+        }
+
+        string LastAssistantText() =>
+            session.History.Skip(historyBefore).OfType<AssistantTurn>().Select(t => t.Content).LastOrDefault(c => !string.IsNullOrWhiteSpace(c)) ?? "";
+
+        Dictionary<string, object?> FailureMetadata()
+        {
+            var metadata = Metadata();
+            metadata[BackendMetadata.LastAssistantText] = LastAssistantText();
+            return metadata;
+        }
+
         Log($"agent session {(lease.IsNew ? "started" : "resumed")}: {provider}/{model}" + (stage.ThreadId is null ? "" : $" (thread {stage.ThreadId})"), "info");
         try
         {
             await session.SubmitAsync(prompt, cancellationToken).ConfigureAwait(false);
         }
-        catch (AbortError) when (cancellationToken.IsCancellationRequested)
+        catch (AbortError ex) when (cancellationToken.IsCancellationRequested)
         {
-            throw new OperationCanceledException("The stage was cancelled.", cancellationToken);
+            throw BackendMetadata.Attach(new OperationCanceledException("The stage was cancelled.", ex, cancellationToken), FailureMetadata());
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // A failed or cancelled stage still records what it spent and the agent's last words.
+            BackendMetadata.Attach(ex, FailureMetadata());
+            throw;
         }
         finally
         {
@@ -128,27 +181,8 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
             }
         }
 
-        var stageTurns = session.History.Skip(historyBefore).ToList();
-        var text = stageTurns.OfType<AssistantTurn>().Select(t => t.Content).LastOrDefault(c => !string.IsNullOrWhiteSpace(c)) ?? "";
-        var usage = Subtract(session.TotalUsage, usageBefore);
-        var metadata = new Dictionary<string, object?>
-        {
-            ["backend"] = "agent",
-            ["provider"] = provider,
-            ["model"] = model,
-            ["session_id"] = session.Id,
-            ["thread_id"] = stage.ThreadId,
-            ["thread_context"] = ThreadContinuity.Describe(stage, lease.IsNew, lease.ContextLost),
-            ["reasoning_effort"] = session.Config.ReasoningEffort,
-            ["assistant_turns"] = stageTurns.Count(t => t is AssistantTurn),
-            ["tool_calls"] = stageStats.ToolCalls,
-            ["tool_errors"] = stageStats.ToolErrors,
-            ["input_tokens"] = usage.InputTokens,
-            ["output_tokens"] = usage.OutputTokens,
-            ["total_tokens"] = usage.TotalTokens,
-            ["reasoning_tokens"] = usage.ReasoningTokens,
-            ["cache_read_tokens"] = usage.CacheReadTokens,
-        };
+        var text = LastAssistantText();
+        var metadata = Metadata();
 
         if (session.LastError is ContextLengthError contextError && !ReferenceEquals(contextError, errorBefore))
         {
@@ -190,7 +224,7 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
         return holder;
     }
 
-    private void ConfigureForStage(SessionConfig config, Node node, StageSettings stage, string model)
+    private void ConfigureForStage(SessionConfig config, Node node, StageSettings stage, string model, string instructions)
     {
         var defaults = _options.SessionConfig ?? new SessionConfig();
         config.ReasoningEffort = ModelResolution.ReasoningEffort(stage, model);
@@ -198,7 +232,7 @@ public sealed class AgentLoopBackend : ICodergenBackend, IAsyncDisposable
             ?? (defaults.MaxToolRoundsPerInput > 0 ? defaults.MaxToolRoundsPerInput : Math.Max(0, _options.DefaultMaxToolRounds));
         config.MaxTurns = ParseInt(node["agent.max_turns"]) ?? defaults.MaxTurns;
         config.MaxTokens = ParseInt(node["agent.max_tokens"]) is int maxTokens and > 0 ? maxTokens : defaults.MaxTokens;
-        config.UserInstructions = Combine(defaults.UserInstructions, node["agent.instructions"]);
+        config.UserInstructions = Combine(defaults.UserInstructions, instructions);
         config.CommandTimeoutOverrideMs = AttributeValues.ParseDuration(node["agent.shell_timeout"]) is { } shellTimeout
             ? (int)Math.Clamp(shellTimeout.TotalMilliseconds, 1, int.MaxValue)
             : defaults.CommandTimeoutOverrideMs;

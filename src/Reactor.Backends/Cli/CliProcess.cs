@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
+using Reactor.Processes;
 
 namespace Reactor.Backends.Cli;
 
@@ -148,11 +149,19 @@ public static partial class CommandResolver
 /// <summary>Result of <see cref="CliProcess.RunAsync"/>.</summary>
 public sealed record CliProcessResult(int ExitCode, string Stderr, TimeSpan Duration);
 
-/// <summary>Runs a CLI agent: writes the prompt to stdin, streams stdout lines to a callback, captures stderr.</summary>
+/// <summary>
+/// Runs a CLI agent: writes the prompt to stdin, streams stdout lines to a callback, captures stderr. Cancellation
+/// (including a stage timeout) terminates the agent's whole process tree — on Windows through a job object, on Unix
+/// through the session and process group it starts in (via <c>setsid</c> when available) — so shells and servers the
+/// agent started do not outlive the stage. When the agent exits by itself, processes it left running keep running.
+/// </summary>
 public static class CliProcess
 {
     /// <summary>Maximum stderr characters kept.</summary>
     public const int MaxStderrChars = 256 * 1024;
+
+    /// <summary>How long a cancelled agent's process tree gets to exit after <c>SIGTERM</c> (Unix) before it is killed.</summary>
+    public static readonly TimeSpan GracePeriod = TimeSpan.FromSeconds(2);
 
     /// <exception cref="CliAgentException">The process could not be started.</exception>
     /// <exception cref="OperationCanceledException">Cancelled; the process tree is killed first.</exception>
@@ -194,6 +203,7 @@ public static class CliProcess
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        var ownsProcessGroup = PosixProcesses.TryStartInNewSession(startInfo);
         using var process = new Process { StartInfo = startInfo };
         var stderr = new StringBuilder();
         var stopwatch = Stopwatch.StartNew();
@@ -209,7 +219,18 @@ public static class CliProcess
             throw new CliAgentException($"Failed to start '{command}': {ex.Message}", retryable: false, ex);
         }
 
-        using var registration = cancellationToken.Register(() => Kill(process));
+        using var tree = ProcessTreeGuard.Attach(process, ownsProcessGroup);
+        var terminationGate = new object();
+        Task<IReadOnlyList<int>>? termination = null;
+        Task<IReadOnlyList<int>> Terminate()
+        {
+            lock (terminationGate)
+            {
+                return termination ??= Task.Run(() => tree.TerminateAsync(GracePeriod), CancellationToken.None);
+            }
+        }
+
+        var registration = cancellationToken.Register(() => Terminate());
         var stdoutTask = Task.Run(async () =>
         {
             try
@@ -253,37 +274,62 @@ public static class CliProcess
             }
         }, CancellationToken.None);
 
+        var exited = false;
         try
-        {
-            if (stdin is not null)
-            {
-                await process.StandardInput.WriteAsync(stdin.AsMemory(), cancellationToken).ConfigureAwait(false);
-                await process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
-            }
-        }
-        catch (IOException)
-        {
-            // The process exited without reading all of its input; its output explains why.
-        }
-        finally
         {
             try
             {
-                process.StandardInput.Close();
+                if (stdin is not null)
+                {
+                    await process.StandardInput.WriteAsync(stdin.AsMemory(), cancellationToken).ConfigureAwait(false);
+                    await process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (IOException)
             {
+                // The process exited without reading all of its input; its output explains why.
             }
-        }
+            finally
+            {
+                try
+                {
+                    process.StandardInput.Close();
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+                {
+                }
+            }
 
-        try
-        {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            exited = true;
         }
         catch (OperationCanceledException)
         {
-            Kill(process);
+            await Terminate().ConfigureAwait(false);
             throw;
+        }
+        finally
+        {
+            registration.Dispose();
+            Task? pending;
+            lock (terminationGate)
+            {
+                pending = termination;
+            }
+
+            if (pending is not null)
+            {
+                // Cancellation raced the agent's exit: let that termination finish before the process is disposed.
+                await pending.ConfigureAwait(false);
+            }
+            else if (exited)
+            {
+                tree.Release();
+            }
+            else
+            {
+                await Terminate().ConfigureAwait(false);
+            }
         }
 
         // Drain remaining output, bounded in case grandchildren keep the pipes open.
@@ -296,20 +342,6 @@ public static class CliProcess
         }
 
         return new CliProcessResult(process.ExitCode, stderrText, stopwatch.Elapsed);
-    }
-
-    private static void Kill(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
-        {
-        }
     }
 }
 

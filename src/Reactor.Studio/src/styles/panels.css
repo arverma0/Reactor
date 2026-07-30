@@ -586,6 +586,79 @@
   color: var(--ink-2);
 }
 
+/* quick fixes for lint findings */
+.rs-fixes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  color: var(--signal-ink);
+}
+
+.rs-fixes__group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.rs-fixes__label {
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+.rs-fix {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 5px;
+  border: 1px solid var(--line-3);
+  background: var(--bg-2);
+  color: var(--ink-0);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.rs-fix:hover {
+  border-color: var(--signal-line);
+  background: var(--bg-3);
+}
+
+.rs-fix.is-recommended {
+  border-color: var(--signal-line);
+}
+
+.rs-fix.is-recommended::after {
+  content: " ★";
+  color: var(--signal-ink);
+  font-size: 9px;
+}
+
+.rs-insp__sub {
+  margin: -4px 0 14px;
+  padding: 10px 10px 2px;
+  border-radius: var(--r-2);
+  border: 1px dashed var(--line-2);
+}
+
+.rs-insp__sub .rs-insp__grid {
+  margin: 10px 0 0;
+}
+
+.rs-insp__metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.rs-insp__metrics .label {
+  margin-right: 4px;
+}
+
 .rs-insp__note {
   margin: 0;
   font-size: 12px;
@@ -804,7 +877,7 @@
 
 .rs-cond__row {
   display: grid;
-  grid-template-columns: 28px 1fr 64px 1fr 20px;
+  grid-template-columns: 28px minmax(0, 1.5fr) 58px minmax(0, 1fr) 20px;
   gap: 5px;
   align-items: center;
   margin-bottom: 6px;
@@ -834,6 +907,25 @@
   border-color: var(--signal-line);
 }
 
+.rs-cond__key.is-invalid,
+.rs-cond__value.is-invalid {
+  border-color: rgba(240, 84, 79, 0.55);
+}
+
+.rs-cond__clause {
+  margin-bottom: 6px;
+}
+
+.rs-cond__clause .rs-cond__row {
+  margin-bottom: 0;
+}
+
+.rs-cond__problem {
+  margin: 3px 0 0 33px;
+  font-size: 11px;
+  color: var(--fail);
+}
+
 .rs-cond__remove {
   display: grid;
   place-items: center;
@@ -851,7 +943,8 @@
 
 .rs-cond__add {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   margin-top: 4px;
 }
 
@@ -998,6 +1091,15 @@
   color: var(--ink-1);
   text-align: left;
   font-size: 12px;
+  cursor: pointer;
+}
+
+.rs-problem:focus-visible {
+  outline: 1px solid var(--signal-line);
+}
+
+.rs-problem .rs-fixes {
+  margin-top: 5px;
 }
 
 .rs-problem:hover {
@@ -1009,7 +1111,8 @@
   height: 7px;
   border-radius: 50%;
   background: var(--warn);
-  align-self: center;
+  align-self: start;
+  margin-top: 5px;
 }
 
 .rs-problem.is-error .rs-problem__sev {

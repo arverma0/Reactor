@@ -4,7 +4,8 @@
 digraph supervisor {
     graph [
         goal="Supervise the worker pipeline",
-        stack.child_dotfile="child-worker.dot"
+        stack.child_dotfile="child-worker.dot",
+        default_on_fail="stop"
     ]
 
     start [shape=Mdiamond]

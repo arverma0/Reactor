@@ -68,7 +68,7 @@ export const KINDS: Record<NodeKind, KindMeta> = {
   },
   join: {
     kind: "join", handler: "parallel.fan_in", name: "Join", code: "JON", shape: "tripleoctagon", idPrefix: "join", hotkey: "J",
-    blurb: "Gathers parallel branches; optionally an LLM picks the best one.", defaults: { shape: "tripleoctagon", label: "Gather" }, llm: false, pins: false,
+    blurb: "Gathers parallel branches; optionally an LLM picks the best one (and then reads and writes artifacts).", defaults: { shape: "tripleoctagon", label: "Gather" }, llm: false, pins: true,
   },
   supervisor: {
     kind: "supervisor", handler: "stack.manager_loop", name: "Supervisor", code: "SUP", shape: "house", idPrefix: "supervise", hotkey: "S",

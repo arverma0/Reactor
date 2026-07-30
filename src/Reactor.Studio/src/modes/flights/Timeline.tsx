@@ -4,7 +4,8 @@ import { Glyph } from "../../components/Glyph";
 import type { StudioDoc } from "../../model/types";
 import { findNode, kindOf, nodeLabel } from "../../model/doc";
 import { formatDuration } from "../../canvas/Elapsed";
-import { timelineRows, type RunReplay } from "./replay";
+import { formatUsd } from "../../model/cost";
+import { metricText, timelineRows, type RunReplay } from "./replay";
 
 function niceStep(span: number) {
   const steps = [1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 900000, 1800000, 3600000, 7200000];
@@ -148,15 +149,23 @@ export function Timeline({
                 const future = exec.start > head;
                 const waiting = exec.end === undefined && replay.questions.some((q) => q.node === row.node && q.asked >= exec.start && q.answered === undefined);
                 const state = exec.end === undefined ? (replay.endedAt === null ? (waiting ? "waiting" : "running") : "fail") : exec.status ?? "success";
+                const metrics = exec.metrics ? Object.entries(exec.metrics).map(([k, v]) => `${k}=${metricText(v)}`).join(", ") : "";
                 return (
                   <span
                     key={i}
-                    className={cx("rs-timeline__exec", `is-${state}`, future && "is-future")}
+                    className={cx("rs-timeline__exec", `is-${state}`, future && "is-future", exec.continuedTo && "is-continued")}
                     style={{ left: pct(exec.start), width: `${width}%` }}
-                    title={`${row.node} · attempt ${exec.attempt} · ${exec.status ?? "running"} · ${formatDuration(stop - exec.start)}${exec.error ? `\n${exec.error}` : ""}`}
+                    title={`${row.node} · attempt ${exec.attempt} · ${exec.status ?? "running"} · ${formatDuration(stop - exec.start)}${exec.error ? `\n${exec.error}` : ""}${exec.continuedTo ? `\nfailed, but the run went on to ${exec.continuedTo} (nothing routes the failure)` : ""}${metrics ? `\nmetrics: ${metrics}` : ""}`}
                   />
                 );
               })}
+              {replay.visitLimits
+                .filter((v) => v.node === row.node)
+                .map((v, i) => (
+                  <span key={`limit${i}`} className="rs-timeline__limit" style={{ left: pct(v.at) }} title={`visit limit (${v.max}) reached: the run went to ${v.target ?? "nowhere — it failed"}`}>
+                    ⟲
+                  </span>
+                ))}
               {replay.questions
                 .filter((q) => q.node === row.node)
                 .map((q) => (
@@ -170,6 +179,15 @@ export function Timeline({
                 <span key={i} className="rs-timeline__mark" style={{ left: pct(tr.at) }} />
               ))}
             </div>
+          ) : null}
+          {replay.budget ? (
+            <span
+              className={cx("rs-timeline__budget", (replay.budget.at - start) / span > 0.8 && "is-end")}
+              style={{ left: pct(replay.budget.at) }}
+              title={`Budget reached: ${formatUsd(replay.budget.spent)} of ${formatUsd(replay.budget.limit)}; stopped before ${replay.budget.next ?? "the next stage"}`}
+            >
+              <span className="rs-timeline__budget-label">budget</span>
+            </span>
           ) : null}
           <span className={cx("rs-timeline__head", at === null && replay.endedAt === null && "is-live")} style={{ left: pct(head) }} />
         </div>

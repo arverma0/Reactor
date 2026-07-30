@@ -16,6 +16,9 @@
     <ProjectReference Include="..\..\src\Reactor.Llm\Reactor.Llm.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\Reactor.Tests\Support\OrphanedGrandchild.cs" Link="Support\OrphanedGrandchild.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
 </Project>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Canvas } from "../../canvas/Canvas";
 import { edgeKey, type CanvasOverlay, type EdgeOverlay, type NodeOverlay } from "../../canvas/build";
 import { formatDuration } from "../../canvas/Elapsed";
@@ -12,11 +12,35 @@ import { api } from "../../api/client";
 import { setMode, toast, useStudio } from "../../state/store";
 import { refreshRuns, rememberRunSource, selectRun } from "../flights/store";
 import { digest, overlayAt } from "../flights/replay";
-import { MAX_DURATION_MS, OUTCOME_KINDS, PRESETS, buildScenario, gateChoices, predictedCost, routeLabels, withoutDurations, type Behavior, type Calibration, type Preset, type SimReport } from "./scenario";
+import {
+  DURATION_PRIORS,
+  MAX_COST_USD,
+  MAX_DURATION_MS,
+  OUTCOME_KINDS,
+  PRESETS,
+  buildScenario,
+  failedStageLandings,
+  formatMetricSpec,
+  formatUsd,
+  gateChoices,
+  landing,
+  parseMetricSpec,
+  predictedCost,
+  routeLabels,
+  withoutDurations,
+  type Behavior,
+  type Calibration,
+  type MetricSpec,
+  type Preset,
+  type SimReport,
+} from "./scenario";
 import { applyCalibration, closeTrace, focusTunnelNode, loadSettingsForDoc, playTrace, runTunnel, setTraceCursor, toggleTracePlaying, updateSettings, useTunnel } from "./store";
 import { loadTelemetry, useTelemetry } from "../../state/telemetry";
 
 const pct = (n: number, digits = 0) => `${(n * 100).toFixed(digits)}%`;
+
+/** A metric value for readouts: whole numbers as is, others to two decimals. */
+const metricValue = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
 
 const NO_FEATURES: string[] = [];
 
@@ -35,7 +59,9 @@ function reportOverlay(doc: StudioDoc, report: SimReport): CanvasOverlay {
     const readouts: NonNullable<NodeOverlay["readouts"]> = [{ label: "reached", value: pct(reach) }];
     if (stats.mean_visits >= 1.05) readouts.push({ label: "visits/run", value: stats.mean_visits.toFixed(1), tone: stats.mean_visits > 3 ? "warn" : undefined });
     if (failRate > 0) readouts.push({ label: "fails", value: pct(failRate), tone: "fail" });
+    if ((stats.failures_continued ?? 0) > 0) readouts.push({ label: "fails flow on", value: pct((stats.failures_continued ?? 0) / stats.visits), tone: "warn" });
     if (stats.retries > 0) readouts.push({ label: "retries", value: String(stats.retries), tone: "warn" });
+    for (const [name, m] of Object.entries(stats.metrics ?? {}).slice(0, 2)) readouts.push({ label: name, value: `⌀ ${metricValue(Math.round(m.mean * 100) / 100)}` });
     nodes[node.id] = {
       state: "visited",
       badge: stats.mean_visits >= 1.05 ? `×${stats.mean_visits.toFixed(1)}` : undefined,
@@ -237,6 +263,8 @@ function ScenarioPanel({ doc, focus }: { doc: StudioDoc; focus: string | null })
           </div>
         </div>
 
+        <PriorsEditor priors={settings.durationPriors} />
+
         <div className="rs-scenario__heading label">Stages</div>
         {tunable.map((node) => (
           <StageBehavior key={node.id} doc={doc} node={node} open={focus === node.id} />
@@ -262,6 +290,72 @@ function ScenarioPanel({ doc, focus }: { doc: StudioDoc; focus: string | null })
         </div>
       </div>
     </div>
+  );
+}
+
+const PRIOR_KINDS: { type: string; label: string }[] = [
+  { type: "codergen", label: "Agent stage" },
+  { type: "tool", label: "Tool command" },
+  { type: "stack.manager_loop", label: "Supervisor" },
+];
+
+/** Typical durations by stage kind: what time forecasts assume for stages without their own duration or flight record. */
+function PriorsEditor({ priors }: { priors?: Record<string, number> }) {
+  const current = priors ?? DURATION_PRIORS;
+  const changed = PRIOR_KINDS.some((k) => current[k.type] !== DURATION_PRIORS[k.type]);
+  const set = (type: string, minutes: string) => {
+    const next = { ...current };
+    const value = Number(minutes);
+    if (minutes.trim() && Number.isFinite(value) && value >= 0) next[type] = Math.min(MAX_DURATION_MS, Math.round(value * 60_000));
+    else delete next[type];
+    updateSettings({ durationPriors: next });
+  };
+  return (
+    <div className="rs-scenario__priors">
+      <div className="rs-dial__head">
+        <span>Typical durations</span>
+        {changed ? (
+          <button type="button" className="rs-linkbtn" onClick={() => updateSettings({ durationPriors: { ...DURATION_PRIORS } })}>
+            defaults
+          </button>
+        ) : (
+          <span className="faint">for time forecasts</span>
+        )}
+      </div>
+      {PRIOR_KINDS.map((k) => (
+        <label key={k.type} className="rs-prior">
+          <span>{k.label}</span>
+          <NumberField
+            value={current[k.type] !== undefined ? String(Math.round((current[k.type] / 60_000) * 100) / 100) : ""}
+            placeholder="—"
+            onCommit={(text) => set(k.type, text)}
+          />
+          <span className="faint">min</span>
+        </label>
+      ))}
+      <p className="faint rs-scenario__note">Rough guesses until calibrated to real flights; never longer than a stage's own timeout.</p>
+    </div>
+  );
+}
+
+/**
+ * A numeric text field that shows what is typed while it is being typed: the stored number is re-formatted only on blur,
+ * so "0." or ".5" on the way to "0.05" is not reset to "0" (which would turn 0.05 into 5).
+ */
+function NumberField({ value, placeholder, onCommit }: { value: string; placeholder?: string; onCommit: (text: string) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <input
+      className="rs-input mono"
+      value={draft ?? value}
+      placeholder={placeholder}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        onCommit(e.target.value);
+      }}
+      onBlur={() => setDraft(null)}
+      onKeyDown={(e) => e.stopPropagation()}
+    />
   );
 }
 
@@ -342,19 +436,36 @@ function StageBehavior({ doc, node, open }: { doc: StudioDoc; node: DocNode; ope
               <span className="faint">for time estimates</span>
             </div>
             <div className="rs-behavior__duration">
-              <input
-                className="rs-input mono"
+              <NumberField
                 value={override?.duration_ms !== undefined ? String(override.duration_ms / 1000) : ""}
                 placeholder="seconds"
-                onChange={(e) => {
-                  const seconds = Number(e.target.value);
-                  set({ ...(override ?? {}), duration_ms: e.target.value.trim() && Number.isFinite(seconds) ? Math.max(0, Math.min(MAX_DURATION_MS, Math.round(seconds * 1000))) : undefined });
+                onCommit={(text) => {
+                  const seconds = Number(text);
+                  set({ ...(override ?? {}), duration_ms: text.trim() && Number.isFinite(seconds) ? Math.max(0, Math.min(MAX_DURATION_MS, Math.round(seconds * 1000))) : undefined });
                 }}
-                onKeyDown={(e) => e.stopPropagation()}
               />
               <span className="faint">s</span>
+              {override?.duration_ms !== undefined && override.duration_ms >= 60_000 ? <span className="faint">= {formatDuration(override.duration_ms)}</span> : null}
             </div>
           </div>
+          <div className="rs-dial">
+            <div className="rs-dial__head">
+              <span>Costs</span>
+              <span className="faint">per run of the stage, for cost estimates</span>
+            </div>
+            <div className="rs-behavior__duration">
+              <span className="faint">$</span>
+              <NumberField
+                value={override?.cost !== undefined ? String(override.cost) : ""}
+                placeholder="USD"
+                onCommit={(text) => {
+                  const usd = Number(text);
+                  set({ ...(override ?? {}), cost: text.trim() && Number.isFinite(usd) ? Math.max(0, Math.min(MAX_COST_USD, usd)) : undefined });
+                }}
+              />
+            </div>
+          </div>
+          {kind !== "human" ? <MetricsEditor metrics={override?.metrics} onChange={(metrics) => set({ ...(override ?? {}), metrics })} /> : null}
           {override ? (
             <button type="button" className="rs-linkbtn" onClick={() => set(undefined)}>
               Reset to scenario defaults
@@ -381,6 +492,84 @@ function WeightList({ title, names, weights, onChange }: { title: string; names:
           <span className="num rs-weight__pct">{pct((current[name] ?? 0) / total)}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+const METRIC_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+
+/**
+ * Outcome metrics a stage reports in the tunnel (recorded as `metrics.<name>`, so conditions can route on them):
+ * `4`, `1..5`, `3, 4, 5`, `3:0.2, 4:0.5, 5:0.3`, or per status `success: 0; fail: 1..5`.
+ */
+function MetricsEditor({ metrics, onChange }: { metrics?: Record<string, MetricSpec>; onChange: (metrics: Record<string, MetricSpec> | undefined) => void }) {
+  const entries = Object.entries(metrics ?? {});
+  const update = (next: [string, MetricSpec][]) => onChange(next.length > 0 ? Object.fromEntries(next) : undefined);
+  const add = () => {
+    let name = "score";
+    for (let i = 2; metrics?.[name] !== undefined; i++) name = `score_${i}`;
+    update([...entries, [name, { min: 3, max: 5 }]]);
+  };
+  return (
+    <div className="rs-dial rs-metrics">
+      <div className="rs-dial__head">
+        <span>Reports metrics</span>
+        <button type="button" className="rs-linkbtn" onClick={add}>
+          + metric
+        </button>
+      </div>
+      {entries.map(([name, spec], i) => (
+        <MetricRow
+          key={i}
+          name={name}
+          spec={spec}
+          taken={(candidate) => entries.some(([other], j) => j !== i && other === candidate)}
+          onChange={(nextName, nextSpec) => update(entries.map((e, j) => (j === i ? [nextName, nextSpec] : e)))}
+          onRemove={() => update(entries.filter((_, j) => j !== i))}
+        />
+      ))}
+      {entries.length > 0 ? <p className="faint rs-scenario__note">4 · 1..5 · 3, 4, 5 · 3:0.2, 4:0.8 · success: 0; fail: 1..5 — route on them with conditions such as metrics.{entries[0][0]}=5.</p> : null}
+    </div>
+  );
+}
+
+function MetricRow({ name, spec, taken, onChange, onRemove }: { name: string; spec: MetricSpec; taken: (name: string) => boolean; onChange: (name: string, spec: MetricSpec) => void; onRemove: () => void }) {
+  // While a field is being edited it shows what was typed (even when not valid yet); otherwise the committed value.
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const [specDraft, setSpecDraft] = useState<string | null>(null);
+  const nameText = nameDraft ?? name;
+  const specText = specDraft ?? formatMetricSpec(spec);
+  const nameOk = METRIC_NAME.test(nameText) && !taken(nameText);
+  const specOk = parseMetricSpec(specText) !== null;
+  return (
+    <div className="rs-metric">
+      <input
+        className={cx("rs-input mono", !nameOk && "is-invalid")}
+        value={nameText}
+        aria-label="Metric name"
+        onChange={(e) => {
+          setNameDraft(e.target.value);
+          if (METRIC_NAME.test(e.target.value) && !taken(e.target.value)) onChange(e.target.value, spec);
+        }}
+        onBlur={() => setNameDraft(null)}
+        onKeyDown={(e) => e.stopPropagation()}
+      />
+      <input
+        className={cx("rs-input mono", !specOk && "is-invalid")}
+        value={specText}
+        aria-label="Distribution"
+        title="4 · 1..5 · 3, 4, 5 · 3:0.2, 4:0.8 · success: 0; fail: 1..5"
+        onChange={(e) => {
+          setSpecDraft(e.target.value);
+          const next = parseMetricSpec(e.target.value);
+          if (next !== null) onChange(name, next);
+        }}
+        onBlur={() => setSpecDraft(null)}
+        onKeyDown={(e) => e.stopPropagation()}
+      />
+      <button type="button" className="rs-linkbtn" onClick={onRemove} title="Remove this metric">
+        ✕
+      </button>
     </div>
   );
 }
@@ -420,6 +609,11 @@ function RealityCheck({ report, calibration }: { report: SimReport; calibration:
   const cost = predictedCost(report, calibration);
   const delta = report.success_rate - calibration.successRate;
   const costDelta = cost && calibration.meanCost !== undefined ? cost.mean - calibration.meanCost : undefined;
+  const usd = report.simulated_cost_usd && report.simulated_cost_usd.max > 0 ? report.simulated_cost_usd.mean : undefined;
+  const usdDelta = usd !== undefined && calibration.meanCostUsd !== undefined ? usd - calibration.meanCostUsd : undefined;
+  const time = report.simulated_duration_ms && report.simulated_duration_ms.max > 0 ? report.simulated_duration_ms.mean : undefined;
+  const timeDelta = time !== undefined && calibration.meanDurationMs !== undefined ? time - calibration.meanDurationMs : undefined;
+  const deltaClass = (d: number | undefined, threshold: number) => cx("num rs-reality__delta", d === undefined || Math.abs(d) < threshold ? "" : d < 0 ? "is-up" : "is-down");
   return (
     <section className="rs-results__section rs-reality">
       <div className="label">
@@ -433,15 +627,31 @@ function RealityCheck({ report, calibration }: { report: SimReport; calibration:
         <span className={cx("num rs-reality__delta", Math.abs(delta) < 0.02 ? "" : delta > 0 ? "is-up" : "is-down")}>
           {Math.abs(delta) < 0.005 ? "±0" : `${delta > 0 ? "+" : "−"}${(Math.abs(delta) * 100).toFixed(0)} pts`}
         </span>
+        {time !== undefined ? (
+          <>
+            <span className="faint">time / flight</span>
+            <span className="num">{calibration.meanDurationMs !== undefined ? formatDuration(calibration.meanDurationMs) : "—"}</span>
+            <span className="rs-reality__arrow">→</span>
+            <span className="num">{formatDuration(time)}</span>
+            <span className={deltaClass(timeDelta, 1000)}>{timeDelta === undefined ? "" : `${timeDelta > 0 ? "+" : "−"}${formatDuration(Math.abs(timeDelta))}`}</span>
+          </>
+        ) : null}
+        {usd !== undefined ? (
+          <>
+            <span className="faint">$ / flight</span>
+            <span className="num">{calibration.meanCostUsd !== undefined ? formatUsd(calibration.meanCostUsd) : "—"}</span>
+            <span className="rs-reality__arrow">→</span>
+            <span className="num">{formatUsd(usd)}</span>
+            <span className={deltaClass(usdDelta, 0.005)}>{usdDelta === undefined ? "" : `${usdDelta > 0 ? "+" : "−"}${formatUsd(Math.abs(usdDelta))}`}</span>
+          </>
+        ) : null}
         {cost ? (
           <>
             <span className="faint">AIU / flight</span>
             <span className="num">{calibration.meanCost !== undefined ? calibration.meanCost.toFixed(1) : "—"}</span>
             <span className="rs-reality__arrow">→</span>
             <span className="num">{cost.mean.toFixed(1)}</span>
-            <span className={cx("num rs-reality__delta", costDelta === undefined || Math.abs(costDelta) < 0.05 ? "" : costDelta < 0 ? "is-up" : "is-down")}>
-              {costDelta === undefined ? "" : `${costDelta > 0 ? "+" : "−"}${Math.abs(costDelta).toFixed(1)}`}
-            </span>
+            <span className={deltaClass(costDelta, 0.05)}>{costDelta === undefined ? "" : `${costDelta > 0 ? "+" : "−"}${Math.abs(costDelta).toFixed(1)}`}</span>
           </>
         ) : null}
       </div>
@@ -475,23 +685,38 @@ function ResultsPanel({ doc }: { doc: StudioDoc }) {
       </div>
     );
   }
-  const landed = report.outcomes.success ?? 0;
-  const verdict = report.success_rate >= 0.95 ? "Flight-ready under this scenario" : report.success_rate >= 0.8 ? "Lands most of the time" : "Not ready: most flights don't land";
+  const ready = landing(report);
+  const verdict = ready.clean >= 0.95 ? "Flight-ready under this scenario" : ready.clean >= 0.8 ? "Lands clean most of the time" : "Not ready: most flights don't land clean";
+  const dirtyStages = failedStageLandings(report);
   const hot = Object.entries(report.nodes)
     .filter(([, n]) => n.visits > 0)
     .sort((a, b) => b[1].mean_visits - a[1].mean_visits)
     .slice(0, 6);
   const maxBucket = Math.max(1, ...report.steps.histogram.map((b) => b.count));
-  const label = (id?: string) => (id ? (findNode(doc, id) ? nodeLabel(doc, findNode(doc, id)!) : id) : "");
+  const label = (id?: string | null) => (id ? (findNode(doc, id) ? nodeLabel(doc, findNode(doc, id)!) : id) : "");
+  const stageLink = (id: string) => (
+    <button key={id} type="button" className="rs-linkbtn" onClick={() => focusTunnelNode(id)}>
+      {label(id)}
+    </button>
+  );
+  const time = report.simulated_duration_ms;
+  const cost = report.simulated_cost_usd;
+  const landedMetrics = Object.entries(report.landed_metrics ?? {});
   return (
     <div className={cx("rs-results", running && "is-running")}>
       <section className="rs-results__gauge">
-        <Gauge value={report.success_rate} low={report.success_ci[0]} high={report.success_ci[1]} />
-        <div className="rs-results__rate num">{pct(report.success_rate, 1)}</div>
+        <Gauge value={ready.clean} low={ready.ci[0]} high={ready.ci[1]} />
+        <div className="rs-results__rate num">{pct(ready.clean, 1)}</div>
         <div className="rs-results__verdict">{verdict}</div>
         <div className="rs-results__ci faint num">
-          {landed.toLocaleString()} of {report.runs.toLocaleString()} landed · 95% CI {pct(report.success_ci[0], 1)}–{pct(report.success_ci[1], 1)}
+          {(ready.landed - ready.dirty).toLocaleString()} of {report.runs.toLocaleString()} landed clean · 95% CI {pct(ready.ci[0], 1)}–{pct(ready.ci[1], 1)}
         </div>
+        {ready.dirty > 0 ? (
+          <div className="rs-results__dirty num" title="These flights reached the exit after a stage failed and its failure flowed on along an unconditional edge">
+            + {pct(ready.dirtyShare, 1)} landed with failed stages ({dirtyStages.slice(0, 3).map((s) => label(s.node)).join(", ")}
+            {dirtyStages.length > 3 ? ", …" : ""})
+          </div>
+        ) : null}
       </section>
 
       {settings.calibration ? <RealityCheck report={report} calibration={settings.calibration} /> : null}
@@ -499,16 +724,25 @@ function ResultsPanel({ doc }: { doc: StudioDoc }) {
       <section className="rs-results__section">
         <div className="label">Outcomes</div>
         <div className="rs-stack">
-          {OUTCOME_KINDS.filter((k) => (report.outcomes[k.key] ?? 0) > 0).map((k) => (
+          {ready.dirty > 0 ? <span style={{ width: pct((ready.landed - ready.dirty) / report.runs, 2), background: "var(--ok)" }} title={`landed clean: ${ready.landed - ready.dirty}`} /> : null}
+          {ready.dirty > 0 ? <span style={{ width: pct(ready.dirtyShare, 2), background: "var(--warn)" }} title={`landed with failed stages: ${ready.dirty}`} /> : null}
+          {OUTCOME_KINDS.filter((k) => (report.outcomes[k.key] ?? 0) > 0 && !(ready.dirty > 0 && k.key === "success")).map((k) => (
             <span key={k.key} style={{ width: pct((report.outcomes[k.key] ?? 0) / report.runs, 2), background: k.tone }} title={`${k.label}: ${report.outcomes[k.key]}`} />
           ))}
         </div>
         <div className="rs-legend">
-          {OUTCOME_KINDS.filter((k) => (report.outcomes[k.key] ?? 0) > 0).map((k) => (
-            <span key={k.key}>
-              <span className="rs-dot" style={{ background: k.tone }} /> {k.label} <span className="num faint">{report.outcomes[k.key]}</span>
-            </span>
-          ))}
+          {OUTCOME_KINDS.filter((k) => (report.outcomes[k.key] ?? 0) > 0).map((k) =>
+            k.key === "success" && ready.dirty > 0 ? (
+              <span key={k.key}>
+                <span className="rs-dot" style={{ background: k.tone }} /> landed clean <span className="num faint">{ready.landed - ready.dirty}</span>{" "}
+                <span className="rs-dot" style={{ background: "var(--warn)" }} /> with failed stages <span className="num faint">{ready.dirty}</span>
+              </span>
+            ) : (
+              <span key={k.key}>
+                <span className="rs-dot" style={{ background: k.tone }} /> {k.label} <span className="num faint">{report.outcomes[k.key]}</span>
+              </span>
+            ),
+          )}
         </div>
       </section>
 
@@ -535,13 +769,29 @@ function ResultsPanel({ doc }: { doc: StudioDoc }) {
             max <b>{report.steps.max}</b>
           </span>
         </div>
-        {report.simulated_duration_ms && report.simulated_duration_ms.mean > 0 ? (
-          <div className="rs-results__stats num">
+        {time && time.mean > 0 ? (
+          <div className="rs-results__stats num" title="Simulated stage time per flight (stage durations, typical durations by stage kind, or the record)">
             <span>
-              time · mean <b>{formatDuration(report.simulated_duration_ms.mean)}</b>
+              time · mean <b>{formatDuration(time.mean)}</b>
             </span>
             <span>
-              p90 <b>{formatDuration(report.simulated_duration_ms.p90)}</b>
+              p90 <b>{formatDuration(time.p90)}</b>
+            </span>
+            <span>
+              max <b>{formatDuration(time.max)}</b>
+            </span>
+          </div>
+        ) : null}
+        {cost && cost.max > 0 ? (
+          <div className="rs-results__stats num" title="Simulated cost per flight (each stage's cost per run)">
+            <span>
+              cost · mean <b>{formatUsd(cost.mean)}</b>
+            </span>
+            <span>
+              p90 <b>{formatUsd(cost.p90)}</b>
+            </span>
+            <span>
+              max <b>{formatUsd(cost.max)}</b>
             </span>
           </div>
         ) : null}
@@ -550,15 +800,82 @@ function ResultsPanel({ doc }: { doc: StudioDoc }) {
       {report.failures.length > 0 ? (
         <section className="rs-results__section">
           <div className="label">How flights go down</div>
-          {report.failures.map((f, i) => (
-            <div key={i} className="rs-failure">
-              <div className="rs-failure__head">
-                <span className={cx("rs-failure__kind", `is-${f.kind}`)}>{OUTCOME_KINDS.find((k) => k.key === f.kind)?.label ?? f.kind}</span>
-                <span className="num">{pct(f.count / report.runs, 1)}</span>
-                <Button size="sm" variant="ghost" icon="play" title="Replay one of these flights on the canvas" onClick={() => void playTrace(`Replay: ${f.kind.replace("_", " ")}`, f.sample.seed, f.sample.run_index)} />
+          {report.failures.map((f, i) => {
+            const nodes = Object.entries(f.nodes ?? (f.last_node ? { [f.last_node]: f.count } : {}));
+            return (
+              <div key={i} className="rs-failure">
+                <div className="rs-failure__head">
+                  <span className={cx("rs-failure__kind", `is-${f.kind}`)}>{OUTCOME_KINDS.find((k) => k.key === f.kind)?.label ?? f.kind}</span>
+                  <span className="num">{pct(f.count / report.runs, 1)}</span>
+                  <Button size="sm" variant="ghost" icon="play" title="Replay one of these flights on the canvas" onClick={() => void playTrace(`Replay: ${f.kind.replace("_", " ")}`, f.sample.seed, f.sample.run_index)} />
+                </div>
+                <div className="rs-failure__reason">{f.reason}</div>
+                {nodes.length === 1 ? (
+                  <div className="rs-failure__where faint">at {stageLink(nodes[0][0])}</div>
+                ) : nodes.length > 1 ? (
+                  <div className="rs-failure__where faint">
+                    last stages:{" "}
+                    {nodes.slice(0, 4).map(([id, count], j) => (
+                      <span key={id}>
+                        {j > 0 ? ", " : ""}
+                        {stageLink(id)} <span className="num">{count}</span>
+                      </span>
+                    ))}
+                    {nodes.length > 4 ? ", …" : ""}
+                  </div>
+                ) : null}
               </div>
-              <div className="rs-failure__reason">{f.reason}</div>
-              {f.last_node ? <div className="rs-failure__where faint">last stage: {label(f.last_node)}</div> : null}
+            );
+          })}
+        </section>
+      ) : null}
+
+      {dirtyStages.length > 0 ? (
+        <section className="rs-results__section">
+          <div className="label">Landed with failed stages</div>
+          <p className="faint rs-results__hint">A stage failed and its failure flowed on along an unconditional edge, so the flight went on as if it had succeeded. Route the failure (on fail) or condition the onward edge on success.</p>
+          {dirtyStages.slice(0, 6).map((s) => (
+            <button key={s.node} type="button" className="rs-hot" onClick={() => focusTunnelNode(s.node)}>
+              <span className="rs-hot__name">{label(s.node)}</span>
+              <span className="rs-hot__bar is-warn">
+                <span style={{ width: pct(s.flights / Math.max(1, dirtyStages[0].flights)) }} />
+              </span>
+              <span className="num rs-hot__value">{pct(s.flights / report.runs, 1)}</span>
+            </button>
+          ))}
+          {report.samples.first_failed_stage_landing ? (
+            <button
+              type="button"
+              className="rs-linkbtn"
+              onClick={() => void playTrace("Landed with failed stages", report.samples.first_failed_stage_landing!.seed, report.samples.first_failed_stage_landing!.run_index)}
+            >
+              replay one of these flights
+            </button>
+          ) : null}
+        </section>
+      ) : null}
+
+      {landedMetrics.length > 0 ? (
+        <section className="rs-results__section">
+          <div className="label">Metrics at landing</div>
+          {landedMetrics.map(([name, m]) => (
+            <div key={name} className="rs-landed-metric">
+              <div className="rs-landed-metric__head">
+                <span className="mono">{name}</span>
+                <span className="num faint">
+                  mean <b>{metricValue(Math.round(m.mean * 100) / 100)}</b> · p10 {metricValue(m.p10)} · p90 {metricValue(m.p90)}
+                </span>
+              </div>
+              {m.values ? (
+                <div className="rs-landed-metric__values">
+                  {Object.entries(m.values).map(([value, flights]) => (
+                    <span key={value} title={`${value}: ${flights} flights`}>
+                      <span className="rs-landed-metric__bar" style={{ height: `${Math.max(4, (flights / Math.max(1, m.flights)) * 100)}%` }} />
+                      <span className="num">{value}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ))}
         </section>

@@ -4,19 +4,31 @@ using System.Text.Json.Nodes;
 
 namespace Reactor.Execution;
 
-/// <summary>A completed stage, kept for context carryover (preambles) and audit.</summary>
-public sealed record StageRecord(string NodeId, string Label, StageStatus Status, string Notes, string FailureReason, DateTimeOffset CompletedAt, int Attempts)
+/// <summary>
+/// A completed stage, kept for context carryover (preambles) and audit. <see cref="Metrics"/> (Reactor extension) holds the
+/// outcome metrics the stage reported (null when none).
+/// </summary>
+public sealed record StageRecord(string NodeId, string Label, StageStatus Status, string Notes, string FailureReason, DateTimeOffset CompletedAt, int Attempts, IReadOnlyDictionary<string, double>? Metrics = null)
 {
-    public JsonObject ToJson() => new()
+    public JsonObject ToJson()
     {
-        ["node_id"] = NodeId,
-        ["label"] = Label,
-        ["status"] = Status.ToWire(),
-        ["notes"] = Notes,
-        ["failure_reason"] = FailureReason,
-        ["completed_at"] = CompletedAt.ToString("O"),
-        ["attempts"] = Attempts,
-    };
+        var json = new JsonObject
+        {
+            ["node_id"] = NodeId,
+            ["label"] = Label,
+            ["status"] = Status.ToWire(),
+            ["notes"] = Notes,
+            ["failure_reason"] = FailureReason,
+            ["completed_at"] = CompletedAt.ToString("O"),
+            ["attempts"] = Attempts,
+        };
+        if (Metrics is { Count: > 0 })
+        {
+            json["metrics"] = new JsonObject(Metrics.Select(kv => new KeyValuePair<string, JsonNode?>(kv.Key, JsonValue.Create(kv.Value))));
+        }
+
+        return json;
+    }
 
     public static StageRecord FromJson(JsonNode node) => new(
         node["node_id"]?.GetValue<string>() ?? "",
@@ -25,7 +37,8 @@ public sealed record StageRecord(string NodeId, string Label, StageStatus Status
         node["notes"]?.GetValue<string>() ?? "",
         node["failure_reason"]?.GetValue<string>() ?? "",
         DateTimeOffset.TryParse(node["completed_at"]?.GetValue<string>(), out var at) ? at : DateTimeOffset.MinValue,
-        node["attempts"] is JsonValue a && a.TryGetValue<int>(out var attempts) ? attempts : 1);
+        node["attempts"] is JsonValue a && a.TryGetValue<int>(out var attempts) ? attempts : 1,
+        node["metrics"] is JsonObject ? Outcome.ParseMetrics(node["metrics"]) : null);
 }
 
 /// <summary>
@@ -77,8 +90,13 @@ public sealed class Checkpoint
     /// <summary>Terminal status when the run has finished (<c>success</c>/<c>fail</c>), otherwise null.</summary>
     public string? FinalStatus { get; set; }
 
-    public JsonObject ToJson() => new()
+    /// <summary>Reactor extension: the run's usage totals so far (see <see cref="UsageLedger"/>).</summary>
+    public Dictionary<string, double> Usage { get; set; } = new(StringComparer.Ordinal);
+
+    public JsonObject ToJson()
     {
+        var json = new JsonObject
+        {
         ["timestamp"] = Timestamp.ToString("O"),
         ["run_id"] = RunId,
         ["current_node"] = CurrentNode,
@@ -92,7 +110,14 @@ public sealed class Checkpoint
         ["loop_restarts"] = LoopRestarts,
         ["history"] = new JsonArray(History.Select(h => (JsonNode?)h.ToJson()).ToArray()),
         ["final_status"] = FinalStatus,
-    };
+        };
+        if (Usage.Count > 0)
+        {
+            json["usage"] = UsageLedger.ToJson(Usage);
+        }
+
+        return json;
+    }
 
     public static Checkpoint FromJson(JsonNode json)
     {
@@ -106,6 +131,7 @@ public sealed class Checkpoint
             LastThreadId = Str(json, "last_thread_id"),
             FinalStatus = Str(json, "final_status"),
             LoopRestarts = json["loop_restarts"] is JsonValue lr && lr.TryGetValue<int>(out var restarts) ? restarts : 0,
+            Usage = UsageLedger.FromJson(json["usage"]),
         };
 
         if (json["completed_nodes"] is JsonArray completed)

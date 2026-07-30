@@ -50,6 +50,18 @@ public sealed record RunOptions
     /// graphs with a node named <c>checkpoints</c>, whose stage directory would collide with the snapshots.
     /// </summary>
     public bool KeepCheckpointHistory { get; init; }
+
+    /// <summary>
+    /// Reactor extension: stop the run (resumably) before its next stage once the recorded cost (<c>cost_usd</c> in stages'
+    /// <c>backend.json</c>) reaches this many US dollars. Overrides the graph's <c>max_cost</c>; null = use the graph's;
+    /// 0 or less = no budget.
+    /// </summary>
+    public double? MaxCostUsd { get; init; }
+
+    /// <summary>
+    /// Overrides <see cref="PipelineRunnerOptions.TrackWorkspaceChanges"/> for this run (null = the runner's setting).
+    /// </summary>
+    public bool? TrackWorkspaceChanges { get; init; }
 }
 
 /// <summary>Runner-wide configuration.</summary>
@@ -91,6 +103,24 @@ public sealed record PipelineRunnerOptions
 
     /// <summary>Timeout for tool nodes without a <c>timeout</c> attribute.</summary>
     public TimeSpan DefaultToolTimeout { get; init; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Record what each stage changed in its working directory (<c>&lt;stage&gt;/changes.json</c> and
+    /// <see cref="Events.WorkspaceChanged"/> events; default true). Applies only to real runs (<see cref="RealWorkspace"/>);
+    /// the graph attribute <c>track_changes=false</c> turns it off for one pipeline. Branch workspaces
+    /// (<c>branch_workdir</c>) and <c>concurrency_group</c> work either way.
+    /// </summary>
+    public bool TrackWorkspaceChanges { get; init; } = true;
+
+    /// <summary>
+    /// Whether runs work in a real working directory, so the workspace service snapshots it (<c>changes.json</c>, workspace
+    /// checkpoints) and gives parallel branches their own workspaces (<c>branch_workdir</c>, <c>promote</c>). Null (the
+    /// default): persisted runs with a codergen <see cref="Backend"/> do, and runs without one are taken for simulations.
+    /// Hosts whose tool stages run for real without a codergen backend (the CLI and the server with the simulate backend)
+    /// set true; <see cref="Reactor.Simulation.SimulationSample.CreateRunner"/> forces false. Never applies without
+    /// <see cref="PersistRunState"/>.
+    /// </summary>
+    public bool? RealWorkspace { get; init; }
 }
 
 /// <summary>A parsed, transformed, validated pipeline.</summary>
@@ -126,6 +156,16 @@ public sealed record PipelineResult
     public int LoopRestarts { get; init; }
 
     public bool Cancelled { get; init; }
+
+    /// <summary>
+    /// Reactor extension: usage totals over every stage attempt that recorded a <c>backend.json</c> (failed and timed-out
+    /// attempts included), e.g. <c>cost_usd</c>, <c>ai_units</c>, <c>premium_requests</c>, <c>input_tokens</c>,
+    /// <c>output_tokens</c>; carried across resumes. Empty when no stage reported usage.
+    /// </summary>
+    public IReadOnlyDictionary<string, double> Usage { get; init; } = new Dictionary<string, double>();
+
+    /// <summary>Reactor extension: true when the run stopped because it reached its cost budget (resumable).</summary>
+    public bool BudgetExceeded { get; init; }
 
     public IReadOnlyList<Diagnostic> Diagnostics { get; init; } = [];
 

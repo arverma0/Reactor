@@ -85,17 +85,28 @@ public sealed class ReachabilityRule : ILintRule
         }
     }
 
+    /// <summary>
+    /// Nodes reachable from <paramref name="startId"/> along edges and visit-limit reroutes (<c>on_max_visits</c> on a node
+    /// with <c>max_visits</c>, a Reactor extension).
+    /// </summary>
     internal static HashSet<string> Reachable(Graph graph, string startId)
     {
         var seen = new HashSet<string>(StringComparer.Ordinal) { startId };
         var queue = new Queue<string>([startId]);
         while (queue.Count > 0)
         {
-            foreach (var edge in graph.OutgoingEdges(queue.Dequeue()))
+            var current = queue.Dequeue();
+            var targets = graph.OutgoingEdges(current).Select(e => e.To);
+            if (graph.GetNode(current) is { MaxVisits: not null, OnMaxVisits.Length: > 0 } limited)
             {
-                if (seen.Add(edge.To))
+                targets = targets.Append(limited.OnMaxVisits);
+            }
+
+            foreach (var target in targets)
+            {
+                if (seen.Add(target))
                 {
-                    queue.Enqueue(edge.To);
+                    queue.Enqueue(target);
                 }
             }
         }
@@ -337,7 +348,10 @@ public sealed class PromptOnLlmNodesRule : ILintRule
     }
 }
 
-/// <summary><c>condition_values</c> (WARNING/INFO): suspicious condition keys and outcome values.</summary>
+/// <summary>
+/// <c>condition_values</c> (WARNING/INFO): suspicious condition keys and outcome values (including numeric comparisons of
+/// non-numeric keys and visit counts of unknown nodes).
+/// </summary>
 public sealed class ConditionValuesRule : ILintRule
 {
     private static readonly HashSet<string> Outcomes = new(StringComparer.Ordinal) { "success", "fail", "partial_success", "retry", "skipped" };
@@ -355,7 +369,29 @@ public sealed class ConditionValuesRule : ILintRule
 
             foreach (var clause in expression.Clauses)
             {
-                if (clause.Key == "outcome" && clause.Operator != ConditionOperator.Truthy && !Outcomes.Contains(clause.Value))
+                if (clause.IsNumeric && clause.Key is "outcome" or "preferred_label")
+                {
+                    yield return new Diagnostic(Name, Severity.Warning,
+                        $"Condition compares {clause.Key} with '{clause}', but {clause.Key} is never a number.")
+                    {
+                        Edge = (edge.From, edge.To),
+                    };
+                }
+                else if (ConditionEvaluator.TryVisitsNode(clause.Key, out var visited))
+                {
+                    if (!graph.ContainsNode(visited))
+                    {
+                        yield return new Diagnostic(Name, Severity.Warning, $"Condition counts visits of '{visited}', which is not a node of this pipeline (always 0).")
+                        {
+                            Edge = (edge.From, edge.To),
+                        };
+                    }
+                }
+                else if (clause.Key.StartsWith(Outcome.MetricsContextPrefix, StringComparison.Ordinal) || clause.Key.StartsWith("context." + Outcome.MetricsContextPrefix, StringComparison.Ordinal))
+                {
+                    // Outcome metrics (metrics.<name>) are first-class keys.
+                }
+                else if (clause.Key == "outcome" && clause.Operator != ConditionOperator.Truthy && !Outcomes.Contains(clause.Value))
                 {
                     yield return new Diagnostic(Name, Severity.Warning,
                         $"Condition compares outcome to '{clause.Value}', which is never produced (expected one of: {string.Join(", ", Outcomes)}).")
@@ -414,6 +450,11 @@ public sealed class AttributeTypesRule : ILintRule
                 {
                     yield return new Diagnostic(Name, Severity.Warning, $"{key}='{flag}' must be true or false.") { NodeId = node.Id };
                 }
+            }
+
+            if (node[AttrKeys.ToolColor] is { } toolColor && AttributeValues.ParseBool(toolColor) is null)
+            {
+                yield return new Diagnostic(Name, Severity.Warning, $"{AttrKeys.ToolColor}='{toolColor}' must be true or false.") { NodeId = node.Id };
             }
         }
 
@@ -601,8 +642,8 @@ public sealed class ArtifactOrderRule(IEnumerable<string>? knownTypes = null) : 
 }
 
 /// <summary>
-/// <c>artifact_handlers</c> (WARNING, Reactor extension): only codergen and tool stages consume and produce artifacts;
-/// <c>inputs</c>/<c>outputs</c> on other node types are ignored.
+/// <c>artifact_handlers</c> (WARNING, Reactor extension): only codergen, tool, and fan-in stages with a judge
+/// <c>prompt</c> consume and produce artifacts; <c>inputs</c>/<c>outputs</c> on other node types are ignored.
 /// </summary>
 public sealed class ArtifactHandlersRule(IEnumerable<string>? knownTypes = null) : ILintRule
 {
@@ -615,6 +656,17 @@ public sealed class ArtifactHandlersRule(IEnumerable<string>? knownTypes = null)
         foreach (var node in graph.Nodes.Values)
         {
             var type = _types.Of(node);
+            if (ArtifactPins.Declares(node) && type == HandlerTypes.FanIn && string.IsNullOrWhiteSpace(node.Prompt))
+            {
+                yield return new Diagnostic(Name, Severity.Warning,
+                    "A fan-in reads and produces artifacts only through its LLM judge, and this one has no prompt (it ranks branches by status and score).")
+                {
+                    NodeId = node.Id,
+                    Fix = "Give the fan-in a judge prompt, or declare the artifacts on a stage after it.",
+                };
+                continue;
+            }
+
             if (!ArtifactPins.Declares(node) || ArtifactPins.IsSupportedHandlerType(type))
             {
                 continue;
@@ -622,7 +674,7 @@ public sealed class ArtifactHandlersRule(IEnumerable<string>? knownTypes = null)
 
             var attributes = new[] { AttrKeys.Inputs, AttrKeys.Outputs }.Where(k => !string.IsNullOrWhiteSpace(node[k])).ToList();
             yield return new Diagnostic(Name, Severity.Warning,
-                $"{string.Join(" and ", attributes)} {(attributes.Count > 1 ? "are" : "is")} ignored on {type} nodes; only codergen and tool stages consume and produce artifacts.")
+                $"{string.Join(" and ", attributes)} {(attributes.Count > 1 ? "are" : "is")} ignored on {type} nodes; only codergen, tool, and judged fan-in stages consume and produce artifacts.")
             {
                 NodeId = node.Id,
                 Fix = "Declare artifacts on a codergen (box) or tool (parallelogram) stage.",

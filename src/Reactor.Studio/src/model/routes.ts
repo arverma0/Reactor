@@ -1,5 +1,8 @@
+import { normalizeCondition } from "./conditions";
 import { edgeAttr, handlerOf, nodeLabel, outgoing } from "./doc";
 import type { Attrs, DocEdge, DocNode, HandlerType, StudioDoc } from "./types";
+
+export { normalizeCondition };
 
 export type RouteKind = "next" | "success" | "partial" | "fail" | "label" | "cond" | "choice" | "branch";
 
@@ -14,15 +17,6 @@ export interface Route {
   edges: DocEdge[];
   /** A suggested port with no edges yet (shown on hover/selection). */
   ghost?: boolean;
-}
-
-/** Condition text without insignificant whitespace (`outcome = fail` → `outcome=fail`). */
-export function normalizeCondition(condition: string): string {
-  return condition
-    .split("&&")
-    .map((clause) => clause.trim().replace(/\s*(!=|=)\s*/g, "$1"))
-    .filter(Boolean)
-    .join(" && ");
 }
 
 /** Parses an accelerator from a label: `[A] Approve`, `A) Approve`, `A - Approve`. */

@@ -36,6 +36,9 @@ public sealed class RunServices
     /// <summary>Working directory for tools, CLI agents, and child pipelines.</summary>
     public required string WorkingDirectory { get; init; }
 
+    /// <summary>The run's workspace service (change tracking, branch workspaces, concurrency groups); null outside an engine run.</summary>
+    internal Workspaces.WorkspaceTracker? Workspace { get; init; }
+
     public required RunOptions Options { get; init; }
 
     public required PipelineRunnerOptions RunnerOptions { get; init; }

@@ -25,7 +25,8 @@ public sealed record DirectLlmBackendOptions
 
 /// <summary>
 /// Answers codergen stages with a single LLM call (no tools) — for planning, review, and summarization stages that do not
-/// need to act on the workspace. <c>full</c>-fidelity stages on the same thread share a message history.
+/// need to act on the workspace. <c>full</c>-fidelity stages on the same thread share a message history. The stage's
+/// standing instructions (without the house rules, which are about tool use) are appended to the system message.
 /// </summary>
 public sealed class DirectLlmBackend(DirectLlmBackendOptions options) : ICodergenBackend
 {
@@ -50,9 +51,11 @@ public sealed class DirectLlmBackend(DirectLlmBackendOptions options) : ICoderge
         }
 
         var messages = new List<Message>();
-        if (!string.IsNullOrWhiteSpace(_options.SystemPrompt))
+        var instructions = StageInstructions.ResolveAndRecord(node, context.Run?.Graph, stage.StageDirectory, toolUse: false);
+        var system = string.Join("\n\n", new[] { _options.SystemPrompt, instructions }.Where(s => !string.IsNullOrWhiteSpace(s)));
+        if (system.Length > 0)
         {
-            messages.Add(Message.System(_options.SystemPrompt));
+            messages.Add(Message.System(system));
         }
 
         messages.AddRange(history);
@@ -72,25 +75,46 @@ public sealed class DirectLlmBackend(DirectLlmBackendOptions options) : ICoderge
         {
             response = await Retry.ExecuteAsync(ct => _options.Client.CompleteAsync(request, ct), _options.RetryPolicy, cancellationToken).ConfigureAwait(false);
         }
-        catch (AbortError) when (cancellationToken.IsCancellationRequested)
+        catch (AbortError ex) when (cancellationToken.IsCancellationRequested)
         {
-            throw new OperationCanceledException("The stage was cancelled.", cancellationToken);
+            throw BackendMetadata.Attach(new OperationCanceledException("The stage was cancelled.", ex, cancellationToken), FailureMetadata());
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            BackendMetadata.Attach(ex, FailureMetadata());
+            throw;
         }
 
         history.Add(Message.User(prompt));
         history.Add(response.Message);
-        return CodergenResult.FromText(response.Text).WithMetadata(new Dictionary<string, object?>
+        var metadata = new Dictionary<string, object?>
         {
             ["backend"] = "direct",
             ["provider"] = provider,
             ["model"] = response.Model ?? model,
+            ["attempt"] = stage.Attempt,
             ["response_id"] = response.Id,
             ["finish_reason"] = response.FinishReason.Reason,
             ["input_tokens"] = response.Usage.InputTokens,
             ["output_tokens"] = response.Usage.OutputTokens,
             ["total_tokens"] = response.Usage.TotalTokens,
             ["reasoning_tokens"] = response.Usage.ReasoningTokens,
-        });
+            ["cache_read_tokens"] = response.Usage.CacheReadTokens,
+            ["cache_write_tokens"] = response.Usage.CacheWriteTokens,
+        };
+        StageCost.AddApi(metadata, response.Model ?? model, inputIncludesCache: !string.Equals(provider, "anthropic", StringComparison.OrdinalIgnoreCase));
+        return CodergenResult.FromText(response.Text).WithMetadata(metadata);
+
+        // A failed call reports no usage, but the stage record keeps the model.
+        Dictionary<string, object?> FailureMetadata() => new()
+        {
+            ["backend"] = "direct",
+            ["provider"] = provider,
+            ["model"] = model,
+            ["attempt"] = stage.Attempt,
+            ["input_tokens"] = 0,
+            ["output_tokens"] = 0,
+        };
     }
 }
 
@@ -129,6 +153,24 @@ public sealed class BackendRouter : ICodergenBackend, IAsyncDisposable
     public bool SupportsStatusFile => Default.SupportsStatusFile;
 
     public bool SupportsStatusFileFor(Node node) => Select(node).SupportsStatusFileFor(node);
+
+    public bool SupportsSteering => Default.SupportsSteering;
+
+    /// <summary>Whether the backend <paramref name="node"/> routes to takes steering (false when the route is not configured).</summary>
+    public bool SupportsSteeringFor(Node node) => TrySelect(node) is { } backend && backend.SupportsSteeringFor(node);
+
+    /// <summary>The backend a node will use, or null when it names a backend that is not configured.</summary>
+    public ICodergenBackend? TrySelect(Node node)
+    {
+        try
+        {
+            return Select(node);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>The backend a node will use.</summary>
     /// <exception cref="InvalidOperationException">The node names a backend that is not configured.</exception>

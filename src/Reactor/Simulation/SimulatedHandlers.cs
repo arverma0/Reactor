@@ -19,7 +19,8 @@ internal sealed record SimulatedDecision(StageStatus Status, string PreferredLab
 
 /// <summary>
 /// Stands in for codergen, tool, manager-loop, and custom handlers: draws the outcome from the scenario (or, in interactive
-/// mode, asks the run's interviewer), spends the simulated duration, and returns an outcome shaped like the real handler's.
+/// mode, asks the run's interviewer), spends the simulated duration and cost, and returns an outcome shaped like the real
+/// handler's, with the scenario's outcome metrics drawn for this execution and a failure reason naming the node.
 /// Never calls a backend, runs a command, launches a child pipeline, or writes stage files. Self-timed: a node's
 /// <c>timeout</c> (for tools, else the runner's default tool timeout) applies to the simulated duration only, never to an
 /// interactive question.
@@ -43,15 +44,15 @@ internal sealed class SimulatedStageHandler(SimulationSample sample, string hand
         decision ??= SimulatedDecisions.Draw(sample, node.Id, behavior, execution);
         context.Run?.Log(node.Id, decision.Explanation);
 
-        var duration = behavior.DurationMs ?? sample.StepDelayMs;
         var limit = node.Timeout ?? (kind == SimulatedStageKind.Tool ? context.Run?.RunnerOptions.DefaultToolTimeout : null);
-        if (!await sample.SpendAsync(duration, limit, cancellationToken).ConfigureAwait(false))
+        var duration = sample.DurationFor(handlerType, behavior, limit);
+        if (!await sample.SpendAsync(node.Id, duration, limit, behavior.CostUsd, cancellationToken).ConfigureAwait(false))
         {
             // Mirrors the engine's own stage timeout (a retryable TimeoutException).
             throw new TimeoutException($"Stage '{node.Id}' timed out after {AttributeValues.FormatDuration(limit!.Value)}.");
         }
 
-        var outcome = BuildOutcome(node, decision, behavior, duration);
+        var outcome = BuildOutcome(node, decision, behavior, duration, behavior.DrawMetrics(sample, node.Id, execution, decision.Status));
         if (kind == SimulatedStageKind.ManagerLoop)
         {
             return outcome;
@@ -126,7 +127,7 @@ internal sealed class SimulatedStageHandler(SimulationSample sample, string hand
             new(status, preferredLabel, SimulatedDecisions.Explain(status, preferredLabel, "chosen in the walkthrough"));
     }
 
-    private Outcome BuildOutcome(Node node, SimulatedDecision decision, ResolvedBehavior behavior, int durationMs)
+    private Outcome BuildOutcome(Node node, SimulatedDecision decision, ResolvedBehavior behavior, int durationMs, IReadOnlyDictionary<string, double> metrics)
     {
         var status = decision.Status;
         var ok = status is StageStatus.Success or StageStatus.PartialSuccess or StageStatus.Skipped;
@@ -161,13 +162,15 @@ internal sealed class SimulatedStageHandler(SimulationSample sample, string hand
             Status = status,
             PreferredLabel = decision.PreferredLabel,
             Notes = "[Simulated] " + status.ToWire(),
+            // The node is named so failure groups in reports (and a run's failure reason) point at the stage.
             FailureReason = status switch
             {
-                StageStatus.Fail => "[Simulated] failure",
-                StageStatus.Retry => "[Simulated] retry requested",
+                StageStatus.Fail => $"[Simulated] failure at {node.Id}",
+                StageStatus.Retry => $"[Simulated] retry requested at {node.Id}",
                 _ => "",
             },
             ContextUpdates = updates,
+            Metrics = metrics,
         };
     }
 }
@@ -261,9 +264,9 @@ internal sealed class SimulatedInterviewer(SimulationSample sample, Graph graph)
         var behavior = sample.Scenario.Resolve(nodeId, HandlerTypes.WaitHuman);
         var decision = SimulatedDecisions.Draw(sample, nodeId, behavior with { Labels = null }, execution);
 
-        var duration = behavior.DurationMs ?? sample.StepDelayMs;
         var limit = question.TimeoutSeconds is { } seconds && seconds > 0 ? TimeSpan.FromSeconds(seconds) : (TimeSpan?)null;
-        if (!await sample.SpendAsync(duration, limit, cancellationToken).ConfigureAwait(false))
+        var duration = sample.DurationFor(HandlerTypes.WaitHuman, behavior, limit);
+        if (!await sample.SpendAsync(nodeId, duration, limit, behavior.CostUsd, cancellationToken).ConfigureAwait(false))
         {
             return Answer.Timeout();
         }

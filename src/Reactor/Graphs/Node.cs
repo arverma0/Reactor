@@ -78,6 +78,12 @@ public sealed class Node
 
     public bool AllowPartial => AttributeValues.ParseBool(this[AttrKeys.AllowPartial]) ?? false;
 
+    /// <summary>Reactor extension: the most times the node may run in one run (null = unbounded).</summary>
+    public int? MaxVisits => AttributeValues.ParseInt(this[AttrKeys.MaxVisits]) is > 0 and var max ? max : null;
+
+    /// <summary>Reactor extension: where the run continues once <see cref="MaxVisits"/> is used up (empty = fail the run).</summary>
+    public string OnMaxVisits => this[AttrKeys.OnMaxVisits]?.Trim() ?? "";
+
     /// <summary>Classes from the comma-separated <c>class</c> attribute plus subgraph-derived classes.</summary>
     public IReadOnlyList<string> Classes
     {

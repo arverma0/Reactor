@@ -114,6 +114,66 @@ public static class AttrKeys
     /// <summary>Reactor extension: comma-separated <c>name</c> or <c>name:path</c> artifacts the stage produces.</summary>
     public const string Outputs = "outputs";
 
+    /// <summary>
+    /// Reactor extension: the most times the node may run in one run; the next visit goes to <see cref="OnMaxVisits"/>
+    /// instead (or fails the run when that is unset).
+    /// </summary>
+    public const string MaxVisits = "max_visits";
+
+    /// <summary>Reactor extension: where the run continues when a node with <see cref="MaxVisits"/> has used up its visits.</summary>
+    public const string OnMaxVisits = "on_max_visits";
+
+    /// <summary>
+    /// Reactor extension: what a failure without an explicit failure route does — <c>continue</c> (the spec: unconditional
+    /// edges are followed as if the stage had succeeded) or <c>stop</c> (only conditions, labels, suggested ids, retry
+    /// targets, and unconditional edges into a diamond or fan-in route a failure; otherwise the run fails). Node attribute;
+    /// the graph default is <see cref="DefaultOnFail"/>.
+    /// </summary>
+    public const string OnFail = "on_fail";
+
+    /// <summary>Reactor extension: graph-wide default for <see cref="OnFail"/> (default <c>continue</c>).</summary>
+    public const string DefaultOnFail = "default_on_fail";
+
+    /// <summary>
+    /// Reactor extension: what a stage timeout does — <c>retry</c> (default: the timeout is retried like other transient
+    /// errors, with a hand-off from the stopped attempt), <c>fail</c> (not retried), or <c>wrap_up</c> (the agent is told
+    /// time is up and gets <see cref="TimeoutGrace"/> to finish before the stage is stopped; needs a steerable backend).
+    /// </summary>
+    public const string OnTimeout = "on_timeout";
+
+    /// <summary>
+    /// Reactor extension: when to remind an agent stage that its time is running out (a duration from the stage start, or
+    /// <c>off</c>); default 80% of <see cref="Timeout"/> for timeouts of 5 minutes or more. Needs a steerable backend.
+    /// </summary>
+    public const string SoftTimeout = "soft_timeout";
+
+    /// <summary>Reactor extension: the grace period for <c>on_timeout=wrap_up</c> (default 10% of the timeout, 1–15 minutes).</summary>
+    public const string TimeoutGrace = "timeout_grace";
+
+    /// <summary>
+    /// Reactor extension: a JSON file (relative to the working directory) whose numeric fields are recorded as the stage's
+    /// outcome metrics after it runs (nested objects flatten to dotted names; arrays are ignored).
+    /// </summary>
+    public const string MetricsFile = "metrics_file";
+
+    /// <summary>Reactor extension (graph): stop the run, resumably, once its recorded cost reaches this many US dollars.</summary>
+    public const string MaxCost = "max_cost";
+
+    /// <summary>
+    /// Reactor extension (tool nodes): <c>true</c> leaves the color-related environment alone instead of asking the
+    /// command for plain output (<c>NO_COLOR=1</c>, <c>FORCE_COLOR=0</c>, <c>TERM=dumb</c>).
+    /// </summary>
+    public const string ToolColor = "tool_color";
+
+    /// <summary>
+    /// Reactor extension (graph and node; also a stylesheet property): standing instructions for LLM stages, delivered by
+    /// every backend (see <see cref="Execution.StageInstructions"/>).
+    /// </summary>
+    public const string Instructions = "instructions";
+
+    /// <summary>Reactor extension (graph or node): <c>false</c> leaves out the built-in house rules.</summary>
+    public const string HouseRules = "house_rules";
+
     // Edge
     public const string Condition = "condition";
     public const string Weight = "weight";

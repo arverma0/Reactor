@@ -112,7 +112,8 @@ public sealed class StudioApiTests
         var prompt = body["prompt"]!.GetValue<string>();
         Assert.Contains("Goal: Ship it", prompt);
         Assert.Contains("- design: success", prompt);
-        Assert.EndsWith("Build", prompt.TrimEnd());
+        Assert.Contains("\n\nBuild\n\n", prompt);
+        Assert.EndsWith(Reactor.Execution.StageTiming.PromptLine(TimeSpan.FromMinutes(5)), prompt.TrimEnd());
         Assert.Equal("compact", body["fidelity"]!.GetValue<string>());
 
         var design = await server.Client.PostAsJsonAsync("/studio/api/graph/prompt-preview", new { dot = Styled, node = "design" });

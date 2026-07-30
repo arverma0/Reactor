@@ -4,6 +4,7 @@ using System.Text;
 using Reactor.Events;
 using Reactor.Execution;
 using Reactor.Graphs;
+using Reactor.Workspaces;
 
 namespace Reactor.Handlers;
 
@@ -12,9 +13,15 @@ namespace Reactor.Handlers;
 /// on an isolated clone of the context, until each branch reaches a join point (fan-in node, exit, or dead end).
 /// Results are stored in <c>parallel.results</c>; branch context changes are not merged back, except artifact records
 /// (<c>artifacts.*</c>, a Reactor extension; see <see cref="StageArtifacts.MergeBranchRecords"/>), which are merged in branch
-/// declaration order from every branch that ran, failed ones included. The engine then continues at the branches' common
+/// declaration order from every branch that ran, failed ones included, and outcome metrics (<c>metrics.*</c>, also a Reactor
+/// extension; a later branch's value wins). The engine then continues at the branches' common
 /// join node. Join policies: <c>wait_all</c> (default; SUCCESS when no branch failed, else PARTIAL_SUCCESS) and
 /// <c>first_success</c> (SUCCESS as soon as one branch succeeds; the rest are cancelled and contribute no artifacts).
+/// Reactor extension: <c>branch_workdir</c> chooses the branches' working directories — <c>shared</c> (default: the
+/// parent's), <c>worktree</c> (a detached git worktree per branch, of a snapshot of the parent's current state), or
+/// <c>copy</c> (a copy of its files per branch); in real runs each <c>parallel.results</c> entry records the branch's
+/// <c>workdir</c> (plus, for its own workspace, the snapshots it started from and ended at and what it changed).
+/// Simulations always share the working directory.
 /// </summary>
 public sealed class ParallelHandler : INodeHandler
 {
@@ -54,6 +61,28 @@ public sealed class ParallelHandler : INodeHandler
         }
 
         var maxParallel = Math.Max(1, AttributeValues.ParseInt(node[AttrKeys.MaxParallel]) ?? run.RunnerOptions.DefaultMaxParallel);
+
+        // Reactor extension: branch workspaces (branch_workdir=worktree|copy) in real runs; simulations always share.
+        var workdirMode = WorkspaceAttributes.BranchWorkdirOf(node);
+        if (!WorkspaceAttributes.BranchWorkdirModes.Contains(workdirMode))
+        {
+            return Outcome.Fail($"Unknown branch_workdir '{workdirMode}'; expected shared, worktree, or copy.");
+        }
+
+        var tracker = run.Workspace is { RealRun: true } realRun ? realRun : null;
+        IReadOnlyList<BranchWorkspace>? workspaces = null;
+        if (tracker is not null && workdirMode != WorkspaceAttributes.BranchModes.Shared)
+        {
+            try
+            {
+                workspaces = await tracker.CreateBranchWorkspacesAsync(node, workdirMode, context, branches.Select(e => e.To).ToList(), logsRoot, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Outcome.Fail(ex.Message);
+            }
+        }
+
         var forkValues = context.Snapshot();
         var stopwatch = Stopwatch.StartNew();
         run.Events.Emit(new ParallelStarted(node.Id, branches.Count));
@@ -68,10 +97,16 @@ public sealed class ParallelHandler : INodeHandler
             try
             {
                 run.Events.Emit(new ParallelBranchStarted(node.Id, edge.To, index));
+                var branchContext = context.Clone();
+                if (workspaces is not null)
+                {
+                    branchContext.Set(PipelineContext.WorkingDirectoryKey, workspaces[index].Directory);
+                }
+
                 BranchResult result;
                 try
                 {
-                    result = await run.BranchExecutor.ExecuteBranchAsync(edge.To, context.Clone(), firstSuccessCts.Token).ConfigureAwait(false);
+                    result = await run.BranchExecutor.ExecuteBranchAsync(edge.To, branchContext, firstSuccessCts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (firstSuccessCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
@@ -122,12 +157,29 @@ public sealed class ParallelHandler : INodeHandler
             results[i] ??= new BranchResult { BranchId = branches[i].To, Status = StageStatus.Skipped, Notes = "Not started (first_success already satisfied)." };
         }
 
+        // Where each branch worked: its workspace, the snapshot it started from and ended at, and what it changed.
+        var workdirs = new Dictionary<string, object?>[results.Length];
+        if (tracker is not null)
+        {
+            for (var i = 0; i < results.Length; i++)
+            {
+                workdirs[i] = workspaces is null
+                    ? new Dictionary<string, object?> { ["workdir"] = context.WorkingDirectory, ["workdir_mode"] = WorkspaceAttributes.BranchModes.Shared }
+                    : await tracker.FinishBranchAsync(workspaces[i], cancellationToken).ConfigureAwait(false);
+            }
+
+            if (workspaces is not null)
+            {
+                await tracker.CheckParentAfterBranchesAsync(node, context, workspaces, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         var successCount = results.Count(r => r.Status == StageStatus.Success || r.Status == StageStatus.PartialSuccess);
         var failCount = results.Count(r => r.Status == StageStatus.Fail);
         run.Events.Emit(new ParallelCompleted(node.Id, stopwatch.Elapsed, successCount, failCount));
 
         var join = DetermineJoin(results, graph);
-        var serialized = results.Select(Serialize).ToList();
+        var serialized = results.Select((r, i) => Serialize(r, workdirs[i])).ToList();
         var updates = new Dictionary<string, object?>
         {
             ["parallel.results"] = serialized,
@@ -142,6 +194,19 @@ public sealed class ParallelHandler : INodeHandler
         foreach (var (key, value) in StageArtifacts.MergeBranchRecords(forkValues, results.Select(r => r.Context)))
         {
             updates[key] = value;
+        }
+
+        // Reactor extension: so are outcome metrics (metrics.*) reported inside branches; later branches win a conflict.
+        foreach (var result in results)
+        {
+            foreach (var (key, value) in result.Context)
+            {
+                if (key.StartsWith(Outcome.MetricsContextPrefix, StringComparison.Ordinal) &&
+                    !(forkValues.TryGetValue(key, out var before) && Equals(ContextValues.Normalize(before), ContextValues.Normalize(value))))
+                {
+                    updates[key] = value;
+                }
+            }
         }
 
         var summary = Summarize(results);
@@ -181,19 +246,30 @@ public sealed class ParallelHandler : INodeHandler
             .First().Key;
     }
 
-    private static Dictionary<string, object?> Serialize(BranchResult result) => new()
+    private static Dictionary<string, object?> Serialize(BranchResult result, Dictionary<string, object?>? workdir)
     {
-        ["id"] = result.BranchId,
-        ["status"] = result.Status.ToWire(),
-        ["stop_node"] = result.StopNodeId,
-        ["notes"] = result.Notes,
-        ["failure_reason"] = result.FailureReason,
-        ["completed_nodes"] = result.CompletedNodes.ToList<object?>(),
-        ["last_stage"] = result.Context.GetValueOrDefault("last_stage"),
-        ["last_response"] = result.Context.GetValueOrDefault("last_response"),
-        ["score"] = Score(result.Context),
-        ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
-    };
+        var entry = new Dictionary<string, object?>
+        {
+            ["id"] = result.BranchId,
+            ["status"] = result.Status.ToWire(),
+            ["stop_node"] = result.StopNodeId,
+            ["notes"] = result.Notes,
+            ["failure_reason"] = result.FailureReason,
+            ["completed_nodes"] = result.CompletedNodes.ToList<object?>(),
+            ["last_stage"] = result.Context.GetValueOrDefault("last_stage"),
+            ["last_response"] = result.Context.GetValueOrDefault("last_response"),
+            ["score"] = Score(result.Context),
+            ["duration_ms"] = (long)result.Duration.TotalMilliseconds,
+        };
+
+        // Reactor extension: workdir, workdir_mode, base_snapshot, snapshot, tree, changes (real runs only).
+        foreach (var (key, value) in workdir ?? [])
+        {
+            entry[key] = value;
+        }
+
+        return entry;
+    }
 
     private static double Score(IReadOnlyDictionary<string, object?> context)
     {
@@ -221,11 +297,23 @@ public sealed class ParallelHandler : INodeHandler
 /// <summary>
 /// Fan-in (spec 4.9): consolidates <c>parallel.results</c> and selects the best candidate — by asking the LLM backend when
 /// the node has a <c>prompt</c>, otherwise heuristically (outcome rank, then score, then id). Fails only when no results
-/// exist or every candidate failed.
+/// exist or every candidate failed. Reactor extension: the best branch's working directory is exposed as
+/// <c>parallel.fan_in.best_workdir</c>, and with <c>promote="best"</c> the changes that branch made in its own workspace
+/// (<c>branch_workdir="worktree"</c> or <c>"copy"</c>) are applied to the fan-in's working directory — the fan-in fails,
+/// changing nothing, when that directory changed the same files since the fork.
 /// </summary>
 public sealed class FanInHandler : INodeHandler
 {
-    private sealed record Candidate(string Id, StageStatus Status, double Score, string Notes, string FailureReason, string LastResponse);
+    private sealed record Candidate(string Id, StageStatus Status, double Score, string Notes, string FailureReason, string LastResponse)
+    {
+        /// <summary>The candidate's <c>parallel.results</c> entry.</summary>
+        public IReadOnlyDictionary<string, object?> Entry { get; init; } = new Dictionary<string, object?>();
+
+        public string Workdir => ContextValues.ToDisplayString(Entry.GetValueOrDefault("workdir"));
+
+        /// <summary>True when the branch worked in its own workspace.</summary>
+        public bool Isolated => ContextValues.ToDisplayString(Entry.GetValueOrDefault("workdir_mode")) is WorkspaceAttributes.BranchModes.Worktree or WorkspaceAttributes.BranchModes.Copy;
+    }
 
     public async Task<Outcome?> ExecuteAsync(Node node, PipelineContext context, Graph graph, string logsRoot, CancellationToken cancellationToken)
     {
@@ -247,12 +335,16 @@ public sealed class FanInHandler : INodeHandler
 
         Candidate best;
         string method;
+        IReadOnlyDictionary<string, object?>? judgeMetadata = null;
+        string? judgement = null;
         var backend = context.Run?.Backend;
         if (!string.IsNullOrWhiteSpace(node.Prompt) && backend is not null)
         {
-            var chosen = await EvaluateWithLlmAsync(node, context, graph, logsRoot, backend, candidates, cancellationToken).ConfigureAwait(false);
+            var (chosen, metadata, text) = await EvaluateWithLlmAsync(node, context, graph, logsRoot, backend, candidates, cancellationToken).ConfigureAwait(false);
             best = chosen ?? HeuristicSelect(candidates);
             method = chosen is null ? "heuristic (LLM choice unparseable)" : "llm";
+            judgeMetadata = metadata;
+            judgement = text;
         }
         else
         {
@@ -260,14 +352,50 @@ public sealed class FanInHandler : INodeHandler
             method = "heuristic";
         }
 
-        return Outcome.Success($"Selected best candidate: {best.Id} ({method})", new Dictionary<string, object?>
+        if (judgeMetadata is not null)
+        {
+            // The judge is a full backend session: record what it cost like any codergen stage (plus its decision).
+            var record = new Dictionary<string, object?>(judgeMetadata, StringComparer.Ordinal)
+            {
+                ["fan_in_method"] = method,
+                ["fan_in_best_id"] = best.Id,
+            };
+            var stageDir = Path.Combine(logsRoot, node.Id);
+            Directory.CreateDirectory(stageDir);
+            await File.WriteAllTextAsync(
+                Path.Combine(stageDir, "backend.json"),
+                ContextValues.ToJson(ContextValues.Normalize(record))?.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }) ?? "{}",
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        var updates = new Dictionary<string, object?>
         {
             ["parallel.fan_in.best_id"] = best.Id,
             ["parallel.fan_in.best_outcome"] = best.Status.ToWire(),
             ["parallel.fan_in.best_notes"] = best.Notes,
             ["parallel.fan_in.best_response"] = best.LastResponse,
             ["parallel.fan_in.method"] = method,
-        });
+            ["parallel.fan_in.best_workdir"] = best.Workdir,
+        };
+        var notes = $"Selected best candidate: {best.Id} ({method})";
+        if (WorkspaceAttributes.Promotes(node) && context.Run?.Workspace is { RealRun: true } tracker)
+        {
+            var promotion = await tracker.PromoteAsync(node, context, best.Entry, cancellationToken).ConfigureAwait(false);
+            if (promotion.Failure is { } failure)
+            {
+                return Outcome.Fail(failure, updates);
+            }
+
+            updates["parallel.fan_in.promoted"] = promotion.Promoted ? best.Id : "";
+            notes += "; " + promotion.Note;
+        }
+
+        // Reactor extension: an LLM judge's declared outputs (its judgement as text, or a report file it wrote) are
+        // recorded like a codergen stage's; a declared file it did not write fails the fan-in.
+        var outcome = Outcome.Success(notes, updates);
+        return judgement is not null && ArtifactPins.Parse(node).Outputs.Count > 0
+            ? await StageArtifacts.CompleteAsync(node, outcome, context, judgement, cancellationToken: cancellationToken).ConfigureAwait(false)
+            : outcome;
     }
 
     private static Candidate HeuristicSelect(IReadOnlyList<Candidate> candidates) =>
@@ -286,7 +414,7 @@ public sealed class FanInHandler : INodeHandler
         _ => 4,
     };
 
-    private static async Task<Candidate?> EvaluateWithLlmAsync(
+    private static async Task<(Candidate? Chosen, IReadOnlyDictionary<string, object?> Metadata, string Text)> EvaluateWithLlmAsync(
         Node node,
         PipelineContext context,
         Graph graph,
@@ -322,6 +450,22 @@ public sealed class FanInHandler : INodeHandler
             {
                 sb.AppendLine("- last response: " + c.LastResponse);
             }
+
+            // Branches with their own workspace: where to look, and what they changed since the fork.
+            if (c.Isolated && c.Workdir.Length > 0)
+            {
+                sb.AppendLine("- workspace: " + c.Workdir);
+                if (DescribeChanges(c) is { Length: > 0 } changed)
+                {
+                    sb.AppendLine("- files changed: " + changed);
+                }
+            }
+        }
+
+        // Reactor extension: the judge's declared artifact inputs and outputs (e.g. a judgement report to write).
+        if (StageArtifacts.PromptSections(node, context) is { Length: > 0 } artifacts)
+        {
+            sb.AppendLine().Append(artifacts.TrimEnd()).AppendLine();
         }
 
         sb.AppendLine();
@@ -331,10 +475,25 @@ public sealed class FanInHandler : INodeHandler
         var stageDir = Path.Combine(logsRoot, node.Id);
         Directory.CreateDirectory(stageDir);
         await File.WriteAllTextAsync(Path.Combine(stageDir, "prompt.md"), prompt, cancellationToken).ConfigureAwait(false);
-        var result = await backend.RunAsync(node, prompt, context, cancellationToken).ConfigureAwait(false);
+        CodergenResult result;
+        try
+        {
+            result = await backend.RunAsync(node, prompt, context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await CodergenHandler.RecordFailedAttemptAsync(stageDir, ex, cancellationToken.IsCancellationRequested).ConfigureAwait(false);
+            throw;
+        }
+
         var text = result.Text ?? result.Outcome?.Notes ?? "";
         await File.WriteAllTextAsync(Path.Combine(stageDir, "response.md"), text, cancellationToken).ConfigureAwait(false);
+        return (ParseChoice(text, candidates), result.Metadata, text);
+    }
 
+    /// <summary>The candidate named on a <c>BEST: &lt;id&gt;</c> line, else the first candidate id mentioned anywhere.</summary>
+    private static Candidate? ParseChoice(string text, IReadOnlyList<Candidate> candidates)
+    {
         foreach (var line in text.Split('\n'))
         {
             var trimmed = line.Trim().Trim('*', '`');
@@ -387,9 +546,25 @@ public sealed class FanInHandler : INodeHandler
                 score,
                 ContextValues.ToDisplayString(map.GetValueOrDefault("notes")),
                 ContextValues.ToDisplayString(map.GetValueOrDefault("failure_reason")),
-                ContextValues.ToDisplayString(map.GetValueOrDefault("last_response"))));
+                ContextValues.ToDisplayString(map.GetValueOrDefault("last_response")))
+            {
+                Entry = map,
+            });
         }
 
         return list;
+    }
+
+    /// <summary>"+2 ~1 -0: src/a.ts, src/b.ts, …" from a result entry's <c>changes</c>, or "" without one.</summary>
+    private static string DescribeChanges(Candidate candidate)
+    {
+        if (candidate.Entry.GetValueOrDefault("changes") is not Dictionary<string, object?> changes)
+        {
+            return "";
+        }
+
+        string Count(string key) => ContextValues.ToDisplayString(changes.GetValueOrDefault(key) ?? 0);
+        var paths = changes.GetValueOrDefault("paths") is List<object?> list ? list.Select(ContextValues.ToDisplayString).ToList() : [];
+        return $"+{Count("added")} ~{Count("modified")} -{Count("deleted")}" + (paths.Count > 0 ? ": " + string.Join(", ", paths) : "");
     }
 }

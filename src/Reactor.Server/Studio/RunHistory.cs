@@ -349,11 +349,16 @@ internal sealed record RunSegment(string Path, string Name, int Restart);
 /// <summary>A page of run events.</summary>
 internal sealed record EventsPage(IReadOnlyList<JsonObject> Events, long Next, bool Done);
 
-/// <summary>Usage and cost fields summed from stage <c>backend.json</c> files; fields no stage reported stay absent.</summary>
+/// <summary>
+/// Usage and cost fields summed from stage <c>backend.json</c> files — every attempt's, including the attempts that were
+/// retried (<c>attempts/attempt-N/</c>) and earlier visits (<c>history/visit-N/</c>) — the way the engine's usage ledger sums
+/// them; fields no stage reported stay absent.
+/// </summary>
 internal sealed class CostTotals
 {
-    /// <summary>The summed <c>backend.json</c> fields.</summary>
-    public static readonly string[] Fields = ["ai_units", "premium_requests", "cost_usd", "input_tokens", "output_tokens", "reasoning_tokens", "tool_calls"];
+    /// <summary>The summed <c>backend.json</c> fields (the engine's <see cref="UsageLedger.Fields"/>, dollars first).</summary>
+    public static readonly string[] Fields =
+        ["cost_usd", "ai_units", "premium_requests", "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "model_calls", "tool_calls"];
 
     private readonly double?[] _values = new double?[Fields.Length];
 
@@ -407,8 +412,17 @@ internal sealed class CostTotals
         value % 1 == 0 && Math.Abs(value) < 9e15 ? JsonValue.Create((long)value) : JsonValue.Create(Math.Round(value, 9));
 }
 
-/// <summary>Metadata of one stage visit, from its <c>backend.json</c>.</summary>
-internal sealed record VisitUsage(string? Model, double?[] Values);
+/// <summary>
+/// Usage of one stage visit: its <c>backend.json</c> plus those of the visit's archived attempts (<c>attempts/attempt-N/</c>),
+/// summed. <see cref="Model"/> is the model of the visit's last attempt that reported one.
+/// </summary>
+internal sealed record VisitUsage(string? Model, double?[] Values, int ArchivedAttempts = 0);
+
+/// <summary>Outcome metrics one visit of a node reported (a <c>MetricsRecorded</c> event); <see cref="Visit"/> is 1-based.</summary>
+internal sealed record MetricVisit(int Visit, IReadOnlyDictionary<string, double> Values);
+
+/// <summary>Why a run stopped at its cost budget (its last <c>BudgetExceeded</c> event since it was last started or resumed).</summary>
+internal sealed record BudgetStop(double SpentUsd, double LimitUsd, string? NextNode, DateTimeOffset? At);
 
 /// <summary>What the events (and <c>backend.json</c> files) say about one node of a run.</summary>
 internal sealed class NodeStats
@@ -425,6 +439,24 @@ internal sealed class NodeStats
     /// <summary>The most recent error reported during the current visit (scan state).</summary>
     public string? PendingError;
 
+    /// <summary>Failures of this node that flowed onward along an unconditional edge (<c>FailedStageContinued</c>).</summary>
+    public int FailuresContinued;
+
+    /// <summary>
+    /// The node's last failure flowed onward and no later visit of it succeeded: the run carries a failed stage behind it
+    /// (a later successful visit, such as a goal gate sending the run back, makes it good — as in the wind tunnel).
+    /// </summary>
+    public bool FailedBehind;
+
+    /// <summary>A continued failure or a success has set <see cref="FailedBehind"/> (scan state, for merging directories).</summary>
+    public bool FailedBehindSet;
+
+    /// <summary>Times the node's <c>max_visits</c> was used up and the run went elsewhere (<c>VisitLimitReached</c>).</summary>
+    public int VisitLimits;
+
+    /// <summary>Outcome metrics per visit that reported any (<c>MetricsRecorded</c>), oldest first.</summary>
+    public List<MetricVisit> Metrics { get; } = [];
+
     /// <summary>The status of each completed visit, in order.</summary>
     public List<string> Statuses { get; } = [];
 
@@ -437,8 +469,10 @@ internal sealed class NodeStats
     /// <summary><c>backend.json</c> metadata of each visit that wrote one (oldest first).</summary>
     public List<VisitUsage> Usage { get; } = [];
 
+    /// <summary>Appends the statistics of a later directory of the same run (a loop restart); visit numbers continue.</summary>
     public void MergeFrom(NodeStats other)
     {
+        var offset = Visits;
         Visits += other.Visits;
         Retries += other.Retries;
         Statuses.AddRange(other.Statuses);
@@ -448,12 +482,21 @@ internal sealed class NodeStats
             Failures[reason] = Failures.GetValueOrDefault(reason) + count;
         }
 
+        Metrics.AddRange(other.Metrics.Select(m => m with { Visit = m.Visit + offset }));
+        FailuresContinued += other.FailuresContinued;
+        VisitLimits += other.VisitLimits;
+        if (other.FailedBehindSet)
+        {
+            FailedBehind = other.FailedBehind;
+            FailedBehindSet = true;
+        }
+
         Open = other.Open;
     }
 }
 
 /// <summary>Fields of <c>manifest.json</c> the history uses.</summary>
-internal sealed record ManifestInfo(string? RunId, string? Name, string? Goal, DateTimeOffset? StartedAt, int? NodeCount, bool Simulated)
+internal sealed record ManifestInfo(string? RunId, string? Name, string? Goal, DateTimeOffset? StartedAt, int? NodeCount, bool Simulated, string? WorkingDirectory)
 {
     public static ManifestInfo? From(JsonObject? json) => json is null ? null : new ManifestInfo(
         HistoryJson.Str(json["run_id"]),
@@ -461,7 +504,12 @@ internal sealed record ManifestInfo(string? RunId, string? Name, string? Goal, D
         HistoryJson.Str(json["goal"]),
         HistoryJson.Date(json["started_at"]),
         (int?)HistoryJson.Long(json["node_count"]),
-        HistoryJson.Bool(json["simulated"]) == true || json["simulation"] is JsonObject);
+        HistoryJson.Bool(json["simulated"]) == true || json["simulation"] is JsonObject,
+        WorkingDirectoryOf(json["working_directory"]));
+
+    /// <summary>The recorded working directory; only an absolute path (the engine records full paths) is usable.</summary>
+    private static string? WorkingDirectoryOf(JsonNode? node) =>
+        HistoryJson.Str(node) is { } path && !string.IsNullOrWhiteSpace(path) && Path.IsPathFullyQualified(path) ? path : null;
 }
 
 /// <summary>Fields of <c>result.json</c> the history uses.</summary>
@@ -525,6 +573,9 @@ internal sealed class RunRecord
 
     public string? SourcePath { get; init; }
 
+    /// <summary>The run's working directory (<c>manifest.json</c>, else the live run's); null when the run did not record one.</summary>
+    public string? WorkingDirectory { get; init; }
+
     public bool Simulated { get; init; }
 
     /// <summary>The <c>forked_from</c> object of <c>studio.json</c>, serialized.</summary>
@@ -534,11 +585,26 @@ internal sealed class RunRecord
 
     public CostTotals Cost { get; init; } = new();
 
+    /// <summary>The final value of each outcome metric (the latest <c>MetricsRecorded</c> value, as <c>metrics.&lt;name&gt;</c> in the context).</summary>
+    public IReadOnlyDictionary<string, double> Metrics { get; init; } = new Dictionary<string, double>(StringComparer.Ordinal);
+
+    /// <summary>Set when the run's latest stop was its cost budget (<c>BudgetExceeded</c> since it was last started or resumed).</summary>
+    public BudgetStop? Budget { get; init; }
+
     /// <summary>Per-node statistics, in order of first execution.</summary>
     public OrderedDictionary<string, NodeStats> Nodes { get; init; } = new(StringComparer.Ordinal);
 
     /// <summary>Selected edges with how often each was taken.</summary>
     public IReadOnlyDictionary<(string From, string To), int> Edges { get; init; } = new Dictionary<(string, string), int>();
+
+    /// <summary>Failures that flowed onward along unconditional edges (<c>FailedStageContinued</c>), over all nodes.</summary>
+    public int FailuresContinued => Nodes.Values.Sum(n => n.FailuresContinued);
+
+    /// <summary>Nodes whose failure flowed onward and that never succeeded afterwards: the run carries them as failed stages.</summary>
+    public IReadOnlyList<string> FailedStages => Nodes.Where(n => n.Value.FailedBehind).Select(n => n.Key).ToList();
+
+    /// <summary>The run reached the exit, but with failed stages behind it (a "dirty" landing; see <see cref="FailedStages"/>).</summary>
+    public bool LandedWithFailedStages => Status is RunStatus.Success or RunStatus.PartialSuccess && Nodes.Values.Any(n => n.FailedBehind);
 
     /// <summary>The run is queued or running in this server.</summary>
     public bool IsActive => Live is not null && !RunStatus.IsTerminal(Live.Status);
@@ -570,6 +636,7 @@ internal sealed class RunRecord
             FinishedAt = run.FinishedAt,
             NodeCount = run.Graph.Nodes.Count,
             SourcePath = studio?.SourcePath,
+            WorkingDirectory = run.WorkingDirectory,
             Simulated = studio?.Simulated ?? false,
             ForkedFromJson = studio?.ForkedFrom,
         };
@@ -582,9 +649,11 @@ internal sealed class RunRecordBuilder(string id, string directory, IReadOnlyLis
     private readonly OrderedDictionary<string, NodeStats> _nodes = new(StringComparer.Ordinal);
     private readonly Dictionary<(string, string), int> _edges = [];
     private readonly CostTotals _cost = new();
+    private readonly Dictionary<string, double> _metrics = new(StringComparer.Ordinal);
     private ManifestInfo? _manifest;
     private StudioInfo? _studio;
     private ResultInfo? _result;
+    private BudgetStop? _budget;
     private bool _simulationFile;
     private int _stageExecutions;
     private DateTimeOffset? _firstEvent;
@@ -610,6 +679,14 @@ internal sealed class RunRecordBuilder(string id, string directory, IReadOnlyLis
         _firstEvent ??= events.FirstTimestamp;
         _lastEvent = events.LastTimestamp ?? _lastEvent;
         _terminalError = events.TerminalError ?? _terminalError;
+
+        // A budget stop ends the run, so only the directory the run ended in can hold the current one.
+        _budget = events.Budget;
+        foreach (var (name, value) in events.FinalMetrics)
+        {
+            _metrics[name] = value;
+        }
+
         foreach (var (node, stats) in events.Nodes)
         {
             Node(node).MergeFrom(stats);
@@ -684,10 +761,13 @@ internal sealed class RunRecordBuilder(string id, string directory, IReadOnlyLis
             DurationMs = duration,
             NodeCount = _manifest?.NodeCount,
             SourcePath = _studio?.SourcePath,
+            WorkingDirectory = _manifest?.WorkingDirectory ?? live?.WorkingDirectory,
             Simulated = _simulationFile || _manifest?.Simulated == true || _studio?.Simulated == true,
             ForkedFromJson = _studio?.ForkedFrom,
             StageExecutions = _stageExecutions,
             Cost = _cost,
+            Metrics = _metrics,
+            Budget = Active ? null : _budget,
             Nodes = _nodes,
             Edges = _edges,
         };
@@ -707,7 +787,7 @@ internal sealed class RunRecordBuilder(string id, string directory, IReadOnlyLis
 /// <summary>Cached, incrementally refreshed data of one run directory. Callers lock the instance while using it.</summary>
 internal sealed class SegmentState(string path)
 {
-    private readonly Dictionary<string, (FileStamp Stamp, VisitUsage? Usage)> _usageFiles = new(RunHistory.PathComparer);
+    private readonly Dictionary<string, (FileStamp Stamp, (string? Model, double?[] Values)? Usage)> _usageFiles = new(RunHistory.PathComparer);
     private bool _loaded;
     private FileStamp _manifestStamp;
     private FileStamp _resultStamp;
@@ -850,10 +930,10 @@ internal sealed class SegmentState(string path)
                 var visits = new List<VisitUsage>();
                 foreach (var (_, visitDir) in StageFiles.HistoryVisits(stageDir))
                 {
-                    AddUsage(visits, Path.Combine(visitDir, "backend.json"), seen);
+                    AddVisit(visits, visitDir, seen);
                 }
 
-                AddUsage(visits, Path.Combine(stageDir, "backend.json"), seen);
+                AddVisit(visits, stageDir, seen);
                 if (visits.Count > 0)
                 {
                     usage[node] = visits;
@@ -872,26 +952,64 @@ internal sealed class SegmentState(string path)
         Usage = usage;
     }
 
-    private void AddUsage(List<VisitUsage> visits, string file, HashSet<string> seen)
+    /// <summary>
+    /// Adds one visit's usage: the <c>backend.json</c> of its archived attempts (<c>attempts/attempt-N/</c>, which the engine
+    /// keeps when it retries a stage — timed-out and failed attempts cost money too) and of its last attempt, summed.
+    /// </summary>
+    private void AddVisit(List<VisitUsage> visits, string visitDir, HashSet<string> seen)
+    {
+        var attempts = StageFiles.Attempts(visitDir);
+        var parts = new List<(string? Model, double?[] Values)>(attempts.Count + 1);
+        foreach (var (_, attemptDir) in attempts)
+        {
+            if (ReadUsage(Path.Combine(attemptDir, "backend.json"), seen) is { } attempt)
+            {
+                parts.Add(attempt);
+            }
+        }
+
+        if (ReadUsage(Path.Combine(visitDir, "backend.json"), seen) is { } last)
+        {
+            parts.Add(last);
+        }
+
+        if (parts.Count == 0)
+        {
+            return;
+        }
+
+        var values = new double?[CostTotals.Fields.Length];
+        foreach (var (_, part) in parts)
+        {
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (part[i] is { } value)
+                {
+                    values[i] = (values[i] ?? 0) + value;
+                }
+            }
+        }
+
+        visits.Add(new VisitUsage(parts.LastOrDefault(p => !string.IsNullOrEmpty(p.Model)).Model, values, attempts.Count));
+    }
+
+    private (string? Model, double?[] Values)? ReadUsage(string file, HashSet<string> seen)
     {
         var stamp = FileStamp.Of(file);
         if (stamp.Missing)
         {
-            return;
+            return null;
         }
 
         seen.Add(file);
         if (!_usageFiles.TryGetValue(file, out var cached) || cached.Stamp != stamp)
         {
             var json = RunHistory.ReadJsonObject(file);
-            cached = (stamp, json is null ? null : new VisitUsage(HistoryJson.Str(json["model"]), CostTotals.Read(json)));
+            cached = (stamp, json is null ? null : (HistoryJson.Str(json["model"]), CostTotals.Read(json)));
             _usageFiles[file] = cached;
         }
 
-        if (cached.Usage is { } visit)
-        {
-            visits.Add(visit);
-        }
+        return cached.Usage;
     }
 }
 
@@ -941,6 +1059,12 @@ internal sealed class EventScan
     /// <summary>The error of the last <c>PipelineFailed</c> event (cleared when the run is resumed).</summary>
     public string? TerminalError { get; private set; }
 
+    /// <summary>The latest value of each outcome metric (<c>MetricsRecorded</c>), in order of first report.</summary>
+    public OrderedDictionary<string, double> FinalMetrics { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>The last <c>BudgetExceeded</c> since the run was last started or resumed (cleared by <c>PipelineStarted</c>).</summary>
+    public BudgetStop? Budget { get; private set; }
+
     public DateTimeOffset? FirstTimestamp => HistoryJson.ParseDate(_firstTimestamp);
 
     public DateTimeOffset? LastTimestamp => HistoryJson.ParseDate(_lastTimestamp);
@@ -980,6 +1104,7 @@ internal sealed class EventScan
         {
             case "PipelineStarted":
                 TerminalError = null;
+                Budget = null;
                 break;
             case "PipelineFailed":
                 TerminalError = e.Error;
@@ -1016,11 +1141,38 @@ internal sealed class EventScan
                     completed.Failures[reason] = completed.Failures.GetValueOrDefault(reason) + 1;
                 }
 
+                if (status is "success" or "partial_success")
+                {
+                    completed.FailedBehind = false;
+                    completed.FailedBehindSet = true;
+                }
+
                 completed.PendingError = null;
                 completed.Open = false;
                 break;
             case "EdgeSelected" when e.From is { } from && e.To is { } to:
                 Edges[(from, to)] = Edges.GetValueOrDefault((from, to)) + 1;
+                break;
+            case "FailedStageContinued" when e.NodeId is { } node:
+                var continued = Node(node);
+                continued.FailuresContinued++;
+                continued.FailedBehind = true;
+                continued.FailedBehindSet = true;
+                break;
+            case "VisitLimitReached" when e.NodeId is { } node:
+                Node(node).VisitLimits++;
+                break;
+            case "MetricsRecorded" when e.NodeId is { } node && e.Metrics is { Count: > 0 } metrics:
+                var reporter = Node(node);
+                reporter.Metrics.Add(new MetricVisit(Math.Max(1, reporter.Visits), metrics));
+                foreach (var (name, value) in metrics)
+                {
+                    FinalMetrics[name] = value;
+                }
+
+                break;
+            case "BudgetExceeded":
+                Budget = new BudgetStop(e.SpentUsd ?? 0, e.LimitUsd ?? 0, e.NextNodeId, HistoryJson.ParseDate(e.Timestamp));
                 break;
         }
     }
@@ -1062,6 +1214,33 @@ internal struct EventFields
     public int Attempt;
     public double? DurationMs;
 
+    /// <summary><c>MetricsRecorded</c>: the reported numbers.</summary>
+    public Dictionary<string, double>? Metrics;
+
+    /// <summary><c>BudgetExceeded</c>: recorded cost and the budget, in US dollars, and the stage it stopped before.</summary>
+    public double? SpentUsd;
+    public double? LimitUsd;
+    public string? NextNodeId;
+
+    private enum Field
+    {
+        Other,
+        Type,
+        NodeId,
+        Status,
+        Error,
+        Notes,
+        From,
+        To,
+        Timestamp,
+        Attempt,
+        Duration,
+        Metrics,
+        SpentUsd,
+        LimitUsd,
+        NextNodeId,
+    }
+
     public static bool TryRead(ReadOnlySpan<byte> line, out EventFields fields)
     {
         fields = default;
@@ -1085,20 +1264,30 @@ internal struct EventFields
                     return false;
                 }
 
-                var property = reader.ValueTextEquals("type"u8) ? 1
-                    : reader.ValueTextEquals("node_id"u8) ? 2
-                    : reader.ValueTextEquals("status"u8) ? 3
-                    : reader.ValueTextEquals("error"u8) ? 4
-                    : reader.ValueTextEquals("notes"u8) ? 5
-                    : reader.ValueTextEquals("from"u8) ? 6
-                    : reader.ValueTextEquals("to"u8) ? 7
-                    : reader.ValueTextEquals("timestamp"u8) ? 8
-                    : reader.ValueTextEquals("attempt"u8) ? 9
-                    : reader.ValueTextEquals("duration"u8) ? 10
-                    : 0;
+                var property = reader.ValueTextEquals("type"u8) ? Field.Type
+                    : reader.ValueTextEquals("node_id"u8) ? Field.NodeId
+                    : reader.ValueTextEquals("status"u8) ? Field.Status
+                    : reader.ValueTextEquals("error"u8) ? Field.Error
+                    : reader.ValueTextEquals("notes"u8) ? Field.Notes
+                    : reader.ValueTextEquals("from"u8) ? Field.From
+                    : reader.ValueTextEquals("to"u8) ? Field.To
+                    : reader.ValueTextEquals("timestamp"u8) ? Field.Timestamp
+                    : reader.ValueTextEquals("attempt"u8) ? Field.Attempt
+                    : reader.ValueTextEquals("duration"u8) ? Field.Duration
+                    : reader.ValueTextEquals("metrics"u8) ? Field.Metrics
+                    : reader.ValueTextEquals("spent_usd"u8) ? Field.SpentUsd
+                    : reader.ValueTextEquals("limit_usd"u8) ? Field.LimitUsd
+                    : reader.ValueTextEquals("next_node_id"u8) ? Field.NextNodeId
+                    : Field.Other;
                 if (!reader.Read())
                 {
                     return false;
+                }
+
+                if (property == Field.Metrics && reader.TokenType == JsonTokenType.StartObject)
+                {
+                    fields.Metrics = ReadNumbers(ref reader);
+                    continue;
                 }
 
                 if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
@@ -1107,38 +1296,48 @@ internal struct EventFields
                     continue;
                 }
 
-                var text = reader.TokenType == JsonTokenType.String && property is > 0 and not 9 ? reader.GetString() : null;
+                var text = reader.TokenType == JsonTokenType.String ? reader.GetString() : null;
+                double? number = reader.TokenType == JsonTokenType.Number && reader.TryGetDouble(out var parsed) && double.IsFinite(parsed) ? parsed : null;
                 switch (property)
                 {
-                    case 1:
+                    case Field.Type:
                         fields.Type = text;
                         break;
-                    case 2:
+                    case Field.NodeId:
                         fields.NodeId = text;
                         break;
-                    case 3:
+                    case Field.Status:
                         fields.Status = text;
                         break;
-                    case 4:
+                    case Field.Error:
                         fields.Error = text;
                         break;
-                    case 5:
+                    case Field.Notes:
                         fields.Notes = text;
                         break;
-                    case 6:
+                    case Field.From:
                         fields.From = text;
                         break;
-                    case 7:
+                    case Field.To:
                         fields.To = text;
                         break;
-                    case 8:
+                    case Field.Timestamp:
                         fields.Timestamp = text;
                         break;
-                    case 9 when reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out var attempt):
+                    case Field.Attempt when reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out var attempt):
                         fields.Attempt = attempt;
                         break;
-                    case 10 when TimeSpan.TryParse(text, CultureInfo.InvariantCulture, out var duration):
+                    case Field.Duration when TimeSpan.TryParse(text, CultureInfo.InvariantCulture, out var duration):
                         fields.DurationMs = duration.TotalMilliseconds;
+                        break;
+                    case Field.SpentUsd:
+                        fields.SpentUsd = number;
+                        break;
+                    case Field.LimitUsd:
+                        fields.LimitUsd = number;
+                        break;
+                    case Field.NextNodeId:
+                        fields.NextNodeId = text;
                         break;
                 }
             }
@@ -1150,8 +1349,32 @@ internal struct EventFields
             return false;
         }
     }
-}
 
+    /// <summary>Reads an object of numbers (the reader is on its start); other values are skipped.</summary>
+    private static Dictionary<string, double> ReadNumbers(ref Utf8JsonReader reader)
+    {
+        var numbers = new Dictionary<string, double>(StringComparer.Ordinal);
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            var name = reader.GetString()!;
+            if (!reader.Read())
+            {
+                break;
+            }
+
+            if (reader.TokenType == JsonTokenType.Number && reader.TryGetDouble(out var value) && double.IsFinite(value))
+            {
+                numbers[name] = value;
+            }
+            else if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+            {
+                reader.Skip();
+            }
+        }
+
+        return numbers;
+    }
+}
 /// <summary>Small JSON value helpers.</summary>
 internal static class HistoryJson
 {
@@ -1277,22 +1500,31 @@ internal static class JsonLines
     private static ReadOnlySpan<byte> Utf8Bom => [0xEF, 0xBB, 0xBF];
 }
 
-/// <summary>Stage directory helpers: history visits and file listings.</summary>
+/// <summary>Stage directory helpers: history visits, archived attempts, and file listings.</summary>
 internal static partial class StageFiles
 {
     /// <summary>The <c>history/visit-N</c> directories of a stage directory, by visit number.</summary>
-    public static IReadOnlyList<(int Visit, string Path)> HistoryVisits(string stageDirectory)
+    public static IReadOnlyList<(int Visit, string Path)> HistoryVisits(string stageDirectory) =>
+        Numbered(Path.Combine(stageDirectory, "history"), "visit-*", VisitPattern());
+
+    /// <summary>
+    /// The <c>attempts/attempt-N</c> directories of a stage directory or of a <c>history/visit-N</c> directory — the
+    /// attempts of that visit that the engine retried — by attempt number.
+    /// </summary>
+    public static IReadOnlyList<(int Attempt, string Path)> Attempts(string visitDirectory) =>
+        Numbered(Path.Combine(visitDirectory, StageAttemptArchive.DirectoryName), "attempt-*", AttemptPattern());
+
+    private static IReadOnlyList<(int Number, string Path)> Numbered(string parent, string search, Regex pattern)
     {
-        var history = Path.Combine(stageDirectory, "history");
-        if (!Directory.Exists(history))
+        if (!Directory.Exists(parent))
         {
             return [];
         }
 
         try
         {
-            return Directory.EnumerateDirectories(history, "visit-*")
-                .Select(d => (Match: VisitPattern().Match(Path.GetFileName(d)), Path: d))
+            return Directory.EnumerateDirectories(parent, search)
+                .Select(d => (Match: pattern.Match(Path.GetFileName(d)), Path: d))
                 .Where(v => v.Match.Success)
                 .Select(v => (int.Parse(v.Match.Groups["n"].Value, CultureInfo.InvariantCulture), v.Path))
                 .OrderBy(v => v.Item1)
@@ -1321,4 +1553,7 @@ internal static partial class StageFiles
 
     [GeneratedRegex(@"^visit-(?<n>\d{1,6})$", RegexOptions.CultureInvariant)]
     private static partial Regex VisitPattern();
+
+    [GeneratedRegex(@"^attempt-(?<n>\d{1,6})$", RegexOptions.CultureInvariant)]
+    private static partial Regex AttemptPattern();
 }

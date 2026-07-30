@@ -78,9 +78,10 @@ public static class StudioGraphJson
     }
 
     /// <summary>
-    /// Effective <c>llm_model</c>/<c>llm_provider</c>/<c>reasoning_effort</c> for a node with their source: <c>node</c>
-    /// (explicit attribute), <c>stylesheet</c> (with the winning selector), or <c>default</c> (a <c>node [...]</c> block).
-    /// Mirrors <see cref="Transforms.StylesheetTransform"/>: the stylesheet overrides defaults but never explicit attributes.
+    /// Effective <c>llm_model</c>/<c>llm_provider</c>/<c>reasoning_effort</c>/<c>instructions</c> for a node with their
+    /// source: <c>node</c> (explicit attribute), <c>stylesheet</c> (with the winning selector), or <c>default</c> (a
+    /// <c>node [...]</c> block). Mirrors <see cref="Transforms.StylesheetTransform"/>: the stylesheet overrides defaults
+    /// but never explicit attributes.
     /// </summary>
     public static JsonObject Effective(Node node, ModelStylesheet stylesheet)
     {
@@ -88,7 +89,7 @@ public static class StudioGraphJson
         ArgumentNullException.ThrowIfNull(stylesheet);
         var winners = stylesheet.ResolveWithRules(node);
         var result = new JsonObject();
-        foreach (var property in new[] { AttrKeys.LlmModel, AttrKeys.LlmProvider, AttrKeys.ReasoningEffort })
+        foreach (var property in new[] { AttrKeys.LlmModel, AttrKeys.LlmProvider, AttrKeys.ReasoningEffort, AttrKeys.Instructions })
         {
             if (node.ExplicitKeys.Contains(property) && node[property] is { Length: > 0 } explicitValue)
             {

@@ -36,8 +36,10 @@ public enum SimulationMode
 public sealed class SimulationSample
 {
     private readonly ConcurrentDictionary<string, int> _executions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, NodeSpend> _spend = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<ParallelRecord>> _parallel = new(StringComparer.Ordinal);
     private long _simulatedTimeMs;
+    private long _simulatedCostMicros;
 
     public SimulationSample(SimulationScenario scenario, long seed, int runIndex = 0, SimulationMode mode = SimulationMode.Stochastic)
     {
@@ -64,14 +66,29 @@ public sealed class SimulationSample
     /// </summary>
     public bool RealTime { get; init; }
 
-    /// <summary>Latency of an execution when neither the node, its handler type, nor the scenario sets one.</summary>
+    /// <summary>
+    /// Latency of an execution when neither the node, its handler type, the scenario's <c>step_delay_ms</c>, nor a
+    /// duration prior sets one.
+    /// </summary>
     public int DefaultStepDelayMs { get; init; }
 
-    /// <summary>The scenario's <c>step_delay_ms</c>, else <see cref="DefaultStepDelayMs"/>.</summary>
+    /// <summary>
+    /// The scenario's <c>step_delay_ms</c>, else <see cref="DefaultStepDelayMs"/> (executions without their own duration use
+    /// the scenario's duration prior for their handler type in between).
+    /// </summary>
     public int StepDelayMs => Scenario.StepDelayMs ?? DefaultStepDelayMs;
 
     /// <summary>Total simulated stage time so far (sum over executions; parallel branches add up).</summary>
     public long SimulatedTimeMs => Interlocked.Read(ref _simulatedTimeMs);
+
+    /// <summary>Total simulated cost so far, in USD (the scenario's <c>cost</c> of every execution).</summary>
+    public double SimulatedCostUsd => Interlocked.Read(ref _simulatedCostMicros) / MicrosPerUsd;
+
+    /// <summary>Costs are accounted in millionths of a dollar, so totals do not depend on the order of additions.</summary>
+    internal const double MicrosPerUsd = 1_000_000;
+
+    /// <summary>Simulated time and cost per node so far.</summary>
+    internal IReadOnlyDictionary<string, NodeSpend> Spend => _spend;
 
     /// <summary>A fresh random seed (31 bits, so it survives JSON round trips through JavaScript).</summary>
     public static long NewSeed() => Random.Shared.Next(1, int.MaxValue);
@@ -114,7 +131,7 @@ public sealed class SimulationSample
     /// </summary>
     public PipelineRunner CreateRunner(PipelineRunnerOptions? options = null, IEnumerable<string>? customHandlerTypes = null)
     {
-        var runner = new PipelineRunner((options ?? new PipelineRunnerOptions()) with { Backend = null });
+        var runner = new PipelineRunner((options ?? new PipelineRunnerOptions()) with { Backend = null, RealWorkspace = false });
         var codergen = new SimulatedStageHandler(this, HandlerTypes.Codergen, SimulatedStageKind.Codergen);
         runner.RegisterHandler(HandlerTypes.Codergen, codergen);
         runner.Handlers.DefaultHandler = codergen;
@@ -141,25 +158,62 @@ public sealed class SimulationSample
     internal int NextExecution(string nodeId) => _executions.AddOrUpdate(nodeId, 1, static (_, count) => count + 1);
 
     /// <summary>
-    /// Spends a simulated duration, bounded by <paramref name="limit"/> when set: waits (in <see cref="RealTime"/> mode) and
-    /// accounts the time. Returns false when the limit cut the duration short (the stage timed out).
+    /// The simulated duration of one execution: the behavior's <c>duration_ms</c>, else the scenario's
+    /// <c>step_delay_ms</c>, else the handler type's duration prior capped at <paramref name="limit"/> (a prior never
+    /// times a stage out), else <see cref="DefaultStepDelayMs"/>.
     /// </summary>
-    internal async Task<bool> SpendAsync(int durationMs, TimeSpan? limit, CancellationToken cancellationToken)
+    internal int DurationFor(string handlerType, ResolvedBehavior behavior, TimeSpan? limit)
     {
+        if ((behavior.DurationMs ?? Scenario.StepDelayMs) is { } explicitMs)
+        {
+            return explicitMs;
+        }
+
+        if (Scenario.PriorFor(handlerType) is { } prior)
+        {
+            return limit is { } l && l > TimeSpan.Zero && prior > l.TotalMilliseconds ? (int)Math.Floor(l.TotalMilliseconds) : prior;
+        }
+
+        return DefaultStepDelayMs;
+    }
+
+    /// <summary>
+    /// Spends a simulated duration, bounded by <paramref name="limit"/> when set: waits (in <see cref="RealTime"/> mode) and
+    /// accounts the time and <paramref name="costUsd"/> to the sample and to <paramref name="nodeId"/>. Returns false when
+    /// the limit cut the duration short (the stage timed out).
+    /// </summary>
+    internal async Task<bool> SpendAsync(string nodeId, int durationMs, TimeSpan? limit, double? costUsd, CancellationToken cancellationToken)
+    {
+        var micros = costUsd is { } cost and > 0 ? (long)Math.Round(cost * MicrosPerUsd) : 0;
+        if (micros > 0)
+        {
+            Interlocked.Add(ref _simulatedCostMicros, micros);
+        }
+
         if (durationMs <= 0)
         {
+            AddSpend(nodeId, 0, micros);
             return true;
         }
 
         var exceeded = limit is { } l && l > TimeSpan.Zero && durationMs > l.TotalMilliseconds;
-        var spent = exceeded ? Math.Ceiling(limit!.Value.TotalMilliseconds) : durationMs;
-        Interlocked.Add(ref _simulatedTimeMs, (long)spent);
+        var spent = (long)(exceeded ? Math.Ceiling(limit!.Value.TotalMilliseconds) : durationMs);
+        Interlocked.Add(ref _simulatedTimeMs, spent);
+        AddSpend(nodeId, spent, micros);
         if (RealTime)
         {
             await Task.Delay(TimeSpan.FromMilliseconds(spent), cancellationToken).ConfigureAwait(false);
         }
 
         return !exceeded;
+    }
+
+    private void AddSpend(string nodeId, long ms, long micros)
+    {
+        if (ms > 0 || micros > 0)
+        {
+            _spend.AddOrUpdate(nodeId, new NodeSpend(ms, micros), (_, current) => new NodeSpend(current.TimeMs + ms, current.CostMicros + micros));
+        }
     }
 
     internal void RecordParallel(ParallelRecord record)
@@ -218,6 +272,9 @@ public sealed class SimulationSample
 
 /// <summary>One branch of a recorded parallel execution (from the parallel handler's <c>parallel.results</c>).</summary>
 internal sealed record ParallelBranchRecord(string Id, string Status, string? StopNode, IReadOnlyList<string> CompletedNodes);
+
+/// <summary>Simulated time (milliseconds) and cost (millionths of a dollar) spent on one node in a sample.</summary>
+internal readonly record struct NodeSpend(long TimeMs, long CostMicros);
 
 /// <summary>A completed execution of a parallel node and the exact path of each branch, in branch order.</summary>
 internal sealed record ParallelRecord(string NodeId, IReadOnlyList<ParallelBranchRecord> Branches);

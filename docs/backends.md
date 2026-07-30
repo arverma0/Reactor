@@ -10,6 +10,8 @@ public interface ICodergenBackend
     Task<CodergenResult> RunAsync(Node node, string prompt, PipelineContext context, CancellationToken cancellationToken);
     bool SupportsStatusFile => false;                       // true: the agent can write status.json
     bool SupportsStatusFileFor(Node node) => SupportsStatusFile;
+    bool SupportsSteering => false;                         // true: steering.md reaches the running agent
+    bool SupportsSteeringFor(Node node) => SupportsSteering;
 }
 ```
 
@@ -17,6 +19,11 @@ Every backend in this repository writes `backend.json` metadata (model, tokens, 
 counts) to the stage directory, forwards agent activity (`→ tool args`, `✗ tool error`, warnings) to the run's
 event stream as `StageLog` events, and maps failures to exceptions carrying a `Retryable` flag so the engine retries
 only what can succeed on retry (rate limits, 5xx, network) and not authentication, policy, or configuration errors.
+An attempt that fails, times out, or is cancelled attaches what it used so far to its exception
+(`BackendMetadata.Attach`: model, tokens, model and tool calls, AI units or premium requests, session id, and the
+agent's last message), so its `backend.json` is still written (with `outcome` and `error`) and the last message goes
+to `response.partial.md`. Steering (`SupportsSteering`) is supported by `agent` and `copilot`; `BackendRouter`
+answers for the backend each node routes to.
 
 **Threads.** Stages with `full` fidelity on one thread share a backend session (the conversation, and for agents the
 tool state) for the duration of one engine execution; a resumed run or a `loop_restart` starts fresh sessions. If a
@@ -37,6 +44,55 @@ of starting blind. The prompt actually sent is then saved as `prompt.effective.m
 Routes registered by the CLI: `agent`, `direct`, and each native provider with a key (`openai`, `anthropic`,
 `gemini`, `openai-compatible`); `copilot`/`copilot-sdk`; `copilot-cli` and `claude-code`/`claude` when the CLIs are
 installed. `--model` sets the default model for stages without `llm_model`.
+
+## Standing instructions
+
+Every backend honors the stage's standing instructions — Reactor's built-in house rules, the graph's and the node's
+`instructions` (see [pipelines.md](pipelines.md#standing-instructions-reactor-extension)) — and writes them to
+`{stage}/instructions.md`:
+
+| Backend | Delivered as |
+|---|---|
+| `agent` | the session's user instructions in the system prompt (plus the legacy `agent.instructions`) |
+| `direct` | appended to the system message (no house rules: the backend has no tools) |
+| `copilot` | appended to the Copilot session's system message (`SystemMessageConfig`, append mode) when the session is created; a later stage on the same thread whose instructions differ gets them at the top of its prompt |
+| `copilot-cli` | a delimited `# Instructions` section at the top of the prompt (the CLI has no system-prompt option), once per session — again only when they change on a resumed thread |
+| `claude-code` | `--append-system-prompt` (on one line when the executable is a batch file; instructions over 16,000 characters go into the prompt instead) |
+
+A tool call cut off at the model's output-token limit ("Tool call arguments truncated by the model output token
+limit") loses that whole generation. The `copilot`, `copilot-cli`, and `claude-code` backends log it as a stage
+warning that explains what happened and count it in `backend.json` (`output_limit_truncations`).
+
+## Usage and cost in `backend.json`
+
+Backends keep the raw usage fields they get — `input_tokens` (including cached), `output_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, `model_calls`, `tool_calls`, and Copilot's
+`ai_units` (AI credits) and `premium_requests` — and add one comparable figure:
+
+| Field | Meaning |
+|---|---|
+| `cost_usd` | List price of the stage's usage in USD. |
+| `cost_basis` | What it was computed from: `ai_units` (× $0.01 per AI credit), `premium_requests` (legacy request-based billing; × the `premium_request_usd` of a `REACTOR_PRICES` file, as the built-in table has no premium request price), or `tokens` (× per-model token prices). |
+| `cost_estimated` | `true` when Reactor derived the quantity itself (tokens × a price table, or premium requests from a model multiplier) rather than taking a figure the runtime reported. |
+
+| Backend | `cost_usd` from |
+|---|---|
+| `copilot` | the AI units the runtime reports; tokens × the price table when it reports none |
+| `copilot-cli` | the AI units in the CLI's usage checkpoint (which also yields tokens and model calls); for a killed run, the session's on-disk usage records, else premium requests estimated from the model's multiplier (priced only when `premium_request_usd` is set) |
+| `claude-code` | `total_cost_usd` from Claude Code's result; for a killed run, the per-message usage parsed so far × the model catalog's prices |
+| `agent`, `direct` | tokens × the model catalog's `input_cost_per_million`/`output_cost_per_million` (cache tokens at `cached_input_cost_per_million`/`cache_write_cost_per_million` when set, else the input rate) |
+
+**The Copilot price table.** Reactor ships the per-model token prices of GitHub Copilot's usage-based billing
+(`src/Reactor.Llm/Catalog/copilot-prices.json`, with source URLs and retrieval dates; long-context tiers and legacy
+premium-request multipliers where documented). It fills in prices when the runtime returns no billing data
+(`reactor models --provider copilot`, `GET /studio/api/models`) and prices token estimates. Point
+`REACTOR_PRICES` at a JSON file with the same shape to add or replace entries (entries replace built-in ones by id;
+`"replace": true` drops the built-in entries); a file that cannot be read is reported by `reactor models` and ignored.
+
+**Attempts.** Each attempt of a stage opens its transcript (`agent-events.jsonl`, `copilot-events.jsonl`,
+`cli-events.jsonl`) with `{"type":"reactor.attempt","attempt":N,"ts":"…"}` (N = the engine's retry count + 1), records
+Reactor writes carry `ts`, and `backend.json` records `attempt`. Backends do not rely on stage files surviving between
+attempts.
 
 ## `agent` — the coding agent loop
 
@@ -64,8 +120,8 @@ installed. `--model` sets the default model for stages without `llm_model`.
   to `steering.consumed-N.md`, and injects the text into the running session before its next model request.
 - **Hooks**: `tool_hooks.pre/post` run around every tool call (see [pipelines.md](pipelines.md#tool-hooks)).
 - **Artifacts**: `transcript.md` (the conversation) and `agent-events.jsonl` (every session event).
-- Node attributes: `agent.max_tool_rounds`, `agent.max_turns`, `agent.max_tokens`, `agent.instructions` (appended
-  to the system prompt), `agent.shell_timeout`.
+- Node attributes: `agent.max_tool_rounds`, `agent.max_turns`, `agent.max_tokens`, `agent.instructions` (legacy:
+  appended to the system prompt after the standing `instructions`), `agent.shell_timeout`.
 
 Credentials come from the environment (`Client.FromEnv`): `OPENAI_API_KEY` (+`OPENAI_BASE_URL`, `OPENAI_ORG_ID`,
 `OPENAI_PROJECT_ID`), `ANTHROPIC_API_KEY` (+`ANTHROPIC_BASE_URL`), `GEMINI_API_KEY`/`GOOGLE_API_KEY`
@@ -102,8 +158,14 @@ Authentication is the signed-in Copilot user (sign in once with the `copilot` CL
   endpoint) is taken like on the `agent` backend and sent with `SendAsync(new MessageOptions { Mode = "immediate" })`,
   which the runtime folds into the turn in progress. Nothing is taken once the turn has ended; a message that arrives
   in the instant the turn ends is logged as not sent.
-- Usage (input/output/cached/reasoning tokens, AI units) is summed per stage into `backend.json`; activity is in
-  `copilot-events.jsonl`.
+- Usage (input/output/cached/cache-write/reasoning tokens, AI units) is summed per stage into `backend.json`; activity
+  is in `copilot-events.jsonl` (including each call's `nano_aiu` and the runtime's `usage.checkpoint` totals).
+- **AI units per attempt**: the runtime reports AI units as a cumulative total per session, so each stage — and each
+  attempt of a stage — records the difference from what earlier attempts on the session were already charged. When a
+  stage ends or is aborted with model calls not yet covered by a checkpoint, the backend waits briefly
+  (`UsageSettleTimeout`, 3 s) for the closing checkpoint, and counts calls still uncovered from their per-call usage;
+  a checkpoint that arrives between stages is not charged to the next one. A timed-out attempt thus keeps its own
+  units, and a retry on the same thread reports only its own.
 
 ## `copilot-cli` — the GitHub Copilot CLI
 
@@ -113,11 +175,18 @@ stage with the prompt on stdin, in the run's working directory.
 - The npm `copilot.cmd` shim on Windows is unwrapped to `node npm-loader.js` so arguments are never re-parsed by
   `cmd.exe`. Set `REACTOR_COPILOT_CLI` or `--copilot-cli` to use a specific executable.
 - `--session-id` both creates and resumes sessions, so `full`-fidelity threads keep one Copilot session. The CLI
-  reports cumulative premium requests per session; the backend records each stage's delta.
+  reports cumulative usage per session (premium requests, and in a usage checkpoint, when it emits one, AI units and
+  per-model tokens and request counts); the backend records each stage's delta. A run killed before it reports usage
+  (timeout, cancel) is accounted from the session's usage records in
+  `<COPILOT_HOME>/session-state/<session id>/events.jsonl` (`usage_source: "session-state"`), else its premium
+  requests are estimated from the price table's multiplier (`premium_requests_estimated`).
 - The stage directory is added with `--add-dir` when it lies outside the working directory, so the agent can write
   `status.json`.
 - An unknown model fails immediately (the CLI rejects it) and is not retried.
 - Raw JSON events (minus streaming deltas) are kept in `cli-events.jsonl`; stderr in `stderr.log`.
+- Cancelling the run, or a stage `timeout`, terminates the CLI's whole process tree, including shells and servers the
+  agent started (a job object on Windows, a process group elsewhere); this holds for `claude-code` too. When the CLI
+  exits by itself, processes it left running are not touched.
 
 ## `claude-code` — Claude Code
 
@@ -129,7 +198,8 @@ prompt on stdin (or `--permission-mode acceptEdits` with `SkipPermissions = fals
 - Claude aliases (`sonnet`, `opus`, `haiku`) and Anthropic ids pass through (dotted versions are converted); a
   non-Claude `llm_model` falls back to the CLI default with a warning. `reasoning_effort` maps to `--effort`
   low/medium/high.
-- Cost, turns, and token usage from the final `result` event go to `backend.json`.
+- Cost, turns, and token usage from the final `result` event go to `backend.json`; a killed run keeps the token
+  usage of the messages it had streamed.
 - Authentication, permission, and model errors are not retried.
 
 ## `simulate`

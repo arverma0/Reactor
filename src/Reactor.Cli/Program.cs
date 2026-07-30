@@ -9,6 +9,7 @@ var root = new RootCommand("Reactor — DOT-defined AI pipelines (an implementat
     PipelineCommands.Run(),
     PipelineCommands.Resume(),
     PipelineCommands.Validate(),
+    SimulateCommand.Create(),
     PipelineCommands.Render(),
     HostCommands.Serve(),
     HostCommands.Studio(),

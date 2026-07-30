@@ -27,9 +27,9 @@ public class ArtifactValidationTests
     [Fact]
     public void Well_formed_pins_have_no_artifact_diagnostics()
     {
-        Assert.Empty(Lint(Valid));
+        Assert.DoesNotContain(Lint(Valid), d => d.Rule.StartsWith("artifact_", StringComparison.Ordinal));
         Assert.Contains(PipelineValidator.BuiltInRules(), r => r.Name == "artifact_syntax");
-        Assert.Equal(23, PipelineValidator.BuiltInRules().Count);
+        Assert.Equal(31, PipelineValidator.BuiltInRules().Count);
     }
 
     [Fact]
@@ -142,8 +142,8 @@ public class ArtifactValidationTests
         var handlers = diagnostics.Where(d => d.Rule == "artifact_handlers").ToList();
         Assert.Equal(2, handlers.Count);
         Assert.All(handlers, d => Assert.Equal(Severity.Warning, d.Severity));
-        Assert.Contains(handlers, d => d.NodeId == "start" && d.Message == "outputs is ignored on start nodes; only codergen and tool stages consume and produce artifacts.");
-        Assert.Contains(handlers, d => d.NodeId == "gate" && d.Message == "inputs and outputs are ignored on wait.human nodes; only codergen and tool stages consume and produce artifacts.");
+        Assert.Contains(handlers, d => d.NodeId == "start" && d.Message == "outputs is ignored on start nodes; only codergen, tool, and judged fan-in stages consume and produce artifacts.");
+        Assert.Contains(handlers, d => d.NodeId == "gate" && d.Message == "inputs and outputs are ignored on wait.human nodes; only codergen, tool, and judged fan-in stages consume and produce artifacts.");
 
         // An output declared where it is ignored does not count as produced.
         Assert.Contains(diagnostics, d => d.Rule == "artifact_inputs" && d.NodeId == "build" && d.Message.Contains("'approval'", StringComparison.Ordinal));

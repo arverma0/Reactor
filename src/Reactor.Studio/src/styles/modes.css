@@ -271,6 +271,29 @@
   margin-top: 14px;
 }
 
+.rs-runpanel__workdir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--ink-1);
+}
+
+.rs-runpanel__workdir-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rs-runpanel__workdir .label,
+.rs-runpanel__workdir .rs-chip {
+  flex: none;
+  white-space: nowrap;
+}
+
 .rs-runpanel__logs {
   margin-left: auto;
   font-size: 10.5px;
@@ -290,6 +313,237 @@
   font-size: 12px;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.rs-runpanel__usage {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--ink-1);
+  line-height: 1.5;
+}
+
+.rs-runpanel__usage .label,
+.rs-runpanel__metrics .label {
+  margin-right: 6px;
+}
+
+.rs-runpanel__metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.rs-runpanel__dirty {
+  margin-top: 10px;
+  padding: 8px 11px;
+  border-radius: var(--r-2);
+  border: 1px solid rgba(232, 184, 74, 0.35);
+  background: var(--warn-soft);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-0);
+}
+
+.rs-runpanel__dirty svg {
+  color: var(--warn);
+  vertical-align: -1px;
+}
+
+.rs-runpanel__dirty .rs-linkbtn {
+  font-size: 12px;
+}
+
+/* a run stopped at its budget */
+.rs-budgetstop {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--r-2);
+  border: 1px dashed rgba(240, 84, 79, 0.5);
+  background: var(--fail-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.rs-budgetstop__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 500 10.5px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fail);
+}
+
+.rs-budgetstop p {
+  margin: 6px 0 0;
+}
+
+.rs-budgetstop__resume {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.rs-budgetstop__amount {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rs-budgetstop__amount .rs-input {
+  width: 80px;
+  height: 26px;
+}
+
+.rs-status.is-budget {
+  color: var(--fail);
+  border-style: dashed;
+}
+
+.rs-flight__tag {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  font: 500 9.5px/15px var(--font-mono);
+  vertical-align: 1px;
+}
+
+.rs-flight__tag.is-budget {
+  color: var(--fail);
+  background: var(--fail-soft);
+}
+
+.rs-flight__tag.is-dirty {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+/* stage panel: attempts, metrics, flow notes */
+.rs-exec__note {
+  grid-column: 2 / -1;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+
+.rs-exec__note.is-warn {
+  color: var(--warn);
+}
+
+.rs-attempts {
+  margin-top: 16px;
+}
+
+.rs-attempts__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.rs-attempts__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.rs-attempt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 5px;
+  border: 1px solid var(--line-2);
+  background: transparent;
+  color: var(--ink-1);
+  font-size: 11.5px;
+}
+
+.rs-attempt:hover {
+  border-color: var(--line-4);
+}
+
+.rs-attempt.is-on {
+  border-color: var(--line-4);
+  background: var(--bg-3);
+  color: var(--ink-0);
+}
+
+.rs-attempt__outcome {
+  white-space: nowrap;
+}
+
+.rs-files-tab.is-lastwords {
+  font-family: var(--font-sans);
+  font-style: italic;
+  color: var(--warn);
+}
+
+.rs-stagemetrics {
+  margin-top: 14px;
+}
+
+.rs-stagemetrics table {
+  margin-top: 6px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.rs-stagemetrics th {
+  padding: 2px 8px;
+  font: 500 9.5px var(--font-mono);
+  color: var(--ink-3);
+  text-align: right;
+}
+
+.rs-stagemetrics td {
+  padding: 3px 8px;
+  border-top: 1px solid var(--line-1);
+  text-align: right;
+}
+
+.rs-stagemetrics td.mono {
+  text-align: left;
+  color: var(--ink-2);
+  font-size: 11px;
+}
+
+.rs-spark {
+  display: block;
+}
+
+.rs-spark polyline {
+  fill: none;
+  stroke: var(--info);
+  stroke-width: 1.3;
+}
+
+.rs-spark circle {
+  fill: var(--info);
+}
+
+.rs-flightlog__row.is-FailedStageContinued {
+  color: var(--warn);
+}
+
+.rs-flightlog__row.is-FailedStageContinued .rs-flightlog__icon {
+  color: var(--warn);
+}
+
+.rs-flightlog__row.is-BudgetExceeded,
+.rs-flightlog__row.is-BudgetExceeded .rs-flightlog__icon {
+  color: var(--fail);
+}
+
+.rs-flightlog__row.is-VisitLimitReached .rs-flightlog__icon,
+.rs-flightlog__row.is-MetricsRecorded .rs-flightlog__icon {
+  color: var(--info);
 }
 
 .rs-flightlog {
@@ -428,6 +682,107 @@
   flex-wrap: wrap;
   gap: 5px;
   margin-top: 12px;
+}
+
+.rs-changes {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--line-2);
+  background: var(--bg-2);
+  font-size: 12px;
+}
+
+.rs-changes.has-violations {
+  border-color: var(--fail);
+}
+
+.rs-changes__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
+
+.rs-changes__total {
+  font-weight: 600;
+}
+
+.rs-changes__counts {
+  color: var(--ink-1);
+}
+
+.rs-changes__flag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.rs-changes__flag.is-fail {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.rs-changes__where {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.rs-changes__none,
+.rs-changes__note {
+  margin-top: 6px;
+}
+
+.rs-changes__note.is-fail {
+  color: var(--fail);
+}
+
+.rs-changes__list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 11.5px;
+}
+
+.rs-change {
+  display: grid;
+  grid-template-columns: 14px 1fr auto;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+.rs-change__kind {
+  font-weight: 600;
+}
+
+.rs-change.is-added .rs-change__kind {
+  color: var(--ok);
+}
+
+.rs-change.is-modified .rs-change__kind {
+  color: var(--warn);
+}
+
+.rs-change.is-deleted .rs-change__kind {
+  color: var(--fail);
+}
+
+.rs-change.is-deleted .rs-change__path {
+  text-decoration: line-through;
+  color: var(--ink-2);
+}
+
+.rs-change__path {
+  overflow-wrap: anywhere;
+}
+
+.rs-change.is-out {
+  color: var(--fail);
+  background: color-mix(in srgb, var(--fail) 10%, transparent);
 }
 
 .rs-steer {
@@ -775,6 +1130,46 @@
   background: rgba(232, 184, 74, 0.22);
   box-shadow: inset 0 0 0 1px var(--kind-human);
   animation: rs-breathe 1.6s ease-in-out infinite;
+}
+
+/* a failure that flowed onward along an unconditional edge */
+.rs-timeline__exec.is-continued {
+  background: repeating-linear-gradient(-45deg, var(--fail), var(--fail) 3px, var(--warn) 3px, var(--warn) 6px);
+}
+
+.rs-timeline__limit {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font: 600 11px/16px var(--font-mono);
+  color: var(--info);
+  pointer-events: auto;
+}
+
+.rs-timeline__budget {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1.5px dashed var(--fail);
+  z-index: 2;
+}
+
+.rs-timeline__budget-label {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--fail-soft);
+  font: 500 9.5px/15px var(--font-mono);
+  color: var(--fail);
+  white-space: nowrap;
+}
+
+.rs-timeline__budget.is-end .rs-timeline__budget-label {
+  left: auto;
+  right: 4px;
 }
 
 .rs-timeline__wait {
@@ -1814,6 +2209,52 @@
   font-size: 11.5px;
 }
 
+.rs-fork__workdir {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border-radius: var(--r-2);
+  border: 1px solid var(--line-2);
+  background: var(--bg-inset);
+  font-size: 11.5px;
+  color: var(--ink-1);
+  overflow-wrap: anywhere;
+}
+
+.rs-fork__workdir-input {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.rs-fork__diff.is-workdir {
+  margin-top: 8px;
+}
+
+.rs-fork__diff > div + div,
+.rs-fork__diff > div + .rs-fork__confirm {
+  margin-top: 6px;
+}
+
+.rs-fork__confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--ink-0);
+  cursor: pointer;
+}
+
+.rs-fork__confirm input {
+  margin: 2px 0 0;
+  accent-color: var(--signal);
+}
+
+.rs-fork__confirm .mono {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 /* flight record */
 .rs-record {
   padding: 16px 18px 30px;
@@ -1911,6 +2352,156 @@
   justify-content: space-between;
   margin-top: 4px;
   font-size: 10px;
+}
+
+/* quality trajectory: final metrics per flight next to time and cost */
+.rs-trajectory {
+  margin-top: 18px;
+}
+
+.rs-trajectory__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 10.5px;
+}
+
+.rs-trajectory__row {
+  display: grid;
+  grid-template-columns: 78px 1fr 64px;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  border-top: 1px solid var(--line-1);
+}
+
+.rs-trajectory__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+
+.rs-trajectory__row.is-metric .rs-trajectory__label {
+  color: var(--info);
+}
+
+.rs-trajectory__plot {
+  position: relative;
+  height: 26px;
+}
+
+.rs-trajectory__plot svg {
+  display: block;
+  width: 100%;
+  height: 26px;
+  overflow: visible;
+}
+
+.rs-trajectory__plot polyline {
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.2;
+}
+
+.rs-trajectory__row.is-metric polyline {
+  stroke: var(--info);
+  stroke-width: 1.6;
+}
+
+.rs-trajectory__dot {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  padding: 0;
+  border: 1.5px solid var(--bg-1);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  cursor: pointer;
+}
+
+.rs-trajectory__dot:hover {
+  transform: translate(-50%, -50%) scale(1.5);
+}
+
+.rs-trajectory__last {
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--ink-0);
+  white-space: nowrap;
+}
+
+.rs-trajectory__delta {
+  margin-left: 3px;
+  font-size: 10px;
+}
+
+.rs-trajectory__delta.is-up {
+  color: var(--ok);
+}
+
+.rs-trajectory__delta.is-down {
+  color: var(--fail);
+}
+
+.rs-trajectory__row.is-metric .rs-trajectory__delta {
+  color: var(--ink-2);
+}
+
+.rs-trajectory__row.is-time .rs-trajectory__delta.is-up,
+.rs-trajectory__row.is-cost .rs-trajectory__delta.is-up {
+  color: var(--fail);
+}
+
+.rs-trajectory__row.is-time .rs-trajectory__delta.is-down,
+.rs-trajectory__row.is-cost .rs-trajectory__delta.is-down {
+  color: var(--ok);
+}
+
+.rs-record__note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--fail);
+}
+
+.rs-record__note.is-warn {
+  color: var(--warn);
+}
+
+.rs-record__stagemetrics {
+  margin-top: 14px;
+}
+
+.rs-record__metrics {
+  width: 100%;
+  margin-top: 6px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.rs-record__metrics th {
+  padding: 2px 6px;
+  font: 500 9.5px var(--font-mono);
+  color: var(--ink-3);
+  text-align: right;
+}
+
+.rs-record__metrics td {
+  padding: 3px 6px;
+  border-top: 1px solid var(--line-1);
+  text-align: right;
+}
+
+.rs-record__metrics td.mono {
+  text-align: left;
+  color: var(--info);
+  font-size: 11px;
 }
 
 .rs-record__trouble {
@@ -2458,6 +3049,133 @@
   background: var(--fail-soft);
 }
 
+/* the checker's findings, by kind */
+.rs-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 11px;
+  border-radius: var(--r-2);
+  border: 1px solid rgba(232, 184, 74, 0.3);
+  background: var(--warn-soft);
+}
+
+.rs-findings.is-problems {
+  border-color: rgba(240, 84, 79, 0.35);
+  background: var(--fail-soft);
+}
+
+.rs-finding + .rs-finding {
+  padding-top: 7px;
+  border-top: 1px solid var(--line-1);
+}
+
+.rs-finding__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+
+.rs-finding__kind {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  font: 500 9.5px/16px var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-1);
+}
+
+.rs-finding.is-contract .rs-finding__kind {
+  background: rgba(179, 148, 236, 0.18);
+  color: var(--kind-fanout);
+}
+
+.rs-finding.is-forecast .rs-finding__kind {
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.rs-finding.is-tunnel .rs-finding__kind {
+  background: var(--signal-soft);
+  color: var(--signal-ink);
+}
+
+.rs-finding.is-review .rs-finding__kind {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.rs-finding__rule {
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+
+.rs-finding__text,
+.rs-finding__fix {
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.rs-finding__fix {
+  margin-top: 2px;
+  color: var(--ink-2);
+}
+
+.rs-finding code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--bg-inset);
+  font-size: 10.5px;
+}
+
+.rs-selfreview {
+  border-radius: var(--r-2);
+  border: 1px solid var(--line-2);
+}
+
+.rs-selfreview.is-revise {
+  border-color: rgba(232, 184, 74, 0.35);
+}
+
+.rs-selfreview__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-1);
+  text-align: left;
+}
+
+.rs-selfreview__verdict {
+  margin-left: auto;
+  font: 500 10.5px var(--font-mono);
+  white-space: nowrap;
+}
+
+.rs-selfreview__verdict.is-pass {
+  color: var(--ok);
+}
+
+.rs-selfreview__verdict.is-revise {
+  color: var(--warn);
+}
+
+.rs-selfreview__verdict.is-skipped {
+  color: var(--ink-3);
+}
+
+.rs-selfreview__body {
+  padding: 0 12px 10px;
+  font-size: 12px;
+}
+
 .rs-proposal__nochange {
   margin: 0;
   font-size: 12px;
@@ -2661,4 +3379,102 @@
 
 .rs-preview__stats .is-removed {
   color: var(--fail);
+}
+
+/* tunnel: landings with failed stages, time/cost priors, outcome metrics */
+.rs-results__dirty {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.rs-results__hint {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.rs-hot__bar.is-warn span {
+  background: var(--warn);
+}
+
+.rs-failure__where .rs-linkbtn {
+  font-size: inherit;
+}
+
+.rs-scenario__priors {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.rs-prior {
+  display: grid;
+  grid-template-columns: 1fr 70px 24px;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.rs-prior .rs-input {
+  height: 24px;
+}
+
+.rs-scenario__note {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.rs-metric {
+  display: grid;
+  grid-template-columns: 90px 1fr 18px;
+  align-items: center;
+  gap: 6px;
+}
+
+.rs-metric .rs-input {
+  height: 24px;
+  min-width: 0;
+}
+
+.rs-landed-metric + .rs-landed-metric {
+  margin-top: 10px;
+}
+
+.rs-landed-metric__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.rs-landed-metric__values {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 46px;
+  margin-top: 6px;
+}
+
+.rs-landed-metric__values > span {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  font-size: 10px;
+  color: var(--ink-2);
+}
+
+.rs-landed-metric__bar {
+  display: block;
+  width: 100%;
+  max-height: calc(100% - 14px);
+  border-radius: 2px 2px 0 0;
+  background: var(--kind-agent);
+  opacity: 0.75;
 }
