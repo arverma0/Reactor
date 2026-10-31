@@ -34,7 +34,7 @@ const doc = (): StudioDoc => ({
   ],
 });
 
-const at = (s: number) => new Date(Date.UTC(2026, 6, 23, 12, 0, s)).toISOString();
+const at = (s: number) => new Date(Date.UTC(2026, 9, 23, 12, 0, s)).toISOString();
 
 describe("fork checkpoints", () => {
   const events: PipelineEventJson[] = [
@@ -154,7 +154,7 @@ describe("doc diff", () => {
   it("reports attribute, group, edge, and graph changes", () => {
     const before = doc();
     const after = doc();
-    after.nodes[1] = { ...after.nodes[1], attrs: { prompt: "Plan carefully", llm_model: "claude-sonnet-5" } };
+    after.nodes[1] = { ...after.nodes[1], attrs: { prompt: "Plan carefully", llm_model: "claude-sonnet-5.5" } };
     after.nodes.push({ id: "lint", attrs: { shape: "parallelogram", tool_command: "ruff" }, group: null });
     after.nodes = after.nodes.filter((n) => n.id !== "gate");
     after.edges = after.edges.filter((e) => e.from !== "gate" && e.to !== "gate");
@@ -165,7 +165,7 @@ describe("doc diff", () => {
     const diff = diffDocs(before, after);
     expect(diff.added).toEqual(["lint"]);
     expect(diff.removed).toEqual(["gate"]);
-    expect(diff.changed).toEqual([{ id: "plan", changes: [{ key: "prompt", before: "Plan", after: "Plan carefully" }, { key: "llm_model", before: undefined, after: "claude-sonnet-5" }] }]);
+    expect(diff.changed).toEqual([{ id: "plan", changes: [{ key: "prompt", before: "Plan", after: "Plan carefully" }, { key: "llm_model", before: undefined, after: "claude-sonnet-5.5" }] }]);
     expect(diff.edgesChanged).toEqual([{ from: "test", to: "review", changes: [{ key: "weight", before: undefined, after: "2" }] }]);
     expect(diff.edgesAdded.map((e) => `${e.from}->${e.to}`)).toEqual(["review->exit"]);
     expect(diff.edgesRemoved.map((e) => `${e.from}->${e.to}`).sort()).toEqual(["gate->exit", "gate->plan", "review->gate"]);
@@ -191,12 +191,12 @@ describe("flight list", () => {
   it("joins live runs with their directories and keeps runs the history does not list", () => {
     const flights = mergeFlights(
       [live("aaaa", "running", { current_node: "test", pending_questions: 1, started_at: at(30) }), live("sim1", "success", { simulated: true, simulation_mode: "interactive", started_at: at(20) })],
-      [disk("20260723-flaky-aaaa", { live_id: "aaaa", status: "running", started_at: at(30), cost: {} }), disk("20260722-flaky-old1", { started_at: at(5), cost: { ai_units: 3.5 } })],
+      [disk("20261023-flaky-aaaa", { live_id: "aaaa", status: "running", started_at: at(30), cost: {} }), disk("20261022-flaky-old1", { started_at: at(5), cost: { ai_units: 3.5 } })],
     );
-    expect(flights.map((f) => f.key)).toEqual(["aaaa", "sim1", "dir:20260722-flaky-old1"]);
-    expect(flights[0]).toMatchObject({ liveId: "aaaa", dir: "20260723-flaky-aaaa", status: "running", currentNode: "test", pending: 1, cost: null });
+    expect(flights.map((f) => f.key)).toEqual(["aaaa", "sim1", "dir:20261022-flaky-old1"]);
+    expect(flights[0]).toMatchObject({ liveId: "aaaa", dir: "20261023-flaky-aaaa", status: "running", currentNode: "test", pending: 1, cost: null });
     expect(flights[1]).toMatchObject({ liveId: "sim1", dir: null, simulated: true, simulationMode: "interactive" });
-    expect(flights[2]).toMatchObject({ liveId: null, dir: "20260722-flaky-old1", cost: { ai_units: 3.5 } });
+    expect(flights[2]).toMatchObject({ liveId: null, dir: "20261022-flaky-old1", cost: { ai_units: 3.5 } });
   });
 
   it("puts queued runs (no start time yet) first", () => {
@@ -221,7 +221,7 @@ describe("re-fly working directory", () => {
 
     // The server's own directory, however it is spelled, and the Architect's scratch directories under its .reactor.
     expect(planForkWorkdir({ source: "c:/code/attractorreimpl/products/", server, allowClient: false })).toMatchObject({ blocked: null, needsConfirmation: false });
-    const scratch = `${server}\\.reactor\\studio\\architect\\20260729-101010-abc123`;
+    const scratch = `${server}\\.reactor\\studio\\architect\\20261029-101010-abc123`;
     expect(planForkWorkdir({ source: scratch, server, allowClient: false })).toMatchObject({ directory: scratch, blocked: null });
   });
 

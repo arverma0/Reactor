@@ -479,7 +479,7 @@ public class AnthropicAdapterTests
             ("anthropic-ratelimit-requests-remaining", "3999"),
             ("anthropic-ratelimit-tokens-limit", "400000"),
             ("anthropic-ratelimit-tokens-remaining", "395000"),
-            ("anthropic-ratelimit-requests-reset", "2026-07-19T00:00:00Z"));
+            ("anthropic-ratelimit-requests-reset", "2026-10-19T00:00:00Z"));
 
         var response = await adapter.CompleteAsync(SimpleRequest());
 
@@ -509,7 +509,7 @@ public class AnthropicAdapterTests
         Assert.Equal(3999, response.RateLimit!.RequestsRemaining);
         Assert.Equal(4000, response.RateLimit.RequestsLimit);
         Assert.Equal(395000, response.RateLimit.TokensRemaining);
-        Assert.Equal(new DateTimeOffset(2026, 7, 19, 0, 0, 0, TimeSpan.Zero), response.RateLimit.ResetAt);
+        Assert.Equal(new DateTimeOffset(2026, 10, 19, 0, 0, 0, TimeSpan.Zero), response.RateLimit.ResetAt);
     }
 
     [Theory]

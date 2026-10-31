@@ -374,14 +374,14 @@ public sealed class CliBackendTests
     }
 
     internal const string CopilotUsageOutput = """
-        {"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-4.8","content":"Writing the spec in one go.","toolRequests":[{"toolCallId":"call_1","name":"create"}]}}
-        {"type":"model.call_final_result","data":{"model":"claude-opus-4.8","result":"success"},"ephemeral":true}
+        {"type":"assistant.message","data":{"messageId":"m1","model":"claude-opus-5.5","content":"Writing the spec in one go.","toolRequests":[{"toolCallId":"call_1","name":"create"}]}}
+        {"type":"model.call_final_result","data":{"model":"claude-opus-5.5","result":"success"},"ephemeral":true}
         {"type":"tool.execution_start","data":{"toolCallId":"call_1","toolName":"create","arguments":{}}}
         {"type":"tool.execution_complete","data":{"toolCallId":"call_1","success":false,"error":{"message":"Tool call arguments truncated by the model output token limit"}}}
-        {"type":"assistant.message","data":{"messageId":"m2","model":"claude-opus-4.8","content":"DONE.","toolRequests":[]}}
-        {"type":"model.call_final_result","data":{"model":"claude-opus-4.8","result":"success"},"ephemeral":true}
-        {"type":"session.usage_checkpoint","data":{"totalNanoAiu":203947025000,"totalPremiumRequests":27,"accountingSnapshot":{"modelMetrics":{"claude-opus-4.8":{"requests":{"count":10,"cost":27},"usage":{"inputTokens":602346,"outputTokens":50992,"cacheReadTokens":521733,"cacheWriteTokens":80591,"reasoningTokens":19666}}}}}}
-        {"type":"result","sessionId":"5f0c1d2e-0000-4000-8000-000000000002","exitCode":0,"usage":{"premiumRequests":27}}
+        {"type":"assistant.message","data":{"messageId":"m2","model":"claude-opus-5.5","content":"DONE.","toolRequests":[]}}
+        {"type":"model.call_final_result","data":{"model":"claude-opus-5.5","result":"success"},"ephemeral":true}
+        {"type":"session.usage_checkpoint","data":{"totalNanoAiu":152722960000,"totalPremiumRequests":15,"accountingSnapshot":{"modelMetrics":{"claude-opus-5.5":{"requests":{"count":10,"cost":15},"usage":{"inputTokens":602346,"outputTokens":50992,"cacheReadTokens":521733,"cacheWriteTokens":80591,"reasoningTokens":19666}}}}}}
+        {"type":"result","sessionId":"5f0c1d2e-0000-4000-8000-000000000002","exitCode":0,"usage":{"premiumRequests":15}}
         """;
 
     [Fact]
@@ -403,13 +403,13 @@ public sealed class CliBackendTests
 
         Assert.Equal(StageStatus.Success, result.Status);
         var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "spec", "backend.json")))!;
-        Assert.Equal(203.947025, metadata["ai_units"]!.GetValue<double>(), 6);
-        Assert.Equal(27, metadata["premium_requests"]!.GetValue<double>());
+        Assert.Equal(152.72296, metadata["ai_units"]!.GetValue<double>(), 6);
+        Assert.Equal(15, metadata["premium_requests"]!.GetValue<double>());
         Assert.Equal(10, metadata["model_calls"]!.GetValue<double>());
         Assert.Equal(602346, metadata["input_tokens"]!.GetValue<double>());
         Assert.Equal(50992, metadata["output_tokens"]!.GetValue<double>());
         Assert.Equal(80591, metadata["cache_write_tokens"]!.GetValue<double>());
-        Assert.Equal(2.03947, metadata["cost_usd"]!.GetValue<double>(), 5);
+        Assert.Equal(1.52723, metadata["cost_usd"]!.GetValue<double>(), 5);
         Assert.Equal("ai_units", metadata["cost_basis"]!.GetValue<string>());
         Assert.False(metadata["cost_estimated"]!.GetValue<bool>());
         Assert.Equal(1, metadata["output_limit_truncations"]!.GetValue<int>());
@@ -458,9 +458,9 @@ public sealed class CliBackendTests
         var at = DateTimeOffset.UtcNow.AddSeconds(5).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", System.Globalization.CultureInfo.InvariantCulture);
         var records = $$$$"""
             {"type":"session.start","data":{},"timestamp":"{{{{at}}}}"}
-            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":26625,"outputTokens":189,"cacheReadTokens":0,"cacheWriteTokens":26621,"reasoningTokens":15,"cost":27.0,"initiator":"user","copilotUsage":{"totalNanoAiu":17112625000}}},"timestamp":"{{{{at}}}}"}
-            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":28948,"outputTokens":205,"cacheReadTokens":26621,"cacheWriteTokens":2325,"reasoningTokens":26,"cost":27.0,"initiator":"agent","copilotUsage":{"totalNanoAiu":3297675000}}},"timestamp":"{{{{at}}}}"}
-            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-4.8","inputTokens":1,"outputTokens":1,"cost":27.0,"initiator":"user"}},"timestamp":"2020-01-01T00:00:00.000Z"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-5.5","inputTokens":26625,"outputTokens":189,"cacheReadTokens":0,"cacheWriteTokens":26621,"reasoningTokens":15,"cost":15.0,"initiator":"user","copilotUsage":{"totalNanoAiu":13690100000}}},"timestamp":"{{{{at}}}}"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-5.5","inputTokens":28948,"outputTokens":205,"cacheReadTokens":26621,"cacheWriteTokens":2325,"reasoningTokens":26,"cost":15.0,"initiator":"agent","copilotUsage":{"totalNanoAiu":2105720000}}},"timestamp":"{{{{at}}}}"}
+            {"type":"session.usage_record","data":{"usage":{"model":"claude-opus-5.5","inputTokens":1,"outputTokens":1,"cost":15.0,"initiator":"user"}},"timestamp":"2020-01-01T00:00:00.000Z"}
             """;
         var home = dir.Combine("copilot-home");
         var cli = FakeCli.Create(
@@ -490,10 +490,10 @@ public sealed class CliBackendTests
         Assert.Equal("session-state", metadata["usage_source"]!.GetValue<string>());
         Assert.Equal(2, metadata["model_calls"]!.GetValue<double>());
         Assert.Equal(26625 + 28948, metadata["input_tokens"]!.GetValue<double>());
-        Assert.Equal(27, metadata["premium_requests"]!.GetValue<double>());
-        Assert.Equal(20.4103, metadata["ai_units"]!.GetValue<double>(), 6);
+        Assert.Equal(15, metadata["premium_requests"]!.GetValue<double>());
+        Assert.Equal(15.79582, metadata["ai_units"]!.GetValue<double>(), 6);
         Assert.Equal("ai_units", metadata["cost_basis"]!.GetValue<string>());
-        Assert.Equal("claude-opus-4.8", metadata["model"]!.GetValue<string>());
+        Assert.Equal("claude-opus-5.5", metadata["model"]!.GetValue<string>());
         Assert.Equal("Writing the spec in one go.\n", File.ReadAllText(dir.Combine("run", "spec", "response.partial.md")));
     }
 
@@ -523,23 +523,9 @@ public sealed class CliBackendTests
         var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "spec", "backend.json")))!;
         Assert.Equal(0.33, metadata["premium_requests"]!.GetValue<double>());
         Assert.True(metadata["premium_requests_estimated"]!.GetValue<bool>());
-
-        // The built-in price table has no premium request price, so the estimate is not converted to USD.
-        Assert.Null(metadata["cost_usd"]);
-        Assert.Null(metadata["cost_basis"]);
-    }
-
-    [Fact]
-    public void Premium_requests_are_priced_when_the_price_table_has_a_premium_request_price()
-    {
-        var table = new Reactor.Llm.PriceTable([new Reactor.Llm.ModelPrice { Id = "claude-haiku-4.5", Input = 1, Output = 5, LegacyPremiumMultiplier = 0.33 }], premiumRequestUsd: 0.04);
-        var metadata = new Dictionary<string, object?> { ["premium_requests"] = 0.33 };
-
-        StageCost.AddCopilot(metadata, "claude-haiku-4.5", table, premiumRequestsEstimated: true);
-
-        Assert.Equal(0.0132, (double)metadata["cost_usd"]!, 6);
-        Assert.Equal("premium_requests", metadata["cost_basis"]);
-        Assert.Equal(true, metadata["cost_estimated"]);
+        Assert.Equal(0.0132, metadata["cost_usd"]!.GetValue<double>(), 6);
+        Assert.Equal("premium_requests", metadata["cost_basis"]!.GetValue<string>());
+        Assert.True(metadata["cost_estimated"]!.GetValue<bool>());
     }
 
     internal const string ClaudeUsageOutput = """

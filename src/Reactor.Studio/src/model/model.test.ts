@@ -94,12 +94,12 @@ describe("model helpers", () => {
   });
 
   it("parses and writes quoted stylesheet values such as instructions", () => {
-    const text = '/* house rules */ .docs { llm_model: claude-opus-4.8; instructions: "Write in parts; append {more}.\nQuote \\"this\\". Path C:\\\\tmp" }';
+    const text = '/* house rules */ .docs { llm_model: claude-opus-5.5; instructions: "Write in parts; append {more}.\nQuote \\"this\\". Path C:\\\\tmp" }';
     const rules = parseStylesheet(text);
     expect(rules).toHaveLength(1);
-    expect(rules[0].declarations).toEqual({ llm_model: "claude-opus-4.8", instructions: 'Write in parts; append {more}.\nQuote "this". Path C:\\tmp' });
+    expect(rules[0].declarations).toEqual({ llm_model: "claude-opus-5.5", instructions: 'Write in parts; append {more}.\nQuote "this". Path C:\\tmp' });
     const written = formatStylesheet(rules);
-    expect(written).toBe('.docs { llm_model: claude-opus-4.8; instructions: "Write in parts; append {more}.\nQuote \\"this\\". Path C:\\\\tmp"; }');
+    expect(written).toBe('.docs { llm_model: claude-opus-5.5; instructions: "Write in parts; append {more}.\nQuote \\"this\\". Path C:\\\\tmp"; }');
     expect(parseStylesheet(written)[0].declarations).toEqual(rules[0].declarations);
 
     const doc = { ...sample(), graphAttrs: { model_stylesheet: '.deep-thinking { instructions: "Think; then act." }' } };

@@ -5,9 +5,9 @@ digraph stylesheet_demo {
     graph [
         goal="Design and implement a small CLI todo app in Python",
         model_stylesheet="
-            * { llm_model: gpt-5.6-luna; reasoning_effort: medium; }
-            .deep-thinking { llm_model: claude-sonnet-5; reasoning_effort: high; }
-            #final_review { llm_model: gpt-5.6-sol; }
+            * { llm_model: gpt-5-mini; reasoning_effort: medium; }
+            .deep-thinking { llm_model: claude-sonnet-5.5; reasoning_effort: high; }
+            #final_review { llm_model: gpt-5.5; }
         ",
         default_on_fail="stop"
     ]

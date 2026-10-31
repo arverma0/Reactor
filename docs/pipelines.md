@@ -266,7 +266,7 @@ attempts that are retried announce nothing):
 
 ```json
 {"name": "design", "kind": "file", "path": "docs/DESIGN.md", "text": null, "producer": "architect", "version": 2,
- "bytes": 1834, "sha256": "9f2c4e…", "produced_at": "2026-07-23T16:05:11.2140000+00:00"}
+ "bytes": 1834, "sha256": "9f2c4e…", "produced_at": "2026-10-23T16:05:11.2140000+00:00"}
 ```
 
 `version` counts how often the artifact has been produced in this run (loops; a `loop_restart` starts a new run).
@@ -577,7 +577,7 @@ resumed stage falls back to `summary:high`.
 ```css
 *               { llm_model: gpt-5-mini; reasoning_effort: medium; }
 box             { llm_provider: anthropic; }
-.deep-thinking  { llm_model: claude-sonnet-5; reasoning_effort: high; }
+.deep-thinking  { llm_model: claude-sonnet-5.5; reasoning_effort: high; }
 #final_review   { llm_model: gpt-5.5; }
 ```
 
@@ -586,7 +586,7 @@ ties; explicit node attributes always win. Properties: `llm_model`, `llm_provide
 extension `instructions` (quote values that contain spaces or punctuation; `\` escapes a quote inside them):
 
 ```css
-.docs { llm_model: claude-opus-4.8; instructions: "Write long documents section by section; keep drafts under .scratch/."; }
+.docs { llm_model: claude-opus-5.5; instructions: "Write long documents section by section; keep drafts under .scratch/."; }
 ```
 
 ## Standing instructions (Reactor extension)
@@ -630,7 +630,7 @@ time per session so audit scripts can append to files safely.
 ## Run directory
 
 ```text
-.reactor/runs/20260718-192803-test_pipeline/
+.reactor/runs/20261018-192803-test_pipeline/
   manifest.json  graph.dot  checkpoint.json  events.jsonl  result.json
   plan/          prompt.md  response.md  status.json  backend.json  instructions.md  changes.json  (+ transcript.md, agent-events.jsonl, ...)
   implement/     ...        history/visit-1/ (files from earlier visits of a stage that ran more than once)

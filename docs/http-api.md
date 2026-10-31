@@ -160,12 +160,12 @@ detail and events describe the whole run; stage files are read from that directo
 **Summary** (`GET /studio/api/runs` → `{"runs": [...]}`):
 
 ```json
-{"id": "20260723-164549-factory-7f55af02c909", "run_id": "7f55af02c909", "name": "factory", "goal": "Ship the feature",
- "started_at": "2026-07-23T16:45:49.3542699+00:00", "finished_at": "2026-07-23T16:45:49.4165759+00:00",
+{"id": "20261023-164549-factory-7f55af02c909", "run_id": "7f55af02c909", "name": "factory", "goal": "Ship the feature",
+ "started_at": "2026-10-23T16:45:49.3542699+00:00", "finished_at": "2026-10-23T16:45:49.4165759+00:00",
  "status": "success", "duration_ms": 38, "node_count": 5, "stage_executions": 3, "failure_reason": null,
  "live_id": "7f55af02c909", "restarts": [], "source_path": "examples/factory.dot", "working_directory": "C:\\work\\factory",
  "simulated": false,
- "forked_from": {"id": "20260723-164531-factory-99397269d91f", "checkpoint": "0002-plan", "node": "plan", "run_id": "99397269d91f"},
+ "forked_from": {"id": "20261023-164531-factory-99397269d91f", "checkpoint": "0002-plan", "node": "plan", "run_id": "99397269d91f"},
  "cost": {"cost_usd": 4.5, "ai_units": 3.5, "input_tokens": 350, "output_tokens": 30, "model_calls": 12},
  "metrics": {"score": 4, "qa_failed": 0}, "failures_continued": 1, "failed_stages": ["docs"], "visit_limits": 1,
  "budget": null}
@@ -215,7 +215,7 @@ attempt keeps its own prompt, transcript, `backend.json`, and, when it was stopp
 message in `response.partial.md`:
 
 ```json
-{"node": "build", "run": "20260730-043500-quality",
+{"node": "build", "run": "20261030-043500-quality",
  "visits": [{"visit": 1, "latest": false, "outcome": null, "error": null, "files": ["backend.json", "response.md"], "backend": {"cost_usd": 1},
              "attempts": [{"attempt": 1, "outcome": "timeout", "error": "Stage timed out after 10m",
                            "files": ["backend.json", "prompt.md", "response.partial.md"], "backend": {"cost_usd": 0.5, "outcome": "timeout"}}]},
@@ -273,15 +273,15 @@ linearly; `series` is oldest → newest. Values no run reported are omitted.
 (`checkpoints/0004-plan.json`: after stage execution 4, `plan`).
 
 ```http
-POST /studio/api/runs/20260723-164531-factory-99397269d91f/fork
+POST /studio/api/runs/20261023-164531-factory-99397269d91f/fork
 {"checkpoint": "0002-plan", "dot": "<modified DOT, optional>", "context": {"ticket": "ABC-123"}}
 
-201 {"id": "7f55af02c909", "status": "queued", "name": "factory", "logs_root": ".../20260723-164549-factory-7f55af02c909",
+201 {"id": "7f55af02c909", "status": "queued", "name": "factory", "logs_root": ".../20261023-164549-factory-7f55af02c909",
      "working_directory": "C:\\work\\factory", "working_directory_source": "source_run",
      "source_working_directory": "C:\\work\\factory",
-     "forked_from": {"id": "20260723-164531-factory-99397269d91f", "checkpoint": "0002-plan", "node": "plan", "run_id": "99397269d91f"},
+     "forked_from": {"id": "20261023-164531-factory-99397269d91f", "checkpoint": "0002-plan", "node": "plan", "run_id": "99397269d91f"},
      "diagnostics": [], "links": {"self": "/pipelines/7f55af02c909", "events": "/pipelines/7f55af02c909/events",
-                                  "history": "/studio/api/runs/20260723-164549-factory-7f55af02c909"}}
+                                  "history": "/studio/api/runs/20261023-164549-factory-7f55af02c909"}}
 ```
 
 The fork is a new run directory (`graph.dot` = the given DOT or the source's, `checkpoint.json` = the snapshot with
@@ -328,7 +328,7 @@ files alike, except ignored ones (`node_modules`, build output) and run director
 index, `HEAD`, and branches are never touched. Rewinds are serialized, and only happen before the fork starts.
 
 ```http
-POST /studio/api/runs/20260723-164531-factory-99397269d91f/fork
+POST /studio/api/runs/20261023-164531-factory-99397269d91f/fork
 {"checkpoint": "0002-plan", "restore_workspace": true}
 
 201 {"id": "7f55af02c909", ..., "workspace_restore": {
@@ -599,8 +599,8 @@ started with `--backend simulate` answers `409`.
 ```http
 POST /studio/api/architect
 {"mode": "critique", "dot": "<current pipeline>", "brief": "Why do flights stall at the tests?",
- "evidence": "<Markdown: flight record, wind tunnel report>", "models": ["claude-sonnet-5", "gpt-5.6-luna"],
- "model": "claude-sonnet-5", "reasoning_effort": "high"}
+ "evidence": "<Markdown: flight record, wind tunnel report>", "models": ["claude-sonnet-5.5", "gpt-5.6-luna"],
+ "model": "claude-sonnet-5.5", "reasoning_effort": "high"}
 ```
 
 `mode` is `draft` (needs `brief`), `revise` (needs `brief` and `dot`), or `critique` (needs `dot`; `brief` is an

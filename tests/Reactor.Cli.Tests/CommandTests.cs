@@ -63,7 +63,7 @@ public class CommandTests
         {
             // th-TH formats dates in the Buddhist calendar (year 2569) unless the invariant culture is used.
             CultureInfo.CurrentCulture = new CultureInfo("th-TH");
-            Assert.Equal("20260729-122702-my-pipeline", PipelineCommands.RunDirectoryName("my pipeline", new DateTime(2026, 7, 29, 12, 27, 2, DateTimeKind.Utc)));
+            Assert.Equal("20261029-122702-my-pipeline", PipelineCommands.RunDirectoryName("my pipeline", new DateTime(2026, 10, 29, 12, 27, 2, DateTimeKind.Utc)));
         }
         finally
         {

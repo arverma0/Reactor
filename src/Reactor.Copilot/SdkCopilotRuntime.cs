@@ -29,8 +29,12 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
             WorkingDirectory = conversation.WorkingDirectory,
             Streaming = false,
 
-            // Pipeline stages run unattended: approve tool use. tool_hooks still veto individual calls (OnPreToolUse below).
-            OnPermissionRequest = PermissionHandler.ApproveAll,
+            // Pipeline stages run unattended: approve tool use, but never auto-approve what managed policy reserves for a
+            // human. (PermissionDecision is flagged experimental in this SDK preview; it is the documented handler API.)
+#pragma warning disable GHCP001
+            OnPermissionRequest = (request, _) => Task.FromResult<PermissionDecision>(
+                request.ManagedApprovalRequired is true ? PermissionDecision.UserNotAvailable() : PermissionDecision.ApproveOnce()),
+#pragma warning restore GHCP001
             Hooks = new SessionHooks
             {
                 OnPreToolUse = async (input, _) =>
@@ -43,7 +47,7 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
 
                     var decision = await hookRunner.BeforeAsync(ToCall(conversation, input.ToolName, input.ToolArgs, input.WorkingDirectory), CancellationToken.None).ConfigureAwait(false);
 
-                    // Allowed: express no opinion so the normal permission flow still applies.
+                    // Allowed: express no opinion so the normal permission flow (including managed policy) still applies.
                     return decision.Allowed
                         ? null!
                         : new PreToolUseHookOutput { PermissionDecision = "deny", PermissionDecisionReason = $"Tool call blocked: {decision.Reason}" };
@@ -70,6 +74,11 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
             },
         };
 
+        if (conversation.AdditionalDirectories.Count > 0)
+        {
+            config.AdditionalDirectories = conversation.AdditionalDirectories.ToList();
+        }
+
         if (conversation.ExcludedTools is { Count: > 0 } excluded)
         {
             config.ExcludedTools = excluded.ToList();
@@ -82,24 +91,6 @@ internal sealed class SdkCopilotRuntime(CopilotSdkBackendOptions options) : ICop
         }
 
         var session = await client.CreateSessionAsync(config, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            // The session may use its working directory; other directories the stage needs join its allow-list.
-            foreach (var directory in conversation.AdditionalDirectories)
-            {
-                var added = await session.Rpc.Permissions.Paths.AddAsync(directory, cancellationToken).ConfigureAwait(false);
-                if (added?.Success != true)
-                {
-                    throw new CopilotStageException($"The Copilot runtime did not allow access to '{directory}'.", retryable: false);
-                }
-            }
-        }
-        catch
-        {
-            await session.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-
         return new SdkConversation(session);
     }
 

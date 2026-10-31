@@ -7,6 +7,8 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>reactor</ToolCommandName>
     <PackageId>Reactor.Cli</PackageId>
+    <!-- The bundled Copilot runtime contains dotfiles (e.g. plugins/*/.release-target) that must ship with it. -->
+    <NoDefaultExcludes>true</NoDefaultExcludes>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />

@@ -461,7 +461,7 @@ public sealed class CopilotSdkBackendTests
     private static List<CopilotModelInfo> Catalog() =>
     [
         new("gpt-5-mini", "GPT-5 mini", "enabled", 0, 264_000, ["low", "medium", "high"]),
-        new("claude-sonnet-5", "Claude Sonnet 5", "enabled", 1, 1_000_000, ["low", "medium", "high", "xhigh", "max"]),
+        new("claude-sonnet-5.5", "Claude Sonnet 5.5", "enabled", 1, 1_000_000, ["low", "medium", "high", "xhigh", "max"]),
         new("claude-haiku-4.5", "Claude Haiku 4.5", "enabled", 0.33, 200_000, []),
         new("legacy-model", "Legacy", "disabled", 1, 100_000, []),
     ];
@@ -485,7 +485,7 @@ public sealed class CopilotSdkBackendTests
 
         Assert.Empty(runtime.Conversations);
         Assert.Contains("'claude-sonnet-4.5' is not available", result.NodeOutcomes["a"].FailureReason);
-        Assert.Contains("claude-sonnet-5, gpt-5-mini", result.NodeOutcomes["a"].FailureReason);
+        Assert.Contains("claude-sonnet-5.5, gpt-5-mini", result.NodeOutcomes["a"].FailureReason);
         Assert.DoesNotContain("legacy-model,", result.NodeOutcomes["a"].FailureReason);
         Assert.Contains("disabled by policy", result.NodeOutcomes["b"].FailureReason);
         Assert.Equal(1, runtime.ListCalls);
@@ -502,13 +502,13 @@ public sealed class CopilotSdkBackendTests
             digraph G {
               start [shape=Mdiamond]
               exit [shape=Msquare]
-              a [prompt="A", llm_model="Claude-Sonnet-5", reasoning_effort="max"]
+              a [prompt="A", llm_model="Claude-Sonnet-5.5", reasoning_effort="max"]
               b [prompt="B", llm_model="claude-haiku-4-5", reasoning_effort="high"]
               start -> a -> b -> exit
             }
             """, Options(dir), Ct);
 
-        Assert.Equal("claude-sonnet-5", runtime.Created[0].Model);
+        Assert.Equal("claude-sonnet-5.5", runtime.Created[0].Model);
         Assert.Equal("max", runtime.Created[0].ReasoningEffort);
         Assert.Equal("claude-haiku-4.5", runtime.Created[1].Model);
         Assert.Null(runtime.Created[1].ReasoningEffort);
@@ -523,7 +523,7 @@ public sealed class CopilotSdkBackendTests
             Models = Catalog(),
             OnTurn = (c, _, _) =>
             {
-                c.Emit(new CopilotActivity.AssistantMessage("done", "claude-opus-4.8"));
+                c.Emit(new CopilotActivity.AssistantMessage("done", "claude-opus-5.5"));
                 return Task.FromResult<string?>("done");
             },
         };
@@ -532,9 +532,9 @@ public sealed class CopilotSdkBackendTests
 
         await Runner(backend).RunAsync(OneStage.Replace("claude-sonnet-4-5", "gpt-5-mini", StringComparison.Ordinal), Options(dir, events), Ct);
 
-        Assert.Contains(Logs(events, "implement"), l => l.Contains("ran on 'claude-opus-4.8' instead of the requested 'gpt-5-mini'", StringComparison.Ordinal));
+        Assert.Contains(Logs(events, "implement"), l => l.Contains("ran on 'claude-opus-5.5' instead of the requested 'gpt-5-mini'", StringComparison.Ordinal));
         var metadata = JsonNode.Parse(File.ReadAllText(dir.Combine("run", "implement", "backend.json")))!;
-        Assert.Equal("claude-opus-4.8", metadata["model"]!.GetValue<string>());
+        Assert.Equal("claude-opus-5.5", metadata["model"]!.GetValue<string>());
         Assert.Equal("gpt-5-mini", metadata["requested_model"]!.GetValue<string>());
     }
 
@@ -687,7 +687,7 @@ public sealed class CopilotSdkBackendTests
         {
             OnTurn = (c, prompt, _) =>
             {
-                c.Emit(new CopilotActivity.Usage("claude-sonnet-5", 1_000_000, 100_000, 0, 0));
+                c.Emit(new CopilotActivity.Usage("claude-sonnet-5.5", 1_000_000, 100_000, 0, 0));
                 if (prompt.Contains("with units", StringComparison.Ordinal))
                 {
                     c.Emit(new CopilotActivity.UsageCheckpoint(250_000_000_000));
@@ -714,7 +714,7 @@ public sealed class CopilotSdkBackendTests
         Assert.Equal("ai_units", a["cost_basis"]!.GetValue<string>());
         Assert.False(a["cost_estimated"]!.GetValue<bool>());
 
-        // claude-sonnet-5: $2 per 1M input and $10 per 1M output tokens.
+        // claude-sonnet-5.5: $2 per 1M input and $10 per 1M output tokens.
         var b = BackendJson(dir, "b");
         Assert.Null(b["ai_units"]);
         Assert.Equal(3.0, b["cost_usd"]!.GetValue<double>(), 9);

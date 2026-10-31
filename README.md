@@ -26,7 +26,7 @@ On top of the specs, Reactor adds what it takes to run agent factories unattende
   [workspaces](#workspaces-and-bake-offs): what each stage changed, write scopes, and bake-off branches in their own
   git worktrees.
 
-![Reactor Studio replaying a real factory run: three models build prototypes in parallel, then an LLM judge picks one](docs/images/studio-flights.png)
+![Reactor Studio replaying a real three-hour factory run: three models build prototypes in parallel, then an LLM judge picks one](docs/images/studio-flights.png)
 
 <sub>Reactor Studio replaying a real 3 h 16 m run that built an arcade game. Three models build prototypes in
 parallel, an LLM judge plays them and picks one, and the rest of the pipeline grows the winner into the full game.</sub>
@@ -62,7 +62,7 @@ backend: GitHub Copilot SDK, default model gpt-5-mini
   │ → view hello.py
 ✔ review success (11.1s)
 ✔ Pipeline completed (success) in 30.7s
-  logs:   .reactor/runs/20260718-192803-test_pipeline
+  logs:   .reactor/runs/20261018-192803-test_pipeline
 ```
 
 ## Quick start
@@ -217,7 +217,7 @@ three polish rounds:
 digraph critic_loop {
     graph [goal="Build the landing page described in BRIEF.md to the quality bar it sets",
            default_on_fail="stop", retry_target="build", max_cost=20,
-           model_stylesheet="* { llm_model: claude-sonnet-5; } .critic { llm_model: gpt-5.6-sol; reasoning_effort: high; }"]
+           model_stylesheet="* { llm_model: claude-sonnet-5.5; } .critic { llm_model: gpt-6.1-sol; reasoning_effort: high; }"]
 
     start   [shape=Mdiamond]
     exit    [shape=Msquare]
@@ -249,32 +249,32 @@ and stub scripts stood in for the `npm` commands: a flaky install, and a QA repo
 $ reactor run critic-loop.dot --backend simulate
 backend: simulation (no LLM calls)
 ▶ Pipeline 'critic_loop' — Build the landing page described in BRIEF.md to the quality bar it sets
-  run bdf3c2b281dc · logs .reactor\runs\20260730-125358-critic_loop
+  run e678bfe906c7 · logs .reactor\runs\20261030-125358-critic_loop
 ● start [start]
 ✔ start success (0.0s)
-  │ workspace snapshots use git (a private index; snapshot commits on refs/reactor/runs/bdf3c2b281dc/main)
+  │ workspace snapshots use git (a private index; snapshot commits on refs/reactor/runs/e678bfe906c7/main)
   …
 ● deps [tool]
   ✖ deps: Tool command exited with code 1: npm ERR! code ETIMEDOUT npm ERR! network request to https://registry.npmjs.org/vite failed, reason: connect ETIMEDOUT (will retry)
   ↻ deps retry #2 in 0.2s
 ● deps [tool] attempt 2
-✔ deps success (3.5s)
+✔ deps success (2.8s)
 ● qa [tool]
   ✖ qa: Tool command exited with code 1: QA round 1 … FAIL  CTA button has no accessible name Tests: 3 failed, 9 passed, 12 total …
-✖ qa fail (5.8s)
+✖ qa fail (4.9s)
   ≡ lcp_ms=2840, a11y=72, qa_passed=9, qa_failed=3
   ⇢ qa_report v1 (text, 366 B)
 ● polish [codergen]
 ✔ polish success (0.0s)
   …
 ● qa [tool]
-✔ qa success (5.7s)
+✔ qa success (4.9s)
   ≡ lcp_ms=1240, a11y=94, qa_passed=12, qa_failed=0
   ⇢ qa_report v3 (text, 226 B)
 ● ship [tool]
-✔ ship success (3.0s)
+✔ ship success (1.8s)
   …
-✔ Pipeline completed (success) in 30.5s
+✔ Pipeline completed (success) in 25.3s
   stages: start → spec → build → deps → qa → polish → qa → polish → qa → ship → exit
 ```
 
@@ -303,8 +303,8 @@ winner's changes:
 
 ```dot
 bakeoff [shape=component, branch_workdir="worktree"]
-proto_a [prompt="Build prototype A", llm_model="claude-opus-4.8"]
-proto_b [prompt="Build prototype B", llm_model="gpt-5.6-sol"]
+proto_a [prompt="Build prototype A", llm_model="claude-opus-5.5"]
+proto_b [prompt="Build prototype B", llm_model="gpt-6.1-sol"]
 judge   [shape=tripleoctagon, promote="best", prompt="Play each prototype in its workspace and pick the best."]
 bakeoff -> proto_a -> judge
 bakeoff -> proto_b -> judge
@@ -376,8 +376,8 @@ While parallel branches run, every activity line names the stage it comes from (
 ```text
 ● proto_a [codergen]
 ● proto_b [codergen]
-  │ proto_a: copilot-cli session 358962f6-… (claude-sonnet-5)
-  │ proto_b: copilot-cli session 4e960be1-… (gpt-5.6-sol)
+  │ proto_a: copilot-cli session 358962f6-… (claude-sonnet-5.5)
+  │ proto_b: copilot-cli session 4e960be1-… (gpt-6.1-sol)
   │ proto_b → view docs/GAME_DESIGN.md
 ```
 

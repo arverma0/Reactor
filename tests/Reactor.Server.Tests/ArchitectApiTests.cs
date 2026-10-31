@@ -102,7 +102,7 @@ public sealed class ArchitectApiTests
         };
         await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, Backend = backend });
 
-        var id = await StartAsync(server, new { mode = "draft", brief = "Add a feature with tests", models = new[] { "claude-sonnet-5", "gpt-5.6-luna" }, model = "claude-sonnet-5" });
+        var id = await StartAsync(server, new { mode = "draft", brief = "Add a feature with tests", models = new[] { "claude-sonnet-5.5", "gpt-5.6-luna" }, model = "claude-sonnet-5.5" });
         var state = await WaitForArchitectAsync(server, id);
 
         Assert.True(state["status"]!.GetValue<string>() == "success", state.ToJsonString());
@@ -131,7 +131,7 @@ public sealed class ArchitectApiTests
         Assert.Contains("Use `$goal` for the goal.", prompts[0], StringComparison.Ordinal);
         Assert.DoesNotContain("Reporting the stage outcome", prompts[0], StringComparison.Ordinal);
         Assert.Contains("## Brief\nAdd a feature with tests", prompts[0], StringComparison.Ordinal);
-        Assert.Contains("## Models available\nclaude-sonnet-5, gpt-5.6-luna", prompts[0], StringComparison.Ordinal);
+        Assert.Contains("## Models available\nclaude-sonnet-5.5, gpt-5.6-luna", prompts[0], StringComparison.Ordinal);
         Assert.DoesNotContain("## What the checker found", prompts[0], StringComparison.Ordinal);
         Assert.Contains("## Your previous draft", prompts[1], StringComparison.Ordinal);
         Assert.Contains("## What the checker found\n- DOT syntax error", prompts[1], StringComparison.Ordinal);
@@ -140,10 +140,10 @@ public sealed class ArchitectApiTests
         var run = await server.GetJsonAsync($"/pipelines/{id}");
         Assert.Equal("architect", run["name"]!.GetValue<string>());
         Assert.Contains($"{Path.DirectorySeparatorChar}.reactor{Path.DirectorySeparatorChar}studio{Path.DirectorySeparatorChar}architect{Path.DirectorySeparatorChar}", run["working_directory"]!.GetValue<string>(), StringComparison.Ordinal);
-        Assert.Equal("claude-sonnet-5", server.Manager.Get(id)!.Graph.Nodes["design"].LlmModel);
+        Assert.Equal("claude-sonnet-5.5", server.Manager.Get(id)!.Graph.Nodes["design"].LlmModel);
         var check = File.ReadAllText(Path.Combine(run["logs_root"]!.GetValue<string>(), "check", "check.md"));
         Assert.StartsWith("# Draft 3: passed", check, StringComparison.Ordinal);
-        Assert.Equal("claude-sonnet-5", server.Manager.Get(id)!.Graph.Nodes["review"].LlmModel);
+        Assert.Equal("claude-sonnet-5.5", server.Manager.Get(id)!.Graph.Nodes["review"].LlmModel);
     }
 
     [Fact]

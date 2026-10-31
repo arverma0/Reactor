@@ -65,7 +65,7 @@ public sealed class CopilotStageException(string message, bool retryable, Except
 /// (or per <c>full</c>-fidelity thread, continuing the conversation). The stage's standing instructions (see
 /// <see cref="StageInstructions"/>) are appended to the session's system message when the session is created; a later
 /// stage on the same thread whose instructions differ gets them at the top of its prompt. Tool permissions are approved
-/// automatically, <c>tool_hooks</c> run through the SDK's pre/post tool
+/// automatically (except where managed policy requires a human), <c>tool_hooks</c> run through the SDK's pre/post tool
 /// hooks, and the agent may write <c>status.json</c>. A <c>steering.md</c> written into the stage directory while the
 /// stage runs is sent to the turn in progress. Activity goes to the stage log and <c>{stage}/copilot-events.jsonl</c>.
 /// Each attempt reports its own AI units (from the runtime's cumulative usage checkpoints, falling back to per-call

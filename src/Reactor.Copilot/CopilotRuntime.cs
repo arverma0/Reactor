@@ -3,7 +3,7 @@ using Reactor.Backends;
 
 namespace Reactor.Copilot;
 
-/// <summary>Normalized activity from a Copilot session (decoupled from the SDK's event types).</summary>
+/// <summary>Normalized activity from a Copilot session (decoupled from the preview SDK's event types).</summary>
 internal abstract record CopilotActivity
 {
     /// <summary>True for events from a Copilot sub-agent rather than the top-level agent.</summary>

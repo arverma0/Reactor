@@ -259,7 +259,7 @@ internal sealed partial class ConsoleReporter
             ? Paint(before, color) + Paint(nodeId, stage) + Paint(after, color)
             : Paint(before + nodeId + after, color);
 
-    /// <summary>Backend session lines: <c>copilot-cli: starting session 3589… (claude-sonnet-5)</c>, <c>copilot-sdk: continuing session …</c>.</summary>
+    /// <summary>Backend session lines: <c>copilot-cli: starting session 3589… (claude-sonnet-5.5)</c>, <c>copilot-sdk: continuing session …</c>.</summary>
     [GeneratedRegex(@"^(?<backend>[A-Za-z][\w.-]*): (?<verb>starting|resuming|started|continuing) session (?<id>\S+)(?: \((?<model>[^()]*)\))?$", RegexOptions.CultureInvariant)]
     private static partial Regex SessionLine();
 

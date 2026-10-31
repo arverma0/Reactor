@@ -147,28 +147,27 @@ validated against real agents.
 
 ## Live validation
 
-The following ran against real agents on Windows, with the Copilot CLI 1.0.71 that the Copilot SDK bundles with the CLI
-(the runtime of the `copilot` backend, and the executable of the `copilot-cli` backend):
+The following ran against real agents on Windows (Copilot SDK runtime bundled with the CLI, Copilot CLI 1.0.98):
 
 | Scenario | Backend(s) | Result |
 |---|---|---|
-| `examples/smoke.dot` (spec 11.13): artifacts, goal gate, `checkpoint.current_node == done` | copilot | pass (35 s) |
+| `examples/smoke.dot` (spec 11.13): artifacts, goal gate, `checkpoint.current_node == done` | copilot | pass (31 s) |
 | Two `full`-fidelity stages: the second recalls a secret word from the first | copilot, copilot-cli | pass; one session per thread |
 | `test-fix-loop.dot` with real `pytest`; a variant with a deliberate bug exercising fail → fix → pass | copilot | pass; the fixer received the test output |
 | `parallel-review.dot`: three concurrent sessions, fan-in, summary | copilot | pass |
-| `stylesheet.dot`: Claude Sonnet 5, GPT-5.6 Luna, GPT-5.6 Sol per stylesheet | copilot | pass; requested == actual model per stage |
+| `stylesheet.dot`: Claude Sonnet 5.5, GPT-5 mini, GPT-5.5 per stylesheet | copilot | pass; requested == actual model per stage |
 | `reactor serve`: token auth, JSON submission, human gate answered over HTTP, SSE replay, SVG graph | copilot | pass |
 | Claude Code when not logged in | claude-code | clean non-retried failure with the CLI's message |
 
 The native `agent` and `direct` backends and the OpenAI-compatible adapter ran against a local llama.cpp server
-(b10068, CPU) with Qwen2.5-Instruct 1.5B and 7B (Q4_K_M):
+(b11747, CPU) with Qwen2.5-Instruct 1.5B and 7B (Q4_K_M):
 
 | Scenario | Model | Result |
 |---|---|---|
 | `reactor agent` one-shot: create a file with a tool | 1.5B | pass; streaming and tool calls |
-| Two `full`-fidelity stages: the second recalls a secret word from the first | 1.5B | pipeline mechanics pass (`thread_context` new → continued, no `reasoning_effort` sent; the transcript carried the word); the model answered it with a doubled letter |
+| Two `full`-fidelity stages: the second recalls a secret word from the first | 1.5B | pass; `thread_context` new → continued, no `reasoning_effort` sent |
 | `examples/smoke.dot` on the `agent` backend | 1.5B | pass (the model answered without using tools) |
-| `examples/smoke.dot` on the `direct` backend with `--max-tokens 300` | 7B | pass (20 s) |
+| `examples/smoke.dot` on the `direct` backend with `--max-tokens 300` | 7B | pass (17 s) |
 | Forced fail → fix loop with real `pytest` | 7B | pipeline mechanics pass (the failing test output reached the fixer, tool errors were actionable, `--max-tokens` and stage `timeout`s bounded the run); the model itself could not write a passing fix |
 | Tool calls cut off by `--max-tokens` (forced with a 40–60 token limit) | 7B | pass; each cut-off call returns a tool error explaining the limit, and the follow-up requests are accepted |
 

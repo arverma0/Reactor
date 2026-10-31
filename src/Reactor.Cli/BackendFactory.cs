@@ -185,7 +185,7 @@ internal static class BackendFactory
         }
 
         var directory = Path.Combine(AppContext.BaseDirectory, "runtimes", RuntimeInformation.RuntimeIdentifier, "native");
-        foreach (var name in new[] { "copilot.exe", "copilot" })
+        foreach (var name in new[] { "copilot-runtime.exe", "copilot-runtime", "copilot.exe", "copilot" })
         {
             var path = Path.Combine(directory, name);
             if (File.Exists(path))

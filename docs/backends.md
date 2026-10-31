@@ -72,13 +72,13 @@ Backends keep the raw usage fields they get — `input_tokens` (including cached
 | Field | Meaning |
 |---|---|
 | `cost_usd` | List price of the stage's usage in USD. |
-| `cost_basis` | What it was computed from: `ai_units` (× $0.01 per AI credit), `premium_requests` (legacy request-based billing; × the `premium_request_usd` of a `REACTOR_PRICES` file, as the built-in table has no premium request price), or `tokens` (× per-model token prices). |
+| `cost_basis` | What it was computed from: `ai_units` (× $0.01 per AI credit), `premium_requests` (× $0.04, legacy request-based billing), or `tokens` (× per-model token prices). |
 | `cost_estimated` | `true` when Reactor derived the quantity itself (tokens × a price table, or premium requests from a model multiplier) rather than taking a figure the runtime reported. |
 
 | Backend | `cost_usd` from |
 |---|---|
 | `copilot` | the AI units the runtime reports; tokens × the price table when it reports none |
-| `copilot-cli` | the AI units in the CLI's usage checkpoint (which also yields tokens and model calls); for a killed run, the session's on-disk usage records, else premium requests estimated from the model's multiplier (priced only when `premium_request_usd` is set) |
+| `copilot-cli` | the AI units in the CLI's usage checkpoint (which also yields tokens and model calls); for a killed run, the session's on-disk usage records, else premium requests estimated from the model's multiplier |
 | `claude-code` | `total_cost_usd` from Claude Code's result; for a killed run, the per-message usage parsed so far × the model catalog's prices |
 | `agent`, `direct` | tokens × the model catalog's `input_cost_per_million`/`output_cost_per_million` (cache tokens at `cached_input_cost_per_million`/`cache_write_cost_per_million` when set, else the input rate) |
 
@@ -137,7 +137,7 @@ message history. Route individual nodes to it with `backend="direct"`; `--max-to
 ## `copilot` — GitHub Copilot SDK
 
 `CopilotSdkBackend` drives the GitHub Copilot runtime through the `GitHub.Copilot.SDK` package. The `reactor` CLI
-bundles the runtime (`runtimes/<rid>/native/copilot`); `COPILOT_CLI_PATH` or `--copilot-runtime` override it.
+bundles the runtime (`runtimes/<rid>/native/copilot-runtime`); `COPILOT_CLI_PATH` or `--copilot-runtime` override it.
 Authentication is the signed-in Copilot user (sign in once with the `copilot` CLI) or a `GitHubToken` option.
 
 - One runtime process per backend; one Copilot session per stage, or per `full`-fidelity thread (later stages
@@ -150,9 +150,8 @@ Authentication is the signed-in Copilot user (sign in once with the `copilot` CL
 - Copilot model names use dots (`claude-sonnet-4.5`); Anthropic-style ids (`claude-sonnet-4-5`,
   `claude-opus-4-6-20260101`) are converted. `reasoning_effort` is passed only when the node sets it and the model
   supports that level.
-- Tool permissions are approved automatically; `tool_hooks` run through the SDK's pre/post tool-use hooks and can
-  deny a call. Directories a stage needs outside its working directory (its stage directory) are added to the
-  session's allow-list.
+- Tool permissions are approved automatically, except requests that managed policy reserves for a human, which are
+  declined. `tool_hooks` run through the SDK's pre/post tool-use hooks.
 - `SendAndWaitAsync` is bounded by the node `timeout` (plus 30 s) or 4 hours; cancellation aborts the Copilot turn.
 - **Steering**: while the turn runs, a `steering.md` in the stage directory (from a supervisor or the server's steer
   endpoint) is taken like on the `agent` backend and sent with `SendAsync(new MessageOptions { Mode = "immediate" })`,
@@ -175,11 +174,11 @@ stage with the prompt on stdin, in the run's working directory.
 - The npm `copilot.cmd` shim on Windows is unwrapped to `node npm-loader.js` so arguments are never re-parsed by
   `cmd.exe`. Set `REACTOR_COPILOT_CLI` or `--copilot-cli` to use a specific executable.
 - `--session-id` both creates and resumes sessions, so `full`-fidelity threads keep one Copilot session. The CLI
-  reports cumulative usage per session (premium requests, and in a usage checkpoint, when it emits one, AI units and
-  per-model tokens and request counts); the backend records each stage's delta. A run killed before it reports usage
-  (timeout, cancel) is accounted from the session's usage records in
-  `<COPILOT_HOME>/session-state/<session id>/events.jsonl` (`usage_source: "session-state"`), else its premium
-  requests are estimated from the price table's multiplier (`premium_requests_estimated`).
+  reports cumulative usage per session (premium requests, AI units, and per-model tokens and request counts in its
+  usage checkpoint); the backend records each stage's delta. A run killed before it reports usage (timeout, cancel) is
+  accounted from the session's usage records in `<COPILOT_HOME>/session-state/<session id>/events.jsonl`
+  (`usage_source: "session-state"`), else its premium requests are estimated from the price table's multiplier
+  (`premium_requests_estimated`).
 - The stage directory is added with `--add-dir` when it lies outside the working directory, so the agent can write
   `status.json`.
 - An unknown model fails immediately (the CLI rejects it) and is not retried.
