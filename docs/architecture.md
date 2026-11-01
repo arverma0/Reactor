@@ -23,17 +23,17 @@
          │               │   └─────────────┘ └─────────────┘
          ▼               ▼
  ┌──────────────────────────────────────────┐
- │ Reactor.Core (src/Reactor)               │  no dependencies
+ │ Reactor.Engine (src/Reactor)             │  no dependencies
  │ graphs, parser, validation, engine,      │
  │ handlers, human interaction, events      │
  └──────────────────────────────────────────┘
 ```
 
-`Reactor.Core` knows nothing about LLMs: codergen stages call an `ICodergenBackend`, and retry classification
+`Reactor.Engine` knows nothing about LLMs: codergen stages call an `ICodergenBackend`, and retry classification
 reads a public `bool Retryable` property from exceptions, so the Reactor.Llm error hierarchy (and the backends'
 exceptions) plug in without a dependency. `Reactor.Agent` and `Reactor.Llm` are usable without the engine.
 
-## Engine (Reactor.Core)
+## Engine (Reactor.Engine)
 
 ```text
 DOT ──DotParser──▶ Graph ──transforms──▶ Graph ──PipelineValidator──▶ diagnostics ──PipelineRunner──▶ PipelineResult

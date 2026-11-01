@@ -4,6 +4,8 @@
     <Description>GitHub Copilot SDK backend for Reactor pipelines.</Description>
     <!-- Libraries do not need the Copilot runtime; the host application (reactor CLI) bundles it. -->
     <CopilotSkipCliDownload>true</CopilotSkipCliDownload>
+    <!-- GitHub.Copilot.SDK is a prerelease package, and a stable package cannot depend on one (NU5104). -->
+    <Version>$(Version)-preview</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="GitHub.Copilot.SDK" />

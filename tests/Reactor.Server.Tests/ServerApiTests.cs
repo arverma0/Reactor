@@ -514,6 +514,55 @@ public sealed class ServerApiTests
     }
 
     [Fact]
+    public async Task Without_a_token_cross_origin_writes_are_refused()
+    {
+        await using var server = await ServerHarness.StartAsync();
+
+        async Task<HttpStatusCode> PostAsync(string? origin)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/pipelines") { Content = new StringContent(Simple, Encoding.UTF8, "text/plain") };
+            if (origin is not null)
+            {
+                request.Headers.Add("Origin", origin);
+            }
+
+            return (await server.Client.SendAsync(request)).StatusCode;
+        }
+
+        Assert.Equal(HttpStatusCode.Forbidden, await PostAsync("https://evil.example"));
+        Assert.Equal(HttpStatusCode.Forbidden, await PostAsync("http://localhost:3000"));
+        Assert.Equal(HttpStatusCode.Forbidden, await PostAsync("null"));
+        Assert.Empty(server.Manager.Runs);
+
+        Assert.Equal(HttpStatusCode.Created, await PostAsync("http://localhost"));
+        Assert.Equal(HttpStatusCode.Created, await PostAsync(null));
+    }
+
+    [Fact]
+    public async Task Without_a_token_only_local_or_ip_host_names_are_served()
+    {
+        await using var server = await ServerHarness.StartAsync();
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await server.Client.GetAsync("http://attacker.example:5180/pipelines")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await server.Client.GetAsync("http://attacker.example:5180/")).StatusCode);
+        foreach (var host in new[] { "localhost:5180", "studio.localhost:5180", "127.0.0.1:5180", "[::1]:5180", "192.168.1.20:5180" })
+        {
+            Assert.Equal(HttpStatusCode.OK, (await server.Client.GetAsync($"http://{host}/pipelines")).StatusCode);
+        }
+    }
+
+    [Fact]
+    public async Task With_a_token_any_host_and_origin_may_call_the_api()
+    {
+        await using var server = await ServerHarness.StartAsync(dir => new ReactorServerOptions { WorkingDirectory = dir, AuthToken = "s3cret" });
+        server.Client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "s3cret");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "http://reactor.example/pipelines") { Content = new StringContent(Simple, Encoding.UTF8, "text/vnd.graphviz") };
+        request.Headers.Add("Origin", "https://reactor.example");
+        Assert.Equal(HttpStatusCode.Created, (await server.Client.SendAsync(request)).StatusCode);
+    }
+
+    [Fact]
     public async Task Client_working_directories_require_opt_in()
     {
         await using var server = await ServerHarness.StartAsync();

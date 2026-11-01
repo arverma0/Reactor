@@ -9,7 +9,7 @@ It implements all three Attractor specs:
 
 | Spec | Reactor project | What it is |
 |---|---|---|
-| [Attractor](https://github.com/strongdm/attractor/blob/main/attractor-spec.md) | `Reactor.Core` (`src/Reactor`) | DOT parser, validation, execution engine, handlers, checkpoints, human gates, events |
+| [Attractor](https://github.com/strongdm/attractor/blob/main/attractor-spec.md) | `Reactor.Engine` (`src/Reactor`) | DOT parser, validation, execution engine, handlers, checkpoints, human gates, events |
 | [Coding Agent Loop](https://github.com/strongdm/attractor/blob/main/coding-agent-loop-spec.md) | `Reactor.Agent` | Agentic loop with provider-aligned tool sets (apply_patch, edit_file, shell, grep, …), subagents |
 | [Unified LLM Client](https://github.com/strongdm/attractor/blob/main/unified-llm-spec.md) | `Reactor.Llm` | One client for OpenAI (Responses API), Anthropic, Gemini, and OpenAI-compatible endpoints |
 
@@ -71,7 +71,7 @@ Requirements: the .NET 10 SDK. Optional: [Graphviz](https://graphviz.org) for gr
 backend you want to use (see below).
 
 ```powershell
-git clone <this repository> reactor && cd reactor
+git clone https://github.com/arverma0/Reactor.git reactor && cd reactor
 dotnet build -c Release
 dotnet run --project src/Reactor.Cli -- doctor          # what backends/tools are available?
 dotnet run --project src/Reactor.Cli -- run examples/smoke.dot --backend simulate
@@ -444,6 +444,10 @@ files, a run history read from disk (including CLI runs), event replay, per-stag
 from any stage, steering a running agent, Monte Carlo simulation, and the Architect. See
 [docs/http-api.md](docs/http-api.md).
 
+Without `--token`, anyone who can reach the port can start runs, and runs execute tools and agents on your machine.
+The server refuses cross-origin writes and requests addressed to other host names (DNS rebinding), so web pages you
+visit can't drive it, but set a token whenever it listens beyond loopback.
+
 ## Using the libraries
 
 ```csharp
@@ -468,7 +472,7 @@ var answer = await Ai.GenerateAsync(new GenerateOptions { Model = "claude-opus-4
 ## Repository layout
 
 ```text
-src/Reactor          Reactor.Core: graph model, DOT parser, validation, engine, handlers, events, rendering
+src/Reactor          Reactor.Engine: graph model, DOT parser, validation, engine, handlers, events, rendering
 src/Reactor.Llm      Unified LLM client, provider adapters, high-level generate/stream/object APIs
 src/Reactor.Agent    Coding agent loop: sessions, tools, execution environments, provider profiles, subagents
 src/Reactor.Backends Codergen backends: agent loop, direct LLM, Copilot CLI, Claude Code, router, tool hooks
@@ -492,5 +496,14 @@ cd src/Reactor.Studio; npm test  # Studio unit tests (Vitest)
 Skip the Studio build with `-p:SkipStudio=true` (or `REACTOR_SKIP_STUDIO=1`); see [docs/studio.md](docs/studio.md#building-the-studio).
 Test projects are executables (xUnit v3), so a single suite can also run directly, e.g.
 `tests/Reactor.Tests/bin/Debug/net10.0/Reactor.Tests.exe -class "Reactor.Tests.Engine.EngineTests"`.
+After changing .NET or Studio dependencies, regenerate [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) with
+`npm run notices` in `src/Reactor.Studio`.
 
 Further reading: [architecture](docs/architecture.md) · [spec conformance and design decisions](docs/spec-conformance.md).
+
+## License
+
+Reactor is licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE). It implements StrongDM's
+[Attractor](https://github.com/strongdm/attractor) specifications. Third-party components are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). The `Reactor.Cli` package bundles the GitHub Copilot CLI runtime,
+which is licensed separately under the GitHub Copilot CLI License.

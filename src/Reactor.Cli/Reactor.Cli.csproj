@@ -21,6 +21,20 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Reactor.Cli.Tests" />
   </ItemGroup>
+
+  <!--
+    The GitHub Copilot CLI license lets an application redistribute the runtime only together with a copy of that
+    license. The SDK leaves the downloaded release's LICENSE.md behind, so ship it next to the runtime.
+  -->
+  <Target Name="ShipCopilotCliLicense" AfterTargets="_RegisterCopilotCliForCopy" Condition="'$(CopilotSkipCliDownload)' != 'true' and '$(CopilotCliBinaryPath)' == '' and '$(_CopilotRid)' != ''">
+    <PropertyGroup>
+      <_CopilotCliLicense>$(_CopilotCacheDir)\LICENSE.md</_CopilotCliLicense>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_CopilotCliLicense)')" Text="The GitHub Copilot CLI license was not found at '$(_CopilotCliLicense)'. The bundled runtime must not ship without it." />
+    <ItemGroup>
+      <ContentWithTargetPath Include="$(_CopilotCliLicense)" TargetPath="runtimes\$(_CopilotRid)\native\LICENSE.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
   <ItemGroup>
     <ProjectReference Include="..\Reactor\Reactor.csproj" />
     <ProjectReference Include="..\Reactor.Llm\Reactor.Llm.csproj" />

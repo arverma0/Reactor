@@ -11,11 +11,24 @@
     <Deterministic>true</Deterministic>
 
     <Product>Reactor</Product>
-    <Authors>Reactor contributors</Authors>
+    <Authors>Arunabh Verma</Authors>
     <Description>Reactor: a C#/.NET implementation of the Attractor DOT-based AI pipeline runner, with a unified LLM client and a coding agent loop.</Description>
     <Version>0.1.0</Version>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <Copyright>Copyright 2026 Arunabh Verma</Copyright>
+    <PackageProjectUrl>https://github.com/arverma0/Reactor</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/arverma0/Reactor.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PackageTags>attractor;ai;agents;coding-agent;pipelines;workflow;dot;graphviz;llm;copilot</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(IsPackable)' != 'false' and !$(MSBuildProjectName.EndsWith('.Tests'))">
+    <None Include="$(MSBuildThisFileDirectory)src\PackageReadme.md" Pack="true" PackagePath="README.md" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)LICENSE;$(MSBuildThisFileDirectory)NOTICE;$(MSBuildThisFileDirectory)THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
 
   <PropertyGroup Condition="$(MSBuildProjectName.EndsWith('.Tests'))">
     <IsPackable>false</IsPackable>

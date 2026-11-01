@@ -1,0 +1,7 @@
+Reactor
+Copyright 2026 Arunabh Verma
+
+This product implements the Attractor specifications by StrongDM
+(https://github.com/strongdm/attractor), licensed under the Apache License, Version 2.0.
+
+Third-party components that Reactor's packages bundle are listed, with their licenses, in THIRD-PARTY-NOTICES.md.

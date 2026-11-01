@@ -67,6 +67,13 @@ public static class ReactorServer
         var options = app.Services.GetRequiredService<ReactorServerOptions>();
         app.Use(async (http, next) =>
         {
+            if (RequestGuard.Refusal(http.Request, options.AuthToken) is { } refusal)
+            {
+                http.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await http.Response.WriteAsJsonAsync(new { error = refusal }).ConfigureAwait(false);
+                return;
+            }
+
             if (RequiresAuth(http.Request.Path) && !Authorized(http, options.AuthToken))
             {
                 http.Response.StatusCode = StatusCodes.Status401Unauthorized;

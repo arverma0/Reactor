@@ -7,7 +7,7 @@
     <ProjectReference Include="..\Reactor.Llm\Reactor.Llm.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <!-- Process-tree containment shared with Reactor (Reactor.Core), compiled into both as internal types. -->
+    <!-- Process-tree containment shared with Reactor (Reactor.Engine), compiled into both as internal types. -->
     <Compile Include="..\Shared\Processes\*.cs" LinkBase="Shared\Processes" />
   </ItemGroup>
   <ItemGroup>

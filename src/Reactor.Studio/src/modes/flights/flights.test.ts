@@ -206,8 +206,8 @@ describe("flight list", () => {
 });
 
 describe("re-fly working directory", () => {
-  const server = "C:\\Code\\AttractorReimpl\\products";
-  const atlas = "C:\\Code\\AttractorReimpl\\products\\attractor-atlas";
+  const server = "C:\\work\\products";
+  const atlas = "C:\\work\\products\\attractor-atlas";
 
   it("continues in the flight's own directory, which a locked-down server refuses unless it is the server's", () => {
     const allowed = planForkWorkdir({ source: atlas, server, allowClient: true });
@@ -220,7 +220,7 @@ describe("re-fly working directory", () => {
     expect(locked.blocked).toContain("--allow-client-workdir");
 
     // The server's own directory, however it is spelled, and the Architect's scratch directories under its .reactor.
-    expect(planForkWorkdir({ source: "c:/code/attractorreimpl/products/", server, allowClient: false })).toMatchObject({ blocked: null, needsConfirmation: false });
+    expect(planForkWorkdir({ source: "c:/WORK/Products/", server, allowClient: false })).toMatchObject({ blocked: null, needsConfirmation: false });
     const scratch = `${server}\\.reactor\\studio\\architect\\20261029-101010-abc123`;
     expect(planForkWorkdir({ source: scratch, server, allowClient: false })).toMatchObject({ directory: scratch, blocked: null });
   });

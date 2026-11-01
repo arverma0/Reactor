@@ -59,7 +59,8 @@ internal static class HostCommands
             if (string.IsNullOrEmpty(authToken) && !IsLoopbackOnly(listen))
             {
                 await Console.Error.WriteLineAsync(
-                    "⚠ Listening on a non-loopback address without --token: anyone who can reach this port can run pipelines (and therefore shell commands).")
+                    "⚠ Listening on a non-loopback address without --token: anyone who can reach this port can run pipelines (and therefore shell commands). " +
+                    "Without a token, only requests addressed to an IP address or localhost are served.")
                     .ConfigureAwait(false);
             }
 

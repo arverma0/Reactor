@@ -15,6 +15,10 @@ reactor serve --backend copilot --urls http://127.0.0.1:5180 --token <secret> [-
   and console pages (`/`, `/console`, and their static assets) and `/healthz` are open; the Studio asks for the token
   and keeps it in the browser's local storage. The server binds to loopback by default and warns when exposed without a
   token — pipelines run shell commands, so treat access as code execution.
+- **Without a token**, the server keeps web pages from driving it: it answers only requests addressed to `localhost`
+  (or `*.localhost`) or an IP address, which defeats DNS rebinding, and refuses `POST` and `PUT` requests whose `Origin`
+  is another site, which defeats cross-site request forgery. Both are refused with `403`. Command-line clients and
+  scripts send no `Origin` and are unaffected. To reach the server by another host name, start it with `--token`.
 - **Runs** execute in the server's working directory (clients may choose one only with `--allow-client-workdir`),
   at most `--max-concurrent` at a time (others are `queued`), each limited to `--max-steps` stage executions (default
   1000; 0 = unlimited). Forks continue in the working directory of the run they fork (see [Fork](#studio-flights)).
